@@ -122,12 +122,18 @@ Several presses inherit from `ScorerPress` ([source](kvpress/presses/scorer_pres
 - `CapPress` ([source](kvpress/presses/cap_press.py), [paper](https://arxiv.org/abs/2604.25975)): evict tokens based on query-aware capacity scores from a log-determinant leverage proxy.
 
 Some presses rely on a different logic:
+- `BSAPress` ([source](kvpress/presses/last_query_chunk_press.py), [paper](https://arxiv.org/abs/2607.02980)): use the final post-RoPE query to rank complete remote chunks by their exact full-attention log mass (`logsumexp` of token logits).
+- `MeanPoolingPress` ([source](kvpress/presses/last_query_chunk_press.py)): use the final post-RoPE query to score each complete remote chunk through its mean post-RoPE key, calibrated as a uniform-chunk approximate log mass for GQA normalization.
 - `ThinKPress` ([source](kvpress/presses/think_press.py), [paper](https://arxiv.org/abs/2407.21018)): compress the dimensions of the keys based on the channel attention score on the last queries 
 - `SimLayerKVPress` ([source](kvpress/presses/simlayerkv_press.py), [paper](https://arxiv.org/abs/2410.13846)): identify "lazy" layers, and apply the StreamingLLM approach to them 
 - `DuoAttentionPress` ([source](kvpress/presses/duo_attention_press.py), [paper](https://arxiv.org/abs/2410.10819)): split heads into retrieval heads (no compression) and streaming heads (StreamingLLM approach)
 - `FinchPress` ([source](kvpress/presses/finch_press.py), [paper](https://direct.mit.edu/tacl/article/doi/10.1162/tacl_a_00716/125280)): similar to SnapKV with a dynamic window size and key value re-rotation
 - `KVzipPress` ([source](kvpress/presses/kvzip_press.py), [paper](https://arxiv.org/abs/2505.23416)): identify redundant KV pairs through context reconstruction. Achieve near-lossless compression at the cost of multiple forward passes.
 - `KVComposePress` ([source](kvpress/presses/kvcompose_press.py), [paper](https://arxiv.org/abs/2509.05165)): attention-guided eviction, aligning per-head selections into composite tokens to preserve cache structure.
+
+> [!NOTE]
+> `BSAPress` and `MeanPoolingPress` are last-query KV eviction baselines, not all-query NaiveBSA or HiLS attention implementations. They currently target unpadded, non-packed text prefill. They permanently retain a recent protected tail, select and gather whole chunks in chronological order, and do not rerotate cached keys. Whole-chunk budget rounding can make the actual compression ratio slightly higher than the requested ratio; evaluation outputs record both. An infeasible request whose token budget is smaller than the protected tail fails explicitly.
+> Scoring uses FP32 Q/K math for reference parity. Its complexity is linear in context length, but the temporary FP32 key copy should still be included in long-context peak-memory measurements.
 
 > [!NOTE]  
 > `KVComposePress` performs an extra pass over the full context, temporarily creating a KV cache of ~2x the context length and creating memory overhead during prefill.

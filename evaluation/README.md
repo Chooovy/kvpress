@@ -19,6 +19,14 @@ If you want, you can override the settings via command line, for instance:
 python evaluate.py --dataset loogle --data_dir shortdep_qa --model meta-llama/Meta-Llama-3.1-8B-Instruct --press_name expected_attention --compression_ratio 0.5
 ```
 
+For last-query whole-chunk eviction, select either `bsa` or `mean_pooling` and configure the chunk and protected-tail sizes:
+
+```bash
+python evaluate.py --dataset ruler --data_dir 4096 --model meta-llama/Meta-Llama-3.1-8B-Instruct --press_name bsa --compression_ratio 0.5 --chunk_size 64 --protected_window_size 512
+```
+
+With `query_aware: true`, choose a protected window large enough to retain the question tokens appended to the compression context.
+
 or pass a custom configuration file:
 
 ```bash

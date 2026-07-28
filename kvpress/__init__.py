@@ -30,6 +30,7 @@ from kvpress.presses.kvcompose_press import KVComposePress
 from kvpress.presses.kvzap_press import KVzapPress
 from kvpress.presses.kvzip_press import KVzipPress
 from kvpress.presses.lagkv_press import LagKVPress
+from kvpress.presses.last_query_chunk_press import BSAPress, ChunkScorerPress, MeanPoolingPress
 from kvpress.presses.leverage_press import LeverageScorePress
 from kvpress.presses.lukv_press import LUKVPress
 from kvpress.presses.merging_press import MergingPress
@@ -77,6 +78,9 @@ __all__ = [
     "PyramidKVPress",
     "FinchPress",
     "LagKVPress",
+    "ChunkScorerPress",
+    "BSAPress",
+    "MeanPoolingPress",
     "BlockPress",
     "KeyDiffPress",
     "KVzipPress",

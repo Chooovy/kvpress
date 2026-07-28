@@ -21,13 +21,14 @@ from tqdm import tqdm
 from transformers import FineGrainedFP8Config, Pipeline, pipeline
 
 from kvpress import (
+    BasePress,
+    ChunkScorerPress,
     ComposedPress,
     DecodingPress,
     DMSPress,
     DuoAttentionPress,
     FinchPress,
     ObservedAttentionPress,
-    ScorerPress,
     ThinKPress,
 )
 
@@ -48,6 +49,8 @@ class EvaluationConfig:
     key_channel_compression_ratio: Optional[float] = None
     head_compression_ratio: Optional[float] = None
     threshold: Optional[float] = None
+    chunk_size: int = 64
+    protected_window_size: int = 512
 
     # Dataset and generation parameters
     fraction: float = 1.0
@@ -85,6 +88,10 @@ class EvaluationConfig:
 
         # Validate press
         assert self.press_name in PRESS_REGISTRY, f"Press '{self.press_name}' not found in PRESS_REGISTRY"
+        if self.press_name in {"bsa", "mean_pooling"}:
+            assert 0.0 <= self.compression_ratio < 1.0, "compression_ratio must be in [0, 1)"
+            assert self.chunk_size > 0, "chunk_size must be positive"
+            assert self.protected_window_size > 0, "protected_window_size must be positive"
 
         if self.press_name == "no_press":
             # override compression_ratio to 0.0
@@ -145,6 +152,8 @@ class EvaluationConfig:
             components.append(f"key_channel_cr{self.key_channel_compression_ratio:.2f}")
         if self.needle_depth is not None and self.dataset == "needle_in_haystack":
             components.append(f"needle_depth{self.needle_depth}")
+        if self.press_name in {"bsa", "mean_pooling"}:
+            components.extend((f"chunk{self.chunk_size}", f"window{self.protected_window_size}"))
 
         dir_name = "__".join(filter(None, components))  # Filter None/empty strings
         config_dir = output_dir / dir_name
@@ -171,6 +180,9 @@ class EvaluationConfig:
             config_dict.pop("threshold", None)
         if self.head_compression_ratio is None:
             config_dict.pop("head_compression_ratio", None)
+        if self.press_name not in {"bsa", "mean_pooling"}:
+            config_dict.pop("chunk_size", None)
+            config_dict.pop("protected_window_size", None)
         with open(str(config_filename), "w") as f:
             yaml.dump(config_dict, f, default_flow_style=False, indent=2, sort_keys=False)
 
@@ -210,7 +222,7 @@ class EvaluationRunner:
         """
         self.config = config
         self.pipeline: Optional[Pipeline] = None  # Will be set by _setup_model_pipeline()
-        self.press: None | ScorerPress = None  # Will be set by _setup_press()
+        self.press: Optional[BasePress] = None  # Will be set by _setup_press()
         self.df: Optional[pd.DataFrame] = None  # Will be set by _load_dataset()
         self._setup_logging()
         self._setup_deterministic_seeds()
@@ -263,7 +275,15 @@ class EvaluationRunner:
         press = PRESS_REGISTRY[press_name]
 
         # Apply compression ratios based on press type
-        if isinstance(press, DuoAttentionPress):
+        if isinstance(press, ChunkScorerPress):
+            press.compression_ratio = compression_ratio
+            press.chunk_size = self.config.chunk_size
+            press.protected_window_size = self.config.protected_window_size
+            logger.info(
+                f"Set {press.__class__.__name__} compression_ratio={compression_ratio}, "
+                f"chunk_size={press.chunk_size}, protected_window_size={press.protected_window_size}"
+            )
+        elif isinstance(press, DuoAttentionPress):
             assert (
                 self.config.head_compression_ratio is not None
             ), "head_compression_ratio must be set for DuoAttentionPress"
@@ -406,6 +426,18 @@ class EvaluationRunner:
         """
 
         self.df["predicted_answer"] = None  # type: ignore[index]
+        if isinstance(self.press, ChunkScorerPress):
+            self.df["actual_compression_ratio"] = pd.Series(  # type: ignore[index]
+                pd.NA,
+                index=self.df.index,  # type: ignore[union-attr]
+                dtype="Float64",
+            )
+            for column in ("input_tokens", "kept_tokens", "protected_tokens", "kept_remote_chunks"):
+                self.df[column] = pd.Series(  # type: ignore[index]
+                    pd.NA,
+                    index=self.df.index,  # type: ignore[union-attr]
+                    dtype="Int64",
+                )
 
         if isinstance(self.press, DecodingPress):
             logger.info("DecodingPress detected, running inference for each context-question pair.")
@@ -440,6 +472,8 @@ class EvaluationRunner:
                 max_new_tokens = self.config.max_new_tokens or df_group["max_new_tokens"].iloc[0]
                 answer_prefix = df_group["answer_prefix"].iloc[0]
 
+                if isinstance(self.press, ChunkScorerPress):
+                    self.press.reset_runtime_stats()
                 output = self.pipeline(  # type: ignore[misc]
                     context,
                     questions=questions,
@@ -449,10 +483,24 @@ class EvaluationRunner:
                     max_context_length=self.config.max_context_length,
                 )
                 self.df.loc[df_group.index, "predicted_answer"] = output["answers"]  # type: ignore[union-attr]
-                # Store the actual compression ratio used (if the press has one)
+                # Keep this existing column as the requested compression ratio.
                 self.df.loc[df_group.index, "compression_ratio"] = (
                     self.press.compression_ratio if self.press is not None else 0.0  # type: ignore[attr-defined]
                 )  # type: ignore[union-attr, attr-defined]
+                if isinstance(self.press, ChunkScorerPress):
+                    runtime_stats = {
+                        "actual_compression_ratio": self.press.last_actual_compression_ratio,
+                        "input_tokens": self.press.last_input_tokens,
+                        "kept_tokens": self.press.last_kept_tokens,
+                        "protected_tokens": self.press.last_protected_tokens,
+                        "kept_remote_chunks": self.press.last_kept_remote_chunks,
+                    }
+                    if any(value is None for value in runtime_stats.values()):
+                        raise RuntimeError(
+                            f"{self.press.__class__.__name__} did not record runtime compression statistics."
+                        )
+                    for column, value in runtime_stats.items():
+                        self.df.loc[df_group.index, column] = value
                 torch.cuda.empty_cache()  # Clear CUDA cache to free up memory
 
         logger.info("Inference completed.")

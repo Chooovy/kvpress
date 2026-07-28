@@ -15,6 +15,7 @@ from benchmarks.zero_scrolls.calculate_metrics import calculate_metrics as zero_
 from kvpress import (
     AdaKVPress,
     BlockPress,
+    BSAPress,
     CAMPress,
     ChunkKVPress,
     CompactorPress,
@@ -35,6 +36,7 @@ from kvpress import (
     KVzipPress,
     LagKVPress,
     LUKVPress,
+    MeanPoolingPress,
     MergingPress,
     ObservedAttentionPress,
     PyramidKVPress,
@@ -77,6 +79,7 @@ SCORER_REGISTRY = {
 
 PRESS_REGISTRY = {
     "adakv_snapkv": AdaKVPress(SnapKVPress()),
+    "bsa": BSAPress(),
     "block_keydiff": BlockPress(press=KeyDiffPress(), block_size=128),
     "chunkkv": ChunkKVPress(press=SnapKVPress(), chunk_length=20),
     "critical_adakv_expected_attention": CriticalAdaKVPress(ExpectedAttentionPress(use_vnorm=False)),
@@ -100,6 +103,7 @@ PRESS_REGISTRY = {
     "kvzap_mlp_layer": AdaKVPress(KVzapPress(model_type="mlp")),
     "lagkv": LagKVPress(),
     "lukv": LUKVPress(ExpectedAttentionPress(epsilon=2e-2), sink=4, window=1),
+    "mean_pooling": MeanPoolingPress(),
     "knorm": KnormPress(),
     "observed_attention": ObservedAttentionPress(),
     "pyramidkv": PyramidKVPress(),

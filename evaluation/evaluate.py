@@ -28,11 +28,15 @@ from kvpress import (
     DMSPress,
     DuoAttentionPress,
     FinchPress,
+    KVzipPress,
     ObservedAttentionPress,
     ThinKPress,
 )
 
 logger = logging.getLogger(__name__)
+
+CHUNK_SIZE_PRESSES = {"bsa", "mean_pooling", "kvzip_chunk"}
+PROTECTED_WINDOW_PRESSES = {"bsa", "mean_pooling"}
 
 
 @dataclass
@@ -88,9 +92,10 @@ class EvaluationConfig:
 
         # Validate press
         assert self.press_name in PRESS_REGISTRY, f"Press '{self.press_name}' not found in PRESS_REGISTRY"
-        if self.press_name in {"bsa", "mean_pooling"}:
+        if self.press_name in CHUNK_SIZE_PRESSES:
             assert 0.0 <= self.compression_ratio < 1.0, "compression_ratio must be in [0, 1)"
             assert self.chunk_size > 0, "chunk_size must be positive"
+        if self.press_name in PROTECTED_WINDOW_PRESSES:
             assert self.protected_window_size > 0, "protected_window_size must be positive"
 
         if self.press_name == "no_press":
@@ -152,8 +157,10 @@ class EvaluationConfig:
             components.append(f"key_channel_cr{self.key_channel_compression_ratio:.2f}")
         if self.needle_depth is not None and self.dataset == "needle_in_haystack":
             components.append(f"needle_depth{self.needle_depth}")
-        if self.press_name in {"bsa", "mean_pooling"}:
-            components.extend((f"chunk{self.chunk_size}", f"window{self.protected_window_size}"))
+        if self.press_name in CHUNK_SIZE_PRESSES:
+            components.append(f"chunk{self.chunk_size}")
+        if self.press_name in PROTECTED_WINDOW_PRESSES:
+            components.append(f"window{self.protected_window_size}")
 
         dir_name = "__".join(filter(None, components))  # Filter None/empty strings
         config_dir = output_dir / dir_name
@@ -180,8 +187,9 @@ class EvaluationConfig:
             config_dict.pop("threshold", None)
         if self.head_compression_ratio is None:
             config_dict.pop("head_compression_ratio", None)
-        if self.press_name not in {"bsa", "mean_pooling"}:
+        if self.press_name not in CHUNK_SIZE_PRESSES:
             config_dict.pop("chunk_size", None)
+        if self.press_name not in PROTECTED_WINDOW_PRESSES:
             config_dict.pop("protected_window_size", None)
         with open(str(config_filename), "w") as f:
             yaml.dump(config_dict, f, default_flow_style=False, indent=2, sort_keys=False)
@@ -283,6 +291,15 @@ class EvaluationRunner:
                 f"Set {press.__class__.__name__} compression_ratio={compression_ratio}, "
                 f"chunk_size={press.chunk_size}, protected_window_size={press.protected_window_size}"
             )
+        elif isinstance(press, KVzipPress):
+            press.compression_ratio = compression_ratio
+            if press.selection_granularity == "chunk":
+                press.selection_chunk_size = self.config.chunk_size
+            logger.info(
+                f"Set {press.__class__.__name__} compression_ratio={compression_ratio}, "
+                f"selection_granularity={press.selection_granularity}, "
+                f"selection_chunk_size={press.selection_chunk_size}"
+            )
         elif isinstance(press, DuoAttentionPress):
             assert (
                 self.config.head_compression_ratio is not None
@@ -350,6 +367,10 @@ class EvaluationRunner:
             original_len = len(df)
             df = df.sample(frac=fraction, random_state=self.config.seed)
             logger.info(f"Sampled {len(df)} samples ({fraction:.2f}) from original {original_len} samples.")
+
+        # Preserve the source row index as a stable identity without resetting or
+        # reordering the sampled DataFrame.
+        df["sample_id"] = df.index
 
         logger.info(f"Dataset loaded with {len(df)} entries.")
 
@@ -438,6 +459,23 @@ class EvaluationRunner:
                     index=self.df.index,  # type: ignore[union-attr]
                     dtype="Int64",
                 )
+        if isinstance(self.press, KVzipPress):
+            self.df["actual_masked_slot_ratio"] = pd.Series(  # type: ignore[index]
+                pd.NA,
+                index=self.df.index,  # type: ignore[union-attr]
+                dtype="Float64",
+            )
+            for column in ("total_kv_slots", "masked_kv_slots", "masked_chunks"):
+                self.df[column] = pd.Series(  # type: ignore[index]
+                    pd.NA,
+                    index=self.df.index,  # type: ignore[union-attr]
+                    dtype="Int64",
+                )
+            self.df["masked_slots_per_layer"] = pd.Series(  # type: ignore[index]
+                pd.NA,
+                index=self.df.index,  # type: ignore[union-attr]
+                dtype="string",
+            )
 
         if isinstance(self.press, DecodingPress):
             logger.info("DecodingPress detected, running inference for each context-question pair.")
@@ -472,7 +510,7 @@ class EvaluationRunner:
                 max_new_tokens = self.config.max_new_tokens or df_group["max_new_tokens"].iloc[0]
                 answer_prefix = df_group["answer_prefix"].iloc[0]
 
-                if isinstance(self.press, ChunkScorerPress):
+                if isinstance(self.press, (ChunkScorerPress, KVzipPress)):
                     self.press.reset_runtime_stats()
                 output = self.pipeline(  # type: ignore[misc]
                     context,
@@ -501,6 +539,26 @@ class EvaluationRunner:
                         )
                     for column, value in runtime_stats.items():
                         self.df.loc[df_group.index, column] = value
+                elif isinstance(self.press, KVzipPress):
+                    total_kv_slots = self.press.last_total_kv_slots
+                    masked_kv_slots = self.press.last_masked_kv_slots
+                    actual_masked_slot_ratio = self.press.last_actual_masked_slot_ratio
+                    masked_slots_per_layer = self.press.last_masked_slots_per_layer
+                    if (
+                        total_kv_slots is None
+                        or masked_kv_slots is None
+                        or actual_masked_slot_ratio is None
+                        or masked_slots_per_layer is None
+                    ):
+                        raise RuntimeError(
+                            f"{self.press.__class__.__name__} did not record runtime masking statistics."
+                        )
+                    self.df.loc[df_group.index, "total_kv_slots"] = total_kv_slots
+                    self.df.loc[df_group.index, "masked_kv_slots"] = masked_kv_slots
+                    self.df.loc[df_group.index, "actual_masked_slot_ratio"] = actual_masked_slot_ratio
+                    self.df.loc[df_group.index, "masked_slots_per_layer"] = json.dumps(list(masked_slots_per_layer))
+                    if self.press.last_masked_chunks is not None:
+                        self.df.loc[df_group.index, "masked_chunks"] = self.press.last_masked_chunks
                 torch.cuda.empty_cache()  # Clear CUDA cache to free up memory
 
         logger.info("Inference completed.")

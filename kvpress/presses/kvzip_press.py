@@ -4,9 +4,9 @@
 import logging
 import math
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MethodType
-from typing import Generator, List
+from typing import Generator, List, Literal
 
 import torch
 from torch import nn
@@ -45,15 +45,28 @@ class KVzipPress(BasePress):
         Number of initial tokens to preserve as attention sinks.
     kvzip_plus_normalization: bool, default=False
         Whether to enable KVzip+ normalization.
+    selection_granularity: {"token", "chunk"}, default="token"
+        Unit used for logical masking after the original KVzip token scores are computed.
+    selection_chunk_size: int, default=64
+        Number of consecutive tokens in each per-KV-head selection chunk.
     """
 
     compression_ratio: float = 0.0
     layerwise: bool = False
     n_sink: int = 4
     kvzip_plus_normalization: bool = False
+    selection_granularity: Literal["token", "chunk"] = "token"
+    selection_chunk_size: int = 64
+
+    last_total_kv_slots: int | None = field(init=False, default=None, repr=False, compare=False)
+    last_masked_kv_slots: int | None = field(init=False, default=None, repr=False, compare=False)
+    last_actual_masked_slot_ratio: float | None = field(init=False, default=None, repr=False, compare=False)
+    last_masked_chunks: int | None = field(init=False, default=None, repr=False, compare=False)
+    last_masked_slots_per_layer: tuple[int, ...] | None = field(init=False, default=None, repr=False, compare=False)
 
     def __post_init__(self):
         assert 0 <= self.compression_ratio < 1, "Compression ratio must be between 0 and 1"
+        self._validate_selection_config()
         logger.warning(
             "KVzipPress requires multiple forward passes for chunked context reconstruction, "
             "resulting in a computational overhead of 2–3 times the initial prefilling cost. "
@@ -61,6 +74,24 @@ class KVzipPress(BasePress):
             "which is inherent to the KVzip algorithm design."
         )
         self._reset_internal_parameters()
+        self.reset_runtime_stats()
+
+    def _validate_selection_config(self):
+        if self.selection_granularity not in {"token", "chunk"}:
+            raise ValueError(
+                f"selection_granularity must be either 'token' or 'chunk', got {self.selection_granularity!r}"
+            )
+        if not isinstance(self.selection_chunk_size, int) or isinstance(self.selection_chunk_size, bool):
+            raise ValueError(f"selection_chunk_size must be a positive integer, got {self.selection_chunk_size!r}")
+        if self.selection_chunk_size <= 0:
+            raise ValueError(f"selection_chunk_size must be positive, got {self.selection_chunk_size}")
+
+    def reset_runtime_stats(self):
+        self.last_total_kv_slots = None
+        self.last_masked_kv_slots = None
+        self.last_actual_masked_slot_ratio = None
+        self.last_masked_chunks = None
+        self.last_masked_slots_per_layer = None
 
     def _reset_internal_parameters(self):
         self.context_length = 0
@@ -84,6 +115,8 @@ class KVzipPress(BasePress):
         1. First yield: allows initial prefilling with context
         2. After yield: performs KVzip scoring and compression using context reconstruction
         """
+        self.reset_runtime_stats()
+
         if not isinstance(model, SUPPORTED_MODELS):
             logger.warning(f"Model {type(model)} not tested, supported models: {SUPPORTED_MODELS}")
 
@@ -360,33 +393,181 @@ class KVzipPress(BasePress):
         Obtain the indices of KV pairs to be evicted.
         Adopted from adakv_press.compress (fake compression). KVzip does not rely on safeguards.
         """
-        if self.compression_ratio > 0:
-            n_layer, bsz, num_key_value_heads, ctx_len = self.score_val.shape
+        self._validate_selection_config()
+        if self.compression_ratio <= 0:
+            return
+        if self.score_val is None:
+            raise RuntimeError("KVzip scores must be computed before compression.")
 
-            # calculate the pruned KV pairs across layers
-            if self.layerwise:
-                nl = int(bsz * num_key_value_heads * ctx_len * self.compression_ratio)
-                n_pruned_layers = nl * torch.ones(n_layer, device=self.score_val.device, dtype=torch.int)
-            else:
-                n_pruned_indices = int(self.score_val.numel() * self.compression_ratio)
-                pruned_indices = torch.topk(-self.score_val.reshape(-1), n_pruned_indices).indices
-                n_tokens_per_layer = bsz * num_key_value_heads * ctx_len
-                n_pruned_layers = torch.bincount(pruned_indices // n_tokens_per_layer, minlength=n_layer).int()
+        if self.selection_granularity == "chunk":
+            self._compress_post_chunk(model)
+        else:
+            self._compress_post_token(model)
 
-            for layer in model.model.layers:
-                module = layer.self_attn
-                layer_idx = int(module.layer_idx)
+    def _record_runtime_stats(
+        self,
+        n_pruned_layers: torch.Tensor,
+        *,
+        masked_chunks: int | None,
+    ):
+        masked_slots_per_layer = tuple(int(value) for value in n_pruned_layers.tolist())
+        total_kv_slots = int(self.score_val.numel())
+        masked_kv_slots = sum(masked_slots_per_layer)
 
-                assert module.config._attn_implementation != "eager", "eager mode not supported"
+        self.last_total_kv_slots = total_kv_slots
+        self.last_masked_kv_slots = masked_kv_slots
+        self.last_actual_masked_slot_ratio = masked_kv_slots / total_kv_slots
+        self.last_masked_chunks = masked_chunks
+        self.last_masked_slots_per_layer = masked_slots_per_layer
 
-                scores = self.score_val[layer_idx]
+    def _compress_post_token(self, model: PreTrainedModel):
+        """Preserve the original token-wise KVzip selection behavior."""
+        n_layer, bsz, num_key_value_heads, ctx_len = self.score_val.shape
 
-                # Compute bottom-k across heads
-                n_pruned = n_pruned_layers[layer_idx].cpu()
-                indices = torch.topk(-scores.reshape(bsz, -1), n_pruned, dim=1).indices.flatten().cpu()
+        # calculate the pruned KV pairs across layers
+        if self.layerwise:
+            nl = int(bsz * num_key_value_heads * ctx_len * self.compression_ratio)
+            n_pruned_layers = nl * torch.ones(n_layer, device=self.score_val.device, dtype=torch.int)
+        else:
+            n_pruned_indices = int(self.score_val.numel() * self.compression_ratio)
+            pruned_indices = torch.topk(-self.score_val.reshape(-1), n_pruned_indices).indices
+            n_tokens_per_layer = bsz * num_key_value_heads * ctx_len
+            n_pruned_layers = torch.bincount(pruned_indices // n_tokens_per_layer, minlength=n_layer).int()
 
-                # Save indices to mask during the attention mechanism. Please refer to attention_patch.py for details
-                batch_indices = torch.arange(bsz, device=n_pruned.device).repeat_interleave(n_pruned)
-                head_indices = indices // ctx_len
-                seq_indices = indices % ctx_len
-                module.masked_key_indices = (batch_indices, head_indices, seq_indices)
+        for layer in model.model.layers:
+            module = layer.self_attn
+            layer_idx = int(module.layer_idx)
+
+            assert module.config._attn_implementation != "eager", "eager mode not supported"
+
+            scores = self.score_val[layer_idx]
+
+            # Compute bottom-k across heads
+            n_pruned = n_pruned_layers[layer_idx].cpu()
+            indices = torch.topk(-scores.reshape(bsz, -1), n_pruned, dim=1).indices.flatten().cpu()
+
+            # Save indices to mask during the attention mechanism. Please refer to attention_patch.py for details
+            batch_indices = torch.arange(bsz, device=n_pruned.device).repeat_interleave(n_pruned)
+            head_indices = indices // ctx_len
+            seq_indices = indices % ctx_len
+            module.masked_key_indices = (batch_indices, head_indices, seq_indices)
+
+        self._record_runtime_stats(n_pruned_layers, masked_chunks=None)
+
+    def _aggregate_chunk_scores(self, token_scores: torch.Tensor) -> tuple[torch.Tensor, int]:
+        """Sum complete, token-zero-aligned selection chunks in FP32."""
+        chunk_size = self.selection_chunk_size
+        ctx_len = token_scores.shape[-1]
+        complete_end = ctx_len // chunk_size * chunk_size
+        num_chunks = complete_end // chunk_size
+        chunk_scores = (
+            token_scores[..., :complete_end]
+            .float()
+            .reshape(*token_scores.shape[:-1], num_chunks, chunk_size)
+            .sum(dim=-1)
+        )
+        return chunk_scores, complete_end
+
+    def _clear_masked_key_indices(self, model: PreTrainedModel):
+        for layer in model.model.layers:
+            layer.self_attn.masked_key_indices = None
+
+    @torch.no_grad()
+    def _compress_post_chunk(self, model: PreTrainedModel):
+        """Select and logically mask complete per-KV-head chunks."""
+        n_layer, bsz, num_key_value_heads, ctx_len = self.score_val.shape
+        if bsz != 1:
+            raise ValueError(f"KVzip chunk selection currently supports batch size 1, got {bsz}.")
+
+        chunk_size = self.selection_chunk_size
+        chunk_scores, _ = self._aggregate_chunk_scores(self.score_val)
+        num_chunks = chunk_scores.shape[-1]
+        available_chunks_per_layer = bsz * num_key_value_heads * num_chunks
+
+        if self.layerwise:
+            requested_slots_per_layer = int(bsz * num_key_value_heads * ctx_len * self.compression_ratio)
+            requested_chunks_per_layer = requested_slots_per_layer // chunk_size
+            if requested_chunks_per_layer > available_chunks_per_layer:
+                raise ValueError(
+                    "Requested layerwise KVzip chunk masking is infeasible: "
+                    f"requested_chunks_per_layer={requested_chunks_per_layer}, "
+                    f"available_chunks_per_layer={available_chunks_per_layer}."
+                )
+            n_pruned_chunks_per_layer = torch.full(
+                (n_layer,),
+                requested_chunks_per_layer,
+                device=chunk_scores.device,
+                dtype=torch.long,
+            )
+        else:
+            requested_slots = int(self.score_val.numel() * self.compression_ratio)
+            requested_chunks = requested_slots // chunk_size
+            available_chunks = int(chunk_scores.numel())
+            if requested_chunks > available_chunks:
+                raise ValueError(
+                    "Requested KVzip chunk masking is infeasible: "
+                    f"requested_chunks={requested_chunks}, available_chunks={available_chunks}."
+                )
+            if requested_chunks == 0:
+                n_pruned_slots_per_layer = torch.zeros(
+                    n_layer,
+                    device=chunk_scores.device,
+                    dtype=torch.long,
+                )
+                self._clear_masked_key_indices(model)
+                self._record_runtime_stats(n_pruned_slots_per_layer, masked_chunks=0)
+                return
+
+            global_pruned_chunks = torch.topk(-chunk_scores.reshape(-1), requested_chunks).indices
+            n_pruned_chunks_per_layer = torch.bincount(
+                global_pruned_chunks // available_chunks_per_layer,
+                minlength=n_layer,
+            ).long()
+
+        if int(n_pruned_chunks_per_layer.sum().item()) == 0:
+            n_pruned_slots_per_layer = torch.zeros(
+                n_layer,
+                device=chunk_scores.device,
+                dtype=torch.long,
+            )
+            self._clear_masked_key_indices(model)
+            self._record_runtime_stats(n_pruned_slots_per_layer, masked_chunks=0)
+            return
+
+        for layer in model.model.layers:
+            module = layer.self_attn
+            layer_idx = int(module.layer_idx)
+
+            assert module.config._attn_implementation != "eager", "eager mode not supported"
+
+            n_pruned_chunks = int(n_pruned_chunks_per_layer[layer_idx].item())
+            if n_pruned_chunks == 0:
+                module.masked_key_indices = None
+                continue
+
+            flat_chunk_indices = (
+                torch.topk(
+                    -chunk_scores[layer_idx].reshape(bsz, -1),
+                    n_pruned_chunks,
+                    dim=1,
+                )
+                .indices.flatten()
+                .cpu()
+            )
+            batch_indices = torch.arange(bsz).repeat_interleave(n_pruned_chunks)
+            head_indices = flat_chunk_indices // num_chunks
+            chunk_indices = flat_chunk_indices % num_chunks
+            offsets = torch.arange(chunk_size)
+            seq_indices = chunk_indices.unsqueeze(-1) * chunk_size + offsets.unsqueeze(0)
+
+            module.masked_key_indices = (
+                batch_indices.unsqueeze(-1).expand_as(seq_indices).reshape(-1),
+                head_indices.unsqueeze(-1).expand_as(seq_indices).reshape(-1),
+                seq_indices.reshape(-1),
+            )
+
+        n_pruned_slots_per_layer = n_pruned_chunks_per_layer * chunk_size
+        self._record_runtime_stats(
+            n_pruned_slots_per_layer,
+            masked_chunks=int(n_pruned_chunks_per_layer.sum().item()),
+        )

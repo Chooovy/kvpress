@@ -96,6 +96,7 @@ PRESS_REGISTRY = {
     "kvcompose": KVComposePress(),
     "kvcompose_unstructured": KVComposePress(structured=False),
     "kvzip": KVzipPress(),
+    "kvzip_chunk": KVzipPress(selection_granularity="chunk"),
     "kvzip_plus": KVzipPress(kvzip_plus_normalization=True),
     "kvzap_linear": DMSPress(press=KVzapPress(model_type="linear")),
     "kvzap_mlp": DMSPress(press=KVzapPress(model_type="mlp")),

@@ -165,13 +165,17 @@ class KVzipPress(BasePress):
                 model.model.forward = original_forward
 
             # After yield: KVzip scoring and compression phase
-            if self.compression_ratio > 0 and self._context_ids is not None:
-                # Now register attention hooks for compression
-                for layer in model.model.layers:
-                    layer.self_attn.rotary_emb = model.model.rotary_emb
-                    hooks.append(layer.self_attn.register_forward_hook(self.forward_hook, with_kwargs=True))
+            if self._context_ids is not None:
+                if self.compression_ratio > 0:
+                    # Now register attention hooks for compression
+                    for layer in model.model.layers:
+                        layer.self_attn.rotary_emb = model.model.rotary_emb
+                        hooks.append(layer.self_attn.register_forward_hook(self.forward_hook, with_kwargs=True))
 
-                self._perform_kvzip_compression(model, tokenizer)
+                    self._perform_kvzip_compression(model, tokenizer)
+                else:
+                    self._clear_masked_key_indices(model)
+                    self._record_zero_mask_runtime_stats(model)
         finally:
             for hook in hooks:
                 hook.remove()
@@ -395,6 +399,17 @@ class KVzipPress(BasePress):
         """
         self._validate_selection_config()
         if self.compression_ratio <= 0:
+            if self.score_val is not None:
+                n_pruned_layers = torch.zeros(
+                    self.score_val.shape[0],
+                    device=self.score_val.device,
+                    dtype=torch.long,
+                )
+                self._clear_masked_key_indices(model)
+                self._record_runtime_stats(
+                    n_pruned_layers,
+                    masked_chunks=0 if self.selection_granularity == "chunk" else None,
+                )
             return
         if self.score_val is None:
             raise RuntimeError("KVzip scores must be computed before compression.")
@@ -419,6 +434,17 @@ class KVzipPress(BasePress):
         self.last_actual_masked_slot_ratio = masked_kv_slots / total_kv_slots
         self.last_masked_chunks = masked_chunks
         self.last_masked_slots_per_layer = masked_slots_per_layer
+
+    def _record_zero_mask_runtime_stats(self, model: PreTrainedModel):
+        batch_size, context_length = self._context_ids.shape[:2]
+        num_layers = model.config.num_hidden_layers
+        slots_per_layer = batch_size * model.config.num_key_value_heads * context_length
+
+        self.last_total_kv_slots = num_layers * slots_per_layer
+        self.last_masked_kv_slots = 0
+        self.last_actual_masked_slot_ratio = 0.0
+        self.last_masked_chunks = 0 if self.selection_granularity == "chunk" else None
+        self.last_masked_slots_per_layer = (0,) * num_layers
 
     def _compress_post_token(self, model: PreTrainedModel):
         """Preserve the original token-wise KVzip selection behavior."""

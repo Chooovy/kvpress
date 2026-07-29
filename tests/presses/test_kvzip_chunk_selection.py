@@ -249,6 +249,40 @@ def test_zero_chunk_budget_is_a_valid_noop_and_clears_stale_mask():
     assert press.last_masked_slots_per_layer == (0,)
 
 
+@pytest.mark.parametrize(
+    "selection_granularity, expected_masked_chunks",
+    (
+        ("token", None),
+        ("chunk", 0),
+    ),
+)
+def test_zero_compression_direct_call_records_stats_and_clears_stale_masks(
+    selection_granularity,
+    expected_masked_chunks,
+):
+    scores = torch.ones(2, 1, 3, 5)
+    press = KVzipPress(
+        compression_ratio=0.0,
+        selection_granularity=selection_granularity,
+        selection_chunk_size=4,
+    )
+    press.score_val = scores
+    model = make_fake_model(num_layers=2)
+    stale_mask = (torch.tensor([0]), torch.tensor([0]), torch.tensor([1]))
+    for layer in model.model.layers:
+        layer.self_attn.masked_key_indices = stale_mask
+
+    press.compress_post(model)
+
+    assert all(layer.self_attn.masked_key_indices is None for layer in model.model.layers)
+    assert press.last_total_kv_slots == scores.numel()
+    assert press.last_masked_kv_slots == 0
+    assert press.last_actual_masked_slot_ratio == 0.0
+    assert press.last_masked_chunks == expected_masked_chunks
+    assert press.last_masked_slots_per_layer == (0, 0)
+    assert_common_runtime_stats_are_python_scalars(press)
+
+
 def test_infeasible_chunk_budget_fails_when_requested_chunks_exceed_available_chunks():
     scores = torch.ones(2, 1, 2, 3)
     press = KVzipPress(
@@ -359,6 +393,53 @@ def test_internal_reset_preserves_last_runtime_stats_until_explicit_stats_reset(
     assert press.last_actual_masked_slot_ratio is None
     assert press.last_masked_chunks is None
     assert press.last_masked_slots_per_layer is None
+
+
+@pytest.mark.parametrize(
+    "selection_granularity, expected_masked_chunks",
+    (
+        ("token", None),
+        ("chunk", 0),
+    ),
+)
+def test_zero_compression_real_context_records_stats_without_reconstruction(
+    unit_test_model,  # noqa: F811
+    monkeypatch,
+    selection_granularity,
+    expected_masked_chunks,
+):
+    context_length = 17
+    press = KVzipPress(
+        compression_ratio=0.0,
+        selection_granularity=selection_granularity,
+        selection_chunk_size=64,
+    )
+
+    def fail_if_reconstruction_runs(*args, **kwargs):
+        raise AssertionError("ratio=0 must not run KVzip reconstruction")
+
+    monkeypatch.setattr(press, "_perform_kvzip_compression", fail_if_reconstruction_runs)
+    cache = DynamicCache()
+    input_ids = torch.randint(0, 1024, (1, context_length), device=unit_test_model.device)
+    stale_mask = (torch.tensor([0]), torch.tensor([0]), torch.tensor([1]))
+
+    with press(unit_test_model):
+        unit_test_model(input_ids, past_key_values=cache)
+        for layer in unit_test_model.model.layers:
+            layer.self_attn.masked_key_indices = stale_mask
+
+    expected_total_slots = (
+        unit_test_model.config.num_hidden_layers * unit_test_model.config.num_key_value_heads * context_length
+    )
+    assert cache.get_seq_length() == context_length
+    assert all(layer.self_attn.masked_key_indices is None for layer in unit_test_model.model.layers)
+    assert press.score_val is None
+    assert press.last_total_kv_slots == expected_total_slots
+    assert press.last_masked_kv_slots == 0
+    assert press.last_actual_masked_slot_ratio == 0.0
+    assert press.last_masked_chunks == expected_masked_chunks
+    assert press.last_masked_slots_per_layer == (0,) * unit_test_model.config.num_hidden_layers
+    assert_common_runtime_stats_are_python_scalars(press)
 
 
 @pytest.mark.parametrize(

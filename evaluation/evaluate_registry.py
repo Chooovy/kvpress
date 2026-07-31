@@ -105,6 +105,12 @@ PRESS_REGISTRY = {
     "lagkv": LagKVPress(),
     "lukv": LUKVPress(ExpectedAttentionPress(epsilon=2e-2), sink=4, window=1),
     "mean_pooling": MeanPoolingPress(),
+    "mean_pooling_pre_q_pre_k": MeanPoolingPress(
+        use_prerope_query=True,
+        use_prerope_keys=True,
+    ),
+    "mean_pooling_post_q_pre_k": MeanPoolingPress(use_prerope_keys=True),
+    "mean_pooling_pre_q_post_k": MeanPoolingPress(use_prerope_query=True),
     "knorm": KnormPress(),
     "observed_attention": ObservedAttentionPress(),
     "pyramidkv": PyramidKVPress(),

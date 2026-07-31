@@ -35,8 +35,14 @@ from kvpress import (
 
 logger = logging.getLogger(__name__)
 
-CHUNK_SIZE_PRESSES = {"bsa", "mean_pooling", "kvzip_chunk"}
-PROTECTED_WINDOW_PRESSES = {"bsa", "mean_pooling"}
+MEAN_POOLING_PRESS_NAMES = {
+    "mean_pooling",
+    "mean_pooling_pre_q_pre_k",
+    "mean_pooling_post_q_pre_k",
+    "mean_pooling_pre_q_post_k",
+}
+CHUNK_SIZE_PRESSES = {"bsa", "kvzip_chunk"} | MEAN_POOLING_PRESS_NAMES
+PROTECTED_WINDOW_PRESSES = {"bsa"} | MEAN_POOLING_PRESS_NAMES
 
 
 @dataclass
@@ -96,7 +102,7 @@ class EvaluationConfig:
             assert 0.0 <= self.compression_ratio < 1.0, "compression_ratio must be in [0, 1)"
             assert self.chunk_size > 0, "chunk_size must be positive"
         if self.press_name in PROTECTED_WINDOW_PRESSES:
-            assert self.protected_window_size > 0, "protected_window_size must be positive"
+            assert self.protected_window_size >= 0, "protected_window_size must be non-negative"
 
         if self.press_name == "no_press":
             # override compression_ratio to 0.0

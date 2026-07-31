@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from transformers import DynamicCache, LlamaConfig, LlamaForCausalLM, Qwen3Config, Qwen3ForCausalLM
 
+import kvpress.presses.last_query_chunk_press as last_query_chunk_press_module
 from kvpress import BSAPress, MeanPoolingPress
 
 
@@ -46,6 +47,153 @@ def make_synthetic_inputs(
     )
     kwargs = {"position_embeddings": position_embeddings}
     return module, hidden_states, keys, values, kwargs
+
+
+@pytest.mark.parametrize(
+    "use_prerope_query, use_prerope_keys",
+    (
+        (False, False),
+        (True, True),
+        (False, True),
+        (True, False),
+    ),
+)
+def test_mean_pooling_routes_expected_scoring_query_and_keys(
+    monkeypatch,
+    use_prerope_query,
+    use_prerope_keys,
+):
+    press = MeanPoolingPress(
+        chunk_size=2,
+        protected_window_size=0,
+        use_prerope_query=use_prerope_query,
+        use_prerope_keys=use_prerope_keys,
+    )
+    module = DummyAttention(num_query_heads=1, num_kv_heads=1, head_dim=2)
+    hidden_states = torch.zeros(1, 4, 2)
+    cached_postrope_keys = torch.full((1, 1, 4, 2), 11.0)
+    prerope_query = torch.tensor([[[[1.0, 2.0]]]])
+    prerope_keys = torch.full_like(cached_postrope_keys, 22.0)
+    calls = {"query": 0, "keys": 0}
+
+    def fake_get_prerope_query_states(attention_module, selected_hidden_states):
+        assert attention_module is module
+        assert torch.equal(selected_hidden_states, hidden_states[:, -1:])
+        calls["query"] += 1
+        return prerope_query
+
+    def fake_get_prerope_key_states(attention_module, selected_hidden_states):
+        assert attention_module is module
+        assert torch.equal(selected_hidden_states, hidden_states)
+        calls["keys"] += 1
+        return prerope_keys
+
+    monkeypatch.setattr(
+        last_query_chunk_press_module,
+        "get_prerope_query_states",
+        fake_get_prerope_query_states,
+    )
+    monkeypatch.setattr(
+        last_query_chunk_press_module,
+        "get_prerope_key_states",
+        fake_get_prerope_key_states,
+    )
+    position_embeddings = (
+        torch.zeros(1, 4, 2),
+        torch.ones(1, 4, 2),
+    )
+
+    scoring_query, scoring_keys = press._get_scoring_query_and_keys(
+        module,
+        hidden_states,
+        cached_postrope_keys,
+        position_embeddings,
+    )
+
+    expected_query = prerope_query.squeeze(2) if use_prerope_query else torch.tensor([[[-2.0, 1.0]]])
+    assert torch.equal(scoring_query, expected_query)
+    assert scoring_keys is (prerope_keys if use_prerope_keys else cached_postrope_keys)
+    assert calls == {"query": 1, "keys": int(use_prerope_keys)}
+
+
+def test_default_mean_pooling_does_not_project_prerope_keys(monkeypatch):
+    press = MeanPoolingPress(compression_ratio=0.5, chunk_size=4, protected_window_size=4)
+    module, hidden_states, keys, values, kwargs = make_synthetic_inputs(seq_len=16)
+
+    def fail_if_called(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("Default post/post scoring must not project pre-RoPE keys")
+
+    monkeypatch.setattr(last_query_chunk_press_module, "get_prerope_key_states", fail_if_called)
+
+    compressed_keys, compressed_values = press.compress(
+        module,
+        hidden_states,
+        keys,
+        values,
+        None,
+        kwargs,
+    )
+
+    assert compressed_keys.shape[2] == 8
+    assert compressed_values.shape[2] == 8
+
+
+def test_prerope_keys_score_remote_and_local_but_gather_original_cache(monkeypatch):
+    press = MeanPoolingPress(
+        compression_ratio=0.5,
+        chunk_size=4,
+        protected_window_size=4,
+        use_prerope_keys=True,
+    )
+    module, hidden_states, keys, values, kwargs = make_synthetic_inputs(seq_len=16)
+    cached_postrope_keys = torch.arange(keys.numel(), dtype=keys.dtype).reshape_as(keys) + 100.0
+    keys.copy_(cached_postrope_keys)
+    prerope_keys = torch.zeros_like(keys)
+    prerope_keys[:, :, 0:4] = 4.0
+    prerope_keys[:, :, 4:8] = 2.0
+    prerope_keys[:, :, 8:12] = 1.0
+    prerope_keys[:, :, 12:16] = 9.0
+    captured = {}
+
+    monkeypatch.setattr(
+        last_query_chunk_press_module,
+        "get_prerope_key_states",
+        lambda attention_module, selected_hidden_states: prerope_keys,
+    )
+
+    original_compute_remote = press._compute_remote_log_mass_proxy
+
+    def capture_remote(query_states, remote_key_chunks, scale):
+        captured["remote_keys"] = remote_key_chunks.detach().clone()
+        return original_compute_remote(query_states, remote_key_chunks, scale)
+
+    monkeypatch.setattr(press, "_compute_remote_log_mass_proxy", capture_remote)
+    original_einsum = torch.einsum
+
+    def capture_local(equation, *operands):
+        if equation == "bhgd,bhld->bhgl":
+            captured["local_keys"] = operands[1].detach().clone()
+        return original_einsum(equation, *operands)
+
+    monkeypatch.setattr(last_query_chunk_press_module.torch, "einsum", capture_local)
+
+    compressed_keys, compressed_values = press.compress(
+        module,
+        hidden_states,
+        keys,
+        values,
+        None,
+        kwargs,
+    )
+
+    expected_remote = prerope_keys[:, :, :12].reshape(1, 1, 3, 4, 2)
+    expected_indices = [0, 1, 2, 3, 12, 13, 14, 15]
+    assert torch.equal(captured["remote_keys"], expected_remote)
+    assert torch.equal(captured["local_keys"], prerope_keys[:, :, 12:])
+    assert torch.equal(compressed_keys, cached_postrope_keys[:, :, expected_indices])
+    assert torch.equal(compressed_values, values[:, :, expected_indices])
+    assert not torch.equal(compressed_keys, prerope_keys[:, :, expected_indices])
 
 
 def test_bsa_log_mass_is_fp32_and_scale_is_inside_logsumexp():
@@ -379,6 +527,36 @@ def test_tiny_gqa_model_end_to_end_and_runtime_stats(press_cls, model_type):
         assert continued_layer.keys.shape[2] == 15
         assert torch.equal(continued_layer.keys[:, :, :12], prefix_keys)
         assert torch.equal(continued_layer.values[:, :, :12], prefix_values)
+
+
+@pytest.mark.parametrize(
+    "use_prerope",
+    (False, True),
+    ids=("post_q_post_k", "pre_q_pre_k"),
+)
+def test_mean_pooling_supports_zero_protected_window(use_prerope):
+    torch.manual_seed(0)
+    model = make_tiny_gqa_model("qwen3")
+    input_ids = torch.randint(0, model.config.vocab_size, (1, 24))
+    press = MeanPoolingPress(
+        compression_ratio=0.5,
+        chunk_size=4,
+        protected_window_size=0,
+        use_prerope_query=use_prerope,
+        use_prerope_keys=use_prerope,
+    )
+    cache = DynamicCache()
+
+    with torch.no_grad(), press(model):
+        model(input_ids, past_key_values=cache, use_cache=True)
+
+    assert all(layer.keys.shape[2] == 12 for layer in cache.layers)
+    assert all(layer.values.shape[2] == 12 for layer in cache.layers)
+    assert press.last_input_tokens == 24
+    assert press.last_kept_tokens == 12
+    assert press.last_protected_tokens == 0
+    assert press.last_kept_remote_chunks == 3
+    assert press.last_actual_compression_ratio == pytest.approx(0.5)
 
 
 @pytest.mark.parametrize("model_type", ("llama", "qwen3"))

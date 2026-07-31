@@ -37,7 +37,7 @@ for module_name in SCORER_MODULES:
 from evaluate import EvaluationConfig, EvaluationRunner  # noqa: E402
 from evaluate_registry import PRESS_REGISTRY  # noqa: E402
 
-from kvpress import BSAPress, KVzipPress  # noqa: E402
+from kvpress import BSAPress, KVzipPress, MeanPoolingPress  # noqa: E402
 
 for module_name in SCORER_MODULES:
     original_module = ORIGINAL_SCORER_MODULES[module_name]
@@ -67,6 +67,44 @@ def test_kvzip_chunk_registry_and_config_use_chunk_without_protected_window(tmp_
     saved_config = yaml.safe_load(config_path.read_text())
     assert saved_config["chunk_size"] == 32
     assert "protected_window_size" not in saved_config
+
+
+@pytest.mark.parametrize(
+    "press_name, use_prerope_query, use_prerope_keys",
+    (
+        ("mean_pooling_pre_q_pre_k", True, True),
+        ("mean_pooling_post_q_pre_k", False, True),
+        ("mean_pooling_pre_q_post_k", True, False),
+    ),
+)
+def test_mean_pooling_variant_registry_and_zero_window_config(
+    tmp_path,
+    press_name,
+    use_prerope_query,
+    use_prerope_keys,
+):
+    press = PRESS_REGISTRY[press_name]
+    assert isinstance(press, MeanPoolingPress)
+    assert press.use_prerope_query is use_prerope_query
+    assert press.use_prerope_keys is use_prerope_keys
+
+    config = EvaluationConfig(
+        press_name=press_name,
+        compression_ratio=0.5,
+        chunk_size=32,
+        protected_window_size=0,
+    )
+    results_dir = config.get_results_dir(tmp_path)
+    assert "chunk32" in results_dir.name
+    assert "window0" in results_dir.name
+
+    runner = EvaluationRunner(config)
+    runner._setup_press()
+
+    assert runner.press is press
+    assert press.compression_ratio == 0.5
+    assert press.chunk_size == 32
+    assert press.protected_window_size == 0
 
 
 @pytest.mark.parametrize(

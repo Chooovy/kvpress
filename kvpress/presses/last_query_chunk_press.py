@@ -10,7 +10,7 @@ from torch import nn
 from transformers.models.llama.modeling_llama import rotate_half
 
 from kvpress.presses.base_press import BasePress
-from kvpress.utils import get_prerope_query_states
+from kvpress.utils import get_prerope_key_states, get_prerope_query_states
 
 
 @dataclass
@@ -18,9 +18,9 @@ class ChunkScorerPress(BasePress, ABC):
     """
     Base class for last-query, whole-chunk KV cache eviction.
 
-    The most recent post-RoPE query scores complete remote chunks. A recent
-    protected tail, including any final partial chunk, is always retained.
-    Subclasses differ only in how they estimate each remote chunk's log mass.
+    A scoring query ranks complete remote chunks. By default, the most recent
+    post-RoPE query scores cached post-RoPE keys. A recent protected tail,
+    including any final partial chunk, is always retained.
 
     Parameters
     ----------
@@ -29,7 +29,8 @@ class ChunkScorerPress(BasePress, ABC):
     chunk_size : int, default=64
         Number of consecutive tokens in each selectable remote chunk.
     protected_window_size : int, default=512
-        Minimum number of recent tokens to retain without scoring.
+        Minimum number of recent tokens to retain without scoring. Set to 0 for
+        no explicit protected window; a final partial chunk is still retained.
     """
 
     compression_ratio: float = 0.0
@@ -50,8 +51,8 @@ class ChunkScorerPress(BasePress, ABC):
             raise ValueError(f"compression_ratio must be in [0, 1), got {self.compression_ratio}")
         if self.chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {self.chunk_size}")
-        if self.protected_window_size <= 0:
-            raise ValueError(f"protected_window_size must be positive, got {self.protected_window_size}")
+        if self.protected_window_size < 0:
+            raise ValueError(f"protected_window_size must be non-negative, got {self.protected_window_size}")
 
     def reset_runtime_stats(self):
         """Clear per-prefill statistics before starting a new context."""
@@ -188,6 +189,16 @@ class ChunkScorerPress(BasePress, ABC):
         query_states = query_states * cos_last + rotate_half(query_states) * sin_last
         return query_states.squeeze(2)
 
+    def _get_scoring_query_and_keys(
+        self,
+        module: nn.Module,
+        hidden_states: torch.Tensor,
+        keys: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the query and keys used only for chunk scoring."""
+        return self._get_postrope_last_query(module, hidden_states, position_embeddings), keys
+
     def _expand_chunk_indices(
         self,
         chunk_indices: torch.Tensor,
@@ -280,11 +291,16 @@ class ChunkScorerPress(BasePress, ABC):
                     "Last-query chunk presses require position_embeddings to reconstruct the post-RoPE query."
                 )
 
-            query_states = self._get_postrope_last_query(module, hidden_states, kwargs["position_embeddings"])
-            grouped_queries = self._group_query_heads(query_states, keys)
+            query_states, scoring_keys = self._get_scoring_query_and_keys(
+                module,
+                hidden_states,
+                keys,
+                kwargs["position_embeddings"],
+            )
+            grouped_queries = self._group_query_heads(query_states, scoring_keys)
             scale = float(getattr(module, "scaling", head_dim**-0.5))
 
-            remote_key_chunks = keys[:, :, :candidate_end, :].reshape(
+            remote_key_chunks = scoring_keys[:, :, :candidate_end, :].reshape(
                 batch_size,
                 num_kv_heads,
                 num_remote_chunks,
@@ -297,7 +313,7 @@ class ChunkScorerPress(BasePress, ABC):
                 scale,
             )
 
-            local_keys = keys[:, :, candidate_end:, :]
+            local_keys = scoring_keys[:, :, candidate_end:, :]
             local_logits = (
                 torch.einsum(
                     "bhgd,bhld->bhgl",
@@ -356,12 +372,31 @@ class BSAPress(ChunkScorerPress):
 @dataclass
 class MeanPoolingPress(ChunkScorerPress):
     """
-    Last-query eviction using the dot product with each post-RoPE mean key.
+    Last-query eviction using the dot product with each mean scoring key.
 
-    The mean logit is shifted by log(chunk_size) before local-inclusive GQA
-    normalization. This is the exact chunk log mass when all token logits in a
-    chunk are equal, and otherwise serves as a uniform-chunk mass proxy.
+    Scoring uses the post-RoPE query and cached post-RoPE keys by default. The
+    query and keys can independently use their pre-RoPE representations for
+    controlled ablations. The mean logit is shifted by log(chunk_size) before
+    local-inclusive GQA normalization.
     """
+
+    use_prerope_query: bool = False
+    use_prerope_keys: bool = False
+
+    def _get_scoring_query_and_keys(
+        self,
+        module: nn.Module,
+        hidden_states: torch.Tensor,
+        keys: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.use_prerope_query:
+            query_states = get_prerope_query_states(module, hidden_states[:, -1:]).squeeze(2)
+        else:
+            query_states = self._get_postrope_last_query(module, hidden_states, position_embeddings)
+
+        scoring_keys = get_prerope_key_states(module, hidden_states) if self.use_prerope_keys else keys
+        return query_states, scoring_keys
 
     def _compute_remote_log_mass_proxy(
         self,

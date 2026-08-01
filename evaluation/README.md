@@ -33,6 +33,24 @@ or pass a custom configuration file:
 python evaluate.py --config_file <your_config.yaml>
 ```
 
+For matched Qwen3-8B 32K/64K runs with static 2x YaRN, reuse the provided
+model-loading configuration and change only the RULER dataset length and
+`max_context_length`:
+
+```bash
+python evaluate.py \
+    --config_file configs/qwen3_8b_yarn2_64k.yaml \
+    --model Qwen/Qwen3-8B \
+    --dataset ruler \
+    --data_dir 65536 \
+    --max_context_length 65536
+```
+
+The same YaRN configuration should also be used for the matched 32K arm, with
+both length arguments set to `32768`. Generate RULER inputs with the tested
+model tokenizer and ensure the combined input and output budget fits the chosen
+length; changing only `max_context_length` does not extend the model's RoPE.
+
 💡 Results (predictions & metrics) are automatically saved to the `output_dir` directory .
 
 

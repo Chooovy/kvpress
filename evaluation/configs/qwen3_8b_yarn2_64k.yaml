@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Static 2x YaRN overrides for Qwen3-8B. Keep max_context_length as a CLI
+# argument so the same model configuration can be used for matched 32K/64K runs.
+model_kwargs:
+  attn_implementation: sdpa
+  max_position_embeddings: 65536
+  rope_scaling:
+    rope_type: yarn
+    factor: 2.0
+    original_max_position_embeddings: 32768

@@ -27,14 +27,16 @@ SCORER_MODULES = (
     "benchmarks.ruler.calculate_metrics",
     "benchmarks.zero_scrolls.calculate_metrics",
 )
-ORIGINAL_SCORER_MODULES = {module_name: sys.modules.get(module_name) for module_name in SCORER_MODULES}
+ORIGINAL_SCORER_MODULES = {
+    module_name: sys.modules.get(module_name) for module_name in SCORER_MODULES
+}
 for module_name in SCORER_MODULES:
     scorer_module = ModuleType(module_name)
     scorer_module.calculate_metrics = lambda df: {}  # type: ignore[attr-defined]
     scorer_module.calculate_metrics_e = lambda df: {}  # type: ignore[attr-defined]
     sys.modules[module_name] = scorer_module
 
-from evaluate import EvaluationConfig, EvaluationRunner  # noqa: E402
+from evaluate import EvaluationConfig, EvaluationRunner, _load_yaml_config  # noqa: E402
 from evaluate_registry import PRESS_REGISTRY  # noqa: E402
 
 from kvpress import BSAPress, KVzipPress, MeanPoolingPress  # noqa: E402
@@ -166,6 +168,52 @@ def test_dataset_sampling_preserves_source_index_as_sample_id(monkeypatch):
     assert runner.df.index.tolist() == expected.index.tolist()
     assert runner.df["sample_id"].tolist() == expected.index.tolist()
     assert runner.df["context"].tolist() == expected["context"].tolist()
+
+
+def test_nested_model_kwargs_are_forwarded_and_saved_unchanged(monkeypatch, tmp_path):
+    expected_model_kwargs = {
+        "attn_implementation": "sdpa",
+        "max_position_embeddings": 65536,
+        "rope_scaling": {
+            "rope_type": "yarn",
+            "factor": 2.0,
+            "original_max_position_embeddings": 32768,
+        },
+    }
+    model_kwargs = _load_yaml_config(
+        EVALUATION_DIR / "configs" / "qwen3_8b_yarn2_64k.yaml"
+    )["model_kwargs"]
+    assert model_kwargs == expected_model_kwargs
+    config = EvaluationConfig(
+        model="Qwen/Qwen3-8B",
+        device="cpu",
+        model_kwargs=model_kwargs,
+    )
+    captured = {}
+
+    class FakeModel:
+        def eval(self):
+            return self
+
+    class FakePipeline:
+        model = FakeModel()
+
+    def fake_pipeline(task, **kwargs):
+        captured["task"] = task
+        captured["kwargs"] = kwargs
+        return FakePipeline()
+
+    monkeypatch.setitem(sys.modules, "flash_attn", None)
+    monkeypatch.setattr("evaluate.pipeline", fake_pipeline)
+    runner = EvaluationRunner(config)
+    runner._setup_model_pipeline()
+
+    assert captured["task"] == "kv-press-text-generation"
+    assert captured["kwargs"]["model_kwargs"] == model_kwargs
+
+    saved_path = tmp_path / "saved.yaml"
+    config.save_config(saved_path)
+    assert yaml.safe_load(saved_path.read_text())["model_kwargs"] == model_kwargs
 
 
 @pytest.mark.parametrize(

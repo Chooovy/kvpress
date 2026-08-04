@@ -12,11 +12,13 @@ from transformers.pipelines import PIPELINE_REGISTRY
 from transformers.pipelines.base import GenericTensor
 
 from kvpress.presses.base_press import BasePress
+from kvpress.presses.decode_press import DecodePress
 from kvpress.presses.decoding_press import DecodingPress
 from kvpress.presses.finch_press import FinchPress
 from kvpress.presses.key_rerotation_press import KeyRerotationPress
 from kvpress.presses.observed_attention_press import ObservedAttentionPress
 from kvpress.presses.prefill_decoding_press import PrefillDecodingPress
+from kvpress.presses.gt_score_press import GTScorePress
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,8 @@ class KVPressTextGenerationPipeline(Pipeline):
         max_new_tokens: int = 50,
         max_context_length: Optional[int] = None,
         cache: Optional[Cache] = None,
+        use_chunk_prefill: bool = False,
+        chunk_prefill_size: Optional[int] = None,
         **kwargs,
     ):
         """
@@ -94,7 +98,13 @@ class KVPressTextGenerationPipeline(Pipeline):
             "answer_prefix": answer_prefix,
             "max_context_length": max_context_length,
         }
-        forward_kwargs = {"press": press, "max_new_tokens": max_new_tokens, "cache": cache}
+        forward_kwargs = {
+            "press": press,
+            "max_new_tokens": max_new_tokens,
+            "cache": cache,
+            "use_chunk_prefill": use_chunk_prefill,
+            "chunk_prefill_size": chunk_prefill_size,
+        }
         return preprocess_kwargs, forward_kwargs, postprocess_kwargs
 
     def preprocess(
@@ -134,14 +144,32 @@ class KVPressTextGenerationPipeline(Pipeline):
             context = bos_token + context
             question_suffix = "\n"  # to separate the question from the answer
         else:
-            separator = "\n" + "#" * len(context)
+            # NOTE: `context` may be empty for some datasets (e.g. aime24 sets context="").
+            # The previous separator logic (`"\n" + "#" * len(context)`) degenerates to "\n",
+            # which appears many times in chat templates and breaks `split()` unpacking.
+            # Use a unique sentinel and only split once to robustly recover the
+            # (templated) context prefix and the question suffix.
+            # Use a unique marker that survives chat-template normalization. Some
+            # templates may strip/alter surrounding newlines, so avoid depending on them.
+            separator = "<|KV_PRESS_SEPARATOR|>"
             context = self.tokenizer.apply_chat_template(
                 [{"role": "user", "content": context + separator}],
                 add_generation_prompt=True,
                 tokenize=False,
                 enable_thinking=False,
             )
-            context, question_suffix = context.split(separator)
+            parts = context.split(separator, 1)
+            if len(parts) != 2:
+                # Fallback: if something odd happened (e.g. template transforms whitespace),
+                # try splitting from the right once before giving up.
+                parts = context.rsplit(separator, 1)
+            if len(parts) != 2:
+                raise ValueError(
+                    "Failed to split chat-templated prompt into (context, question_suffix). "
+                    f"Expected exactly one occurrence of separator={separator!r}, "
+                    f"but found {context.count(separator)}."
+                )
+            context, question_suffix = parts
 
         # Add question_suffix and answer prefix
         # e.g. for llama3.1, question_suffix="<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n")
@@ -162,12 +190,53 @@ class KVPressTextGenerationPipeline(Pipeline):
 
         return {"context_ids": context_ids, "questions_ids": question_ids}
 
+
+    def _chunk_prefill_context(
+        self,
+        context_ids: torch.Tensor,
+        cache: Cache,
+        press: Optional[BasePress],
+        chunk_prefill_size: int,
+    ):
+        output_attentions = self.output_attentions(press)
+        num_chunks = (context_ids.shape[1] + chunk_prefill_size - 1) // chunk_prefill_size
+
+        for chunk_idx, start in enumerate(range(0, context_ids.shape[1], chunk_prefill_size)):
+            end = min(start + chunk_prefill_size, context_ids.shape[1])
+            seg_ids = context_ids[:, start:end]
+
+            # IMPORTANT:
+            # After online compression, the real KV length is no longer equal to `start`.
+            # We must use the ACTUAL cache length to construct a contiguous cache_position
+            # that matches the physically stored KV cache.
+            seg_cache_pos = torch.arange(
+                start,
+                end,
+                device=seg_ids.device,
+            )
+
+
+            self.model(
+                input_ids=seg_ids,
+                past_key_values=cache,
+                cache_position=seg_cache_pos,
+                use_cache=True,
+                output_attentions=output_attentions,
+                kvpress_chunk_prefill=True,
+                kvpress_chunk_start=start,
+                kvpress_chunk_end=end,
+                kvpress_chunk_idx=chunk_idx,
+                kvpress_num_chunks=num_chunks,
+            )
+            
     def _forward(
         self,
         input_tensors: dict[str, GenericTensor],
         max_new_tokens: int = 50,
         press: Optional[BasePress] = None,
         cache: Optional[Cache] = None,
+        use_chunk_prefill: bool = False,
+        chunk_prefill_size: Optional[int] = None,
     ):
         """
         Execute KV cache compression and text generation pipeline.
@@ -191,7 +260,7 @@ class KVPressTextGenerationPipeline(Pipeline):
         list[str]
             Generated answers for each input question.
         """
-        if isinstance(press, (DecodingPress, PrefillDecodingPress)) and len(input_tensors["questions_ids"]) > 1:
+        if isinstance(press, (DecodePress, DecodingPress, PrefillDecodingPress)) and len(input_tensors["questions_ids"]) > 1:
             raise ValueError(
                 "DecodingPress is not compatible with multiple questions. Please specify a single question."
             )
@@ -206,18 +275,35 @@ class KVPressTextGenerationPipeline(Pipeline):
         # We only perform prefill compression if the press is a prefill press
         perform_prefill_compression = press is not None and not isinstance(press, DecodingPress)
         with press(self.model) if perform_prefill_compression else contextlib.nullcontext():
-            # We run the model without the lm head for pre-filling.
-            self.model.model(
-                input_ids=context_ids,
-                past_key_values=cache,
-                output_attentions=self.output_attentions(press),
-            )
+            if use_chunk_prefill and chunk_prefill_size is not None and chunk_prefill_size > 0:
+                if press is not None and hasattr(press, "_reset_chunk_prefill_buffers"):
+                    press._reset_chunk_prefill_buffers()
+
+                self._chunk_prefill_context(
+                    context_ids=context_ids,
+                    cache=cache,
+                    press=press,
+                    chunk_prefill_size=int(chunk_prefill_size),
+                )
+
+                # After all chunks are processed, run deferred finalize (e.g. streaming score + block-compress).
+                if press is not None and hasattr(press, "finalize_chunk_prefill"):
+                    cache = press.finalize_chunk_prefill(self.model, cache)
+
+                context_length = self._actual_cache_length(cache)
+            else:
+                self.model(
+                    input_ids=context_ids,
+                    past_key_values=cache,
+                    use_cache=True,
+                    output_attentions=self.output_attentions(press),
+                )
 
             logger.debug(f"Context Length: {context_length}")
-            logger.debug(f"Compressed Context Length: {cache.get_seq_length()}")
+            logger.debug(f"Compressed Context Length: {self._actual_cache_length(cache)}")
 
         # We only perform decoding compression if the press is a decoding or prefill decoding press
-        perform_decoding_compression = press is not None and isinstance(press, (DecodingPress, PrefillDecodingPress))
+        perform_decoding_compression = press is not None and isinstance(press, (DecodePress, DecodingPress, PrefillDecodingPress))
         with press(self.model) if perform_decoding_compression else contextlib.nullcontext():
             # Greedy decoding for each question
             answers = []
@@ -237,6 +323,23 @@ class KVPressTextGenerationPipeline(Pipeline):
                 answers.append(answer)
         return answers
 
+    def _actual_cache_length(self, cache: Cache) -> int:
+        #从真实 KV 取长度，不要信 cache.get_seq_length()
+        lengths = []
+        for layer_idx in range(len(cache)):
+            layer = cache.layers[layer_idx]
+            if getattr(layer, "keys", None) is not None:
+                lengths.append(layer.keys.shape[2])
+
+        if not lengths:
+            return 0
+
+        first = lengths[0]
+        for i, x in enumerate(lengths):
+            if x != first:
+                raise ValueError(f"Inconsistent cache lengths across layers: layer0={first}, layer{i}={x}")
+        return first
+
     def _remove_answer_from_cache(self, cache: Cache, cache_seq_lengths: list[int]):
 
         for layer_idx, sequence_length in enumerate(cache_seq_lengths):
@@ -255,63 +358,75 @@ class KVPressTextGenerationPipeline(Pipeline):
     def generate_answer(
         self, question_ids: torch.Tensor, cache: Cache, context_length: int, max_new_tokens: int
     ) -> str:
-        """
-        Generate an answer to a question using greedy decoding.
+    #后续 question 的位置和 cache 位置，必须从“压缩后真实还剩多少 token”开始算
+        logger.info(f"[generate_answer] input context_length = {context_length}")
+        logger.info(f"[generate_answer] actual cache length = {self._actual_cache_length(cache)}")
+        real_cache_len = self._actual_cache_length(cache)
+        if context_length != real_cache_len:
+            logger.warning(
+                f"[generate_answer] context_length ({context_length}) != actual cache length ({real_cache_len}); "
+                f"using actual cache length."
+            )
+            context_length = real_cache_len
 
-        Parameters
-        ----------
-        question_ids : torch.Tensor
-            The tokenized question.
-        cache : Cache
-            The compressed key-value cache.
-        context_length : int
-            The length of the context.
-        max_new_tokens : int
-            The maximum number of new tokens to generate.
+        question_ids = question_ids.to(self.model.device)
 
-        Returns
-        -------
-        str
-            The generated answer.
-        """
+        # Use the REAL cache length as the starting position.
         position_ids = torch.arange(
             context_length, context_length + question_ids.shape[1], device=self.model.device
         ).unsqueeze(0)
+        cache_position = position_ids.clone()
 
-        # if the user doesn't provide a question, skip forward pass
         outputs = self.model(
-            input_ids=question_ids.to(self.model.device),
+            input_ids=question_ids,
             past_key_values=cache,
             position_ids=position_ids,
+            cache_position=cache_position,
             num_logits_to_keep=1,
         )
 
-        position_ids = position_ids[:, -1:] + 1
+        next_position = torch.tensor([[context_length + question_ids.shape[1]]], device=self.model.device)
         generated_ids = [outputs.logits[0, -1].argmax()]
 
         should_stop_token_ids = self.model.generation_config.eos_token_id
         if not isinstance(should_stop_token_ids, list):
             should_stop_token_ids = [should_stop_token_ids]
 
-        for i in range(max_new_tokens - 1):
+        for _ in range(max_new_tokens - 1):
             outputs = self.model(
                 input_ids=generated_ids[-1].unsqueeze(0).unsqueeze(0),
                 past_key_values=cache,
-                position_ids=position_ids + i,
+                position_ids=next_position,
+                cache_position=next_position,
             )
             new_id = outputs.logits[0, -1].argmax()
             generated_ids.append(new_id)
             if new_id.item() in should_stop_token_ids:
                 break
+            next_position = next_position + 1
+
         answer = self.tokenizer.decode(torch.stack(generated_ids), skip_special_tokens=True)
         return answer
 
     def output_attentions(self, press: BasePress):
-        if isinstance(press, ObservedAttentionPress):
-            return True
-        if hasattr(press, "press") and isinstance(press.press, ObservedAttentionPress):
-            return True
-        return False
+        def contains(p: Optional[BasePress]) -> bool:
+            if p is None:
+                return False
+            if isinstance(p, (ObservedAttentionPress, GTScorePress)):
+                return True
+            # common wrappers
+            if hasattr(p, "press") and contains(getattr(p, "press")):
+                return True
+            if hasattr(p, "base_press") and contains(getattr(p, "base_press")):
+                return True
+            if hasattr(p, "presses"):
+                try:
+                    return any(contains(x) for x in getattr(p, "presses"))
+                except Exception:
+                    return False
+            return False
+
+        return contains(press)
 
     def postprocess(self, model_outputs, single_question):
         if single_question:

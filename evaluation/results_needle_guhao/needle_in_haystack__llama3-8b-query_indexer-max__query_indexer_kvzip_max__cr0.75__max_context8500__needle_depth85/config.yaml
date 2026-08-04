@@ -1,0 +1,29 @@
+dataset: needle_in_haystack
+data_dir: ''
+model: /aifs4su/guhao/checkpoints/llama3-8b-query_indexer-max
+device: cuda:0
+press_name: query_indexer_kvzip_max
+compression_ratio: 0.75
+key_channel_compression_ratio: null
+samples: null
+fraction: 1.0
+max_new_tokens: null
+max_context_length: 8500
+compress_questions: false
+needle_depth: 85
+compression_interval: null
+target_size: null
+hidden_states_buffer_size: null
+output_dir: ./results_needle_guhao
+log_level: INFO
+model_kwargs:
+  attn_implementation: flash_attention_2
+  dtype: auto
+  device_map: cuda:0
+press_init_command: QueryIndexer_KVzipScorePress(compression_ratio=0.75, n_sink=4,
+  chunk_size=2048, prev_postfix_size=8, block_size=None, score_reduce='amax_logit_softmax',
+  last_n_query=None)
+seed: 42
+task: null
+filter_max_tokens: 131072
+filter_on: context+question

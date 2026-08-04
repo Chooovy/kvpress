@@ -1,0 +1,35 @@
+dataset: needle_in_haystack
+data_dir: ''
+model: /aifs4su/guhao/checkpoints/llama3-8b-query_indexer-max
+device: cuda:0
+press_name: query_indexer_max_mode
+compression_ratio: 0.5
+key_channel_compression_ratio: null
+samples: null
+fraction: 1.0
+max_new_tokens: null
+max_context_length: 4000
+compress_questions: false
+needle_depth: 85
+compression_interval: null
+target_size: null
+hidden_states_buffer_size: null
+output_dir: ./results_needle
+log_level: INFO
+model_kwargs:
+  attn_implementation: flash_attention_2
+  dtype: auto
+  device_map: cuda:0
+press_init_command: QueryIndexerScorePress(compression_ratio=0.5, mean_head=False,
+  layer_running_mean=False, running_mean_start_layer=0, entropy_gate=False, entropy_gate_level='head',
+  entropy_skip='low', entropy_threshold_mode='mean', entropy_threshold=0.5, entropy_quantile=0.5,
+  entropy_eps=1e-12, entropy_debug=False, entropy_shift_mode='always_min', entropy_prob_mode='l1',
+  entropy_softmax_tau=1.0, layer_running_alpha=1.0, layer_running_use_max=False, layer_running_skip_spiky=False,
+  layer_spiky_scope='head', layer_spiky_metric='entropy', layer_spiky_entropy_thresh=0.4,
+  layer_spiky_peak_thresh=0.0, meanmax_gate=False, meanmax_gate_keep_high=False, scorer_attr='indexer',
+  use_vnorm=False, n_sink=4, mask_fill_value=-10000.0, _initialized=False, enable_low_rank=True,
+  max_batch_size=8, max_seq_len=4096, use_pooling=False, pooling_kernel_size=3, chunk_size=128,
+  activation='relu', last_n_query=None, query_reduce='max', block_size=16, recency_half_life=32.0,
+  top_p_mass=0.9, top_p_keep_ratio=0.25, top_p_min_queries=8, top_p_topk=256, question_len=0)
+seed: 42
+task: null

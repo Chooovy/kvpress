@@ -1,0 +1,30 @@
+dataset: needle_in_haystack
+data_dir: ''
+model: /aifs4su/guhao/Models/Llama-3.1-8B-Instruct
+device: cuda:0
+press_name: expected_attention
+compression_ratio: 0.1
+key_channel_compression_ratio: null
+samples: null
+fraction: 1.0
+max_new_tokens: null
+max_context_length: 6500
+compress_questions: false
+needle_depth: 85
+compression_interval: null
+target_size: null
+hidden_states_buffer_size: null
+output_dir: ./results_needle
+log_level: INFO
+model_kwargs:
+  attn_implementation: flash_attention_2
+  dtype: auto
+press_init_command: ExpectedAttentionPress(compression_ratio=0.1, mean_head=False,
+  layer_running_mean=False, running_mean_start_layer=0, entropy_gate=False, entropy_gate_level='head',
+  entropy_skip='low', entropy_threshold_mode='mean', entropy_threshold=0.5, entropy_quantile=0.5,
+  entropy_eps=1e-12, entropy_debug=False, entropy_shift_mode='always_min', entropy_prob_mode='l1',
+  entropy_softmax_tau=1.0, layer_running_alpha=1.0, layer_running_use_max=False, layer_running_skip_spiky=False,
+  layer_spiky_scope='head', layer_spiky_metric='entropy', layer_spiky_entropy_thresh=0.4,
+  layer_spiky_peak_thresh=0.0, meanmax_gate=False, meanmax_gate_keep_high=False, n_future_positions=512,
+  n_sink=4, use_covariance=True, use_vnorm=True, epsilon=0.0)
+seed: 42

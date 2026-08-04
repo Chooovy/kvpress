@@ -1,0 +1,25 @@
+dataset: ruler
+data_dir: 4096
+model: /aifs4su/guhao/Models/Llama-3.1-8B-Instruct
+device: cuda:0
+press_name: expected_attention_head_mean
+compression_ratio: 0.9
+key_channel_compression_ratio: null
+samples: null
+fraction: 1.0
+max_new_tokens: null
+max_context_length: null
+compress_questions: false
+needle_depth: null
+compression_interval: null
+target_size: null
+hidden_states_buffer_size: null
+output_dir: ./results_mean_debug
+log_level: INFO
+model_kwargs:
+  attn_implementation: flash_attention_2
+  dtype: auto
+press_init_command: ExpectedAttentionPress(compression_ratio=0.9, mean_head=True,
+  layer_running_mean=False, n_future_positions=512, n_sink=4, use_covariance=True,
+  use_vnorm=True, epsilon=0.0)
+seed: 42

@@ -1,0 +1,25 @@
+dataset: ruler
+data_dir: '4096'
+model: /aifs4su/guhao/Models/Llama-3.2-3B-Instruct
+device: 0
+press_name: expected_attention
+compression_ratio: 0.75
+key_channel_compression_ratio: null
+samples: null
+fraction: 1.0
+max_new_tokens: null
+max_context_length: null
+compress_questions: false
+needle_depth: null
+compression_interval: null
+target_size: null
+hidden_states_buffer_size: null
+output_dir: /aifs4su/guhao/KVCache/kvpress/evaluation/results_ea_means
+log_level: INFO
+model_kwargs:
+  attn_implementation: null
+  dtype: auto
+press_init_command: ExpectedAttentionPress(compression_ratio=0.75, mean_head=False,
+  layer_running_mean=False, n_future_positions=512, n_sink=4, use_covariance=True,
+  use_vnorm=True, epsilon=0.0)
+seed: 42

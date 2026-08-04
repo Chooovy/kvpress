@@ -1,0 +1,23 @@
+dataset: math500
+data_dir: '4096'
+model: /aifs4su/guhao/Models/DeepSeek-R1-Distill-Qwen-1.5B
+device: cuda:0
+press_name: no_press
+compression_ratio: 0.0
+key_channel_compression_ratio: null
+samples: 20
+fraction: 1.0
+max_new_tokens: null
+max_context_length: null
+compress_questions: false
+needle_depth: null
+compression_interval: null
+target_size: null
+hidden_states_buffer_size: null
+output_dir: ./results_math
+log_level: INFO
+model_kwargs:
+  attn_implementation: flash_attention_2
+  dtype: auto
+press_init_command: None
+seed: 42

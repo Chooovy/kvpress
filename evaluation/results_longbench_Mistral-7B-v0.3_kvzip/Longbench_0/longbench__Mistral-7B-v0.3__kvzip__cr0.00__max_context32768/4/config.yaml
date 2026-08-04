@@ -1,0 +1,22 @@
+dataset: longbench
+data_dir: null
+model: /aifs4su/guhao/Models/Mistral-7B-v0.3
+device: 0
+press_name: kvzip
+compression_ratio: 0.0
+key_channel_compression_ratio: null
+samples: null
+fraction: 1.0
+max_new_tokens: null
+max_context_length: 32768
+compress_questions: false
+needle_depth: null
+compression_interval: null
+target_size: null
+hidden_states_buffer_size: null
+output_dir: ./results_longbench_Mistral-7B-v0.3_kvzip/Longbench_0
+log_level: INFO
+model_kwargs:
+  attn_implementation: sdpa
+press_init_command: KVzipPress(compression_ratio=0.0, layerwise=False, n_sink=4)
+seed: 42

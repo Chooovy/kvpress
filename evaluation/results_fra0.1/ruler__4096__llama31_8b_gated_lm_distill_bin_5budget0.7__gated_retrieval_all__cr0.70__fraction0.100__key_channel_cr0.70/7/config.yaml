@@ -1,0 +1,34 @@
+dataset: ruler
+data_dir: 4096
+model: /aifs4su/guhao/checkpoints/llama31_8b_gated_lm_distill_bin_5budget0.7
+device: cuda:0
+press_name: gated_retrieval_all
+compression_ratio: 0.7
+key_channel_compression_ratio: 0.7
+samples: null
+fraction: 0.1
+max_new_tokens: null
+max_context_length: null
+compress_questions: false
+needle_depth: null
+compression_interval: null
+target_size: null
+hidden_states_buffer_size: null
+output_dir: ./results_fra0.1
+log_level: INFO
+model_kwargs:
+  attn_implementation: flash_attention_2
+  dtype: auto
+  device_map: cuda:0
+press_init_command: GatedPress(gate_mode='dynamic', static_separate_kv=True, gate_type='elementwise',
+  init='open', init_open_p=0.999, bias=True, record_mse=False, mse_detach_target=True,
+  mse_reduction='token_mean', aux_fp32=True, reg_type='group_lasso', gate_sparsity_threshold=0.5,
+  key_channel_compression_ratio=0.7, window_size=-1, pairwise_prune=True, sync_kv_prune=True,
+  qk_scale_correction=True, _warned_channel_prune_unsupported=False, capture_mode='gated',
+  apply_kv_gate=True, record_gate_stats=False, train_gate_mode='soft', rope_pairing='half',
+  cache_infer_mask=True, prune_in_compress=False, protect_retrieval_heads=True, retrieval_head_topk=2,
+  duo_cache_dir='/home/guhao/.cache/kvpress_duo', duo_num_samples=50, duo_q_len=500,
+  duo_dataset='kmfoda/booksum', duo_split='train', duo_text_field='chapter', duo_seed=42,
+  protected_kv_heads=None, protected_q_heads=None, preserve_global_key_channel_ratio=True,
+  debug_layers=[0, 1, 2], debug=True)
+seed: 42

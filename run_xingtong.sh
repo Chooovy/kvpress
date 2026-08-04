@@ -1,0 +1,5 @@
+JOBID=$(sbatch slurm_xingtong.sh | awk '{print $4}')
+echo "Job ID: ${JOBID}"
+sleep 3
+
+tail -f logs/slurm-${JOBID}.err

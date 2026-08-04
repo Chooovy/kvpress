@@ -39,6 +39,16 @@ class ThinKPress(BasePress):
 
     key_channel_compression_ratio: float = 0.0
     window_size: int = 32
+    # Pruning controls
+    # - pairwise_prune: prune RoPE dimension pairs (2i, 2i+1) together to avoid breaking RoPE structure.
+    # - sync_kv_prune: apply the same dimension pruning mask to both K and V (recommended for high ratios).
+    pairwise_prune: bool = False
+    sync_kv_prune: bool = False
+    # If we prune key dimensions (set to 0) but keep using the original 1/sqrt(d_k) scaling
+    # inside softmax attention, logits variance drops and attention becomes too uniform.
+    # Enable this to compensate by scaling pruned keys by sqrt(d_k / d_eff),
+    # where d_eff = d_k - n_pruned.
+    qk_scale_correction: bool = True
 
     def compute_window_queries(self, module, hidden_states, position_embeddings):
         """
@@ -82,10 +92,37 @@ class ThinKPress(BasePress):
         key_scores = queries_norm * keys_norm  # (bsz, num_key_value_heads, head_dim)
 
         # Prune dimensions with the lowest scores by setting them to 0
-        n_pruned = int(head_dim * self.key_channel_compression_ratio)
-        indices = key_scores.topk(n_pruned, dim=-1, largest=False).indices
-        indices = indices.unsqueeze(2).expand(-1, -1, k_len, -1)
-        keys = keys.scatter_(-1, indices, 0)
+        ratio = float(self.key_channel_compression_ratio)
+        n_pruned_dims = int(head_dim * ratio)
+        n_pruned_dims = min(max(1, n_pruned_dims), head_dim - 1)
+
+        if self.pairwise_prune and head_dim % 2 == 0 and n_pruned_dims >= 2:
+            # Convert per-dim scores -> per-pair scores, then prune whole pairs.
+            pair_scores = 0.5 * (key_scores[..., 0::2] + key_scores[..., 1::2])  # (bsz, kv_heads, head_dim/2)
+            n_pairs = head_dim // 2
+            n_pruned_pairs = min(max(1, n_pruned_dims // 2), n_pairs - 1)
+            pair_idx = pair_scores.topk(n_pruned_pairs, dim=-1, largest=False).indices  # (bsz, kv_heads, n_pruned_pairs)
+
+            dim_idx = torch.stack((pair_idx * 2, pair_idx * 2 + 1), dim=-1).reshape(bsz, num_key_value_heads, 2 * n_pruned_pairs)
+            dim_idx = dim_idx.unsqueeze(2).expand(-1, -1, k_len, -1)
+            keys = keys.scatter_(-1, dim_idx, 0)
+            if self.sync_kv_prune:
+                values = values.scatter_(-1, dim_idx, 0)
+            n_pruned_eff = 2 * n_pruned_pairs
+        else:
+            dim_idx = key_scores.topk(n_pruned_dims, dim=-1, largest=False).indices
+            dim_idx = dim_idx.unsqueeze(2).expand(-1, -1, k_len, -1)
+            keys = keys.scatter_(-1, dim_idx, 0)
+            if self.sync_kv_prune:
+                values = values.scatter_(-1, dim_idx, 0)
+            n_pruned_eff = n_pruned_dims
+
+        # QK scaling correction: scale K so that Var(q^T k) stays roughly stable after pruning.
+        # Equivalent to using 1/sqrt(d_eff) instead of 1/sqrt(d_k) in attention.
+        if self.qk_scale_correction and n_pruned_eff > 0 and head_dim - n_pruned_eff > 0:
+            d_eff = head_dim - n_pruned_eff
+            scale = (head_dim / d_eff) ** 0.5
+            keys = keys * scale
 
         return keys, values
 

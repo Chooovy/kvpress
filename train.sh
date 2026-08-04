@@ -1,0 +1,13 @@
+accelerate launch --num_processes 1 train_score.py \
+    --model_name_or_path /aifs4su/guhao/Models/Llama-3-8B-1M \
+    --output_dir /aifs4su/guhao/KVCache/checkpoints/llama-3-8b-1m-query-indexer \
+    --per_device_train_batch_size 1 \
+    --per_device_eval_batch_size 1 \
+    --gradient_accumulation_steps 4 \
+    --press_method query_indexer_score \
+    --num_train_epochs 1 \
+    --learning_rate 1e-3 \
+    --n_sink 4 \
+    --pt_context_len 3072 \
+    --max_train_samples 8192 \
+    --attn_implementation eager \

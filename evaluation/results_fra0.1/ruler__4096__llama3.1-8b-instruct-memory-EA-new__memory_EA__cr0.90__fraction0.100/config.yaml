@@ -1,0 +1,27 @@
+dataset: ruler
+data_dir: 4096
+model: /aifs4su/guhao/checkpoints/llama3.1-8b-instruct-memory-EA-new
+device: cuda:0
+press_name: memory_EA
+compression_ratio: 0.9
+key_channel_compression_ratio: null
+samples: null
+fraction: 0.1
+max_new_tokens: null
+max_context_length: null
+compress_questions: false
+needle_depth: null
+compression_interval: null
+target_size: null
+hidden_states_buffer_size: null
+output_dir: ./results_fra0.1
+log_level: INFO
+model_kwargs:
+  attn_implementation: flash_attention_2
+  dtype: auto
+  device_map: cuda:0
+press_init_command: MemoryScorerPress(compression_ratio=0.9, mean_head=False, layer_running_mean=False,
+  base_press=ExpectedAttentionPress(compression_ratio=0.0, mean_head=False, layer_running_mean=False,
+  n_future_positions=512, n_sink=4, use_covariance=True, use_vnorm=True, epsilon=0.0),
+  d_phi=None, decay=1.0, write_eta=1.0, use_denominator=True, attach_to_module=True)
+seed: 42

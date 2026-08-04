@@ -13,12 +13,13 @@ from kvpress.presses.adakv_press import AdaKVPress
 from kvpress.presses.base_press import BasePress
 from kvpress.presses.scorer_press import ScorerPress
 from kvpress.utils import extract_keys_and_values
+from kvpress.presses.decode_press import DecodePress
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class DecodingPress(BasePress):
+class DecodingPress(DecodePress):
     """
     A press that only operates during decoding phase and maintains a running buffer of hidden states.
 
@@ -147,6 +148,7 @@ class DecodingPress(BasePress):
 
             # Apply compression using buffered hidden states for this layer
             buffered_hidden_states = torch.cat(self.hidden_states_buffer[layer_idx], dim=1)
+            kwargs["is_decoding"] = True
             keys, values = self.compress(module, buffered_hidden_states, keys, values, attentions, kwargs)
             logger.debug(f"Applied decoding compression: " f"keys.shape: {keys.shape}, values.shape: {values.shape}")
 
@@ -178,6 +180,11 @@ class DecodingPress(BasePress):
         """Reset the decoding press state."""
         self.hidden_states_buffer = defaultdict(list)
         self.layer_step_counts = defaultdict(int)
+        # Reset underlying base press state if it maintains per-sequence cache/state.
+        if hasattr(self.base_press, "reset") and callable(getattr(self.base_press, "reset")):
+            self.base_press.reset()
+        elif hasattr(self.base_press, "_reset_cache") and callable(getattr(self.base_press, "_reset_cache")):
+            self.base_press._reset_cache()
 
     def _find_target_compression_ratio(self, q_len: int, target_tokens: int) -> float:
         """

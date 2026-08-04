@@ -1,9 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-
 import re
-
 import pandas as pd
 
 
@@ -29,9 +27,18 @@ def string_match_all(preds, refs):
 
 def calculate_metrics(df: pd.DataFrame) -> dict:
     scores = {}
+    df = df.copy()
 
     np_pattern = re.compile(r"[\x00-\x1f]")
-    df["predicted_answer"] = df["predicted_answer"].apply(lambda x: np_pattern.sub("", x.strip()).strip())
+    df["predicted_answer"] = df["predicted_answer"].fillna("").apply(
+        lambda x: np_pattern.sub("", str(x).strip()).strip()
+    )
+
+    if "task" not in df.columns:
+        raise KeyError("Missing required column: 'task'")
+
+    if "answer" not in df.columns:
+        raise KeyError("Missing required column: 'answer'")
 
     for task, df_task in df.groupby("task"):
         task_category = task.split("_")[0]
@@ -40,4 +47,5 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
         refs = df_task["answer"].tolist()
         score = metric_fn(preds, refs)
         scores[task] = {"string_match": score}
+
     return scores

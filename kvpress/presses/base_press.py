@@ -52,6 +52,10 @@ class BasePress:
         """
         pass
 
+    def register_hooks(self, module: nn.Module):
+        # 默认行为：只挂一个 attention 的 forward 后置 hook（和你现在 __call__ 里做的一样）
+        return [module.register_forward_hook(self.forward_hook, with_kwargs=True)]
+
     def compress(
         self,
         module: nn.Module,
@@ -131,13 +135,25 @@ class BasePress:
         """
 
         hidden_states = kwargs["hidden_states"]
-        cache = kwargs["past_key_values"]
+        # cache = kwargs["past_key_values"]
+        cache = kwargs.get("past_key_values", None)
+        if cache is None:
+            return output
         cache_layer = cache.layers[module.layer_idx]
         q_len = hidden_states.shape[1]
 
+        cache_position = kwargs.get("cache_position", None)
+
+        # Don't compress after pre-filling.
+        # For chunked prefill we must allow the hook to run on every chunk; otherwise
+        # deferred finalize will only see the first chunk's hidden_states.
+        if not bool(kwargs.get("kvpress_chunk_prefill", False)):
+            if cache_position is not None and cache_position[-1] > q_len:
+                return output
+        
         # Don't compress after pre-filling
-        if kwargs["cache_position"][-1] > q_len:
-            return output
+        # if kwargs["cache_position"][-1] > q_len:
+        #     return output 
 
         keys, values = extract_keys_and_values(cache, module.layer_idx)
 
@@ -194,7 +210,9 @@ class BasePress:
                     # Skip layers with sliding window attention, only for Gemma3
                     continue
                 layer.self_attn.rotary_emb = language_model.rotary_emb
-                hooks.append(layer.self_attn.register_forward_hook(self.forward_hook, with_kwargs=True))
+                # hooks.append(layer.self_attn.register_forward_hook(self.forward_hook, with_kwargs=True))
+                hooks.extend(self.register_hooks(layer.self_attn))
+
             yield
         finally:
             for forward_hook in hooks:

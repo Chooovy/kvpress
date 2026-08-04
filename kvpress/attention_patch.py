@@ -1,8 +1,83 @@
 # SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import torch
+
+# Force transformers to avoid optional TF/Flax backends in this environment.
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("USE_FLAX", "0")
+os.environ.setdefault("USE_TORCH", "1")
+
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+
+def _maybe_add_kvpress_memory(module, query, attn_output):
+    """
+    If module has kvpress memory state (A,b), compute m(q) and add to attn_output.
+
+    Conventions:
+    - query: (B, num_heads, q_len, head_dim)
+    - attn_output: (B, q_len, num_heads, head_dim)  (this is what HF attention fns return)
+    - A: (B, num_kv_heads, d_phi, head_dim)
+    - b: (B, num_kv_heads, d_phi) or None
+    - phi_W: (head_dim, d_phi) or None (identity)
+    """
+    A = getattr(module, "_kvpress_memory_A", None)
+    if A is None:
+        return attn_output
+
+    # Basic guards for odd cases.
+    if query is None or attn_output is None or query.numel() == 0 or attn_output.numel() == 0:
+        return attn_output
+
+    b = getattr(module, "_kvpress_memory_b", None)
+    phi_W = getattr(module, "_kvpress_memory_phi_W", None)
+    eps = float(getattr(module, "_kvpress_memory_eps", 1e-6))
+
+    # query: (B, H, T, D)
+    B, H, T, D = query.shape
+    # A: (B, H_kv, d_phi, D)
+    H_kv = A.shape[1]
+    if H_kv <= 0 or H % H_kv != 0:
+        # Can't align GQA groups; skip.
+        return attn_output
+    G = H // H_kv
+
+    # Reshape query into kv-head groups: (B, H_kv, G, T, D)
+    qg = query.view(B, H_kv, G, T, D)
+
+    # Prefer learnable per-layer params if present.
+    mem_mod = getattr(module, "kvpress_memory", None)
+    if mem_mod is not None and hasattr(mem_mod, "phi") and hasattr(mem_mod, "gate"):
+        # (B,H_kv,G,T,d_phi)
+        phi_q = mem_mod.phi(qg)
+        gate = float(mem_mod.gate().item())
+    else:
+        # Fixed/random projection fallback via exposed phi_W.
+        if phi_W is None:
+            phi_q = qg
+        else:
+            phi_q = torch.einsum("bkgtd,df->bkgtf", qg, phi_W)
+        gate = 1.0
+
+    # m(q) = (φ(q)^T A) / ( (φ(q)^2)^T b + eps ) if b exists
+    # where b is accumulated as Σ φ(k)^2 (see MemoryScorerPress).
+    # numerator: (B, H_kv, G, T, D)
+    m = torch.einsum("bkgtf,bkfd->bkgtd", phi_q, A)
+    if b is not None:
+        denom = torch.einsum("bkgtf,bkf->bkgt", phi_q ** 2, b).unsqueeze(-1)  # (B,H_kv,G,T,1)
+        denom = denom.clamp(min=eps)
+        m = m / denom
+
+    m = torch.nan_to_num(m, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Back to attention-head layout: (B, T, H, D)
+    m = m.reshape(B, H, T, D).transpose(1, 2).contiguous()
+
+    # Fusion: o = o_save + g * m(q)
+    return attn_output + (m * gate)
 
 
 def search_hyperplane(X, max_iter: int = 1000):
@@ -82,7 +157,15 @@ def attention_patch(func):
         # cu_seq_lens_k are only in kwargs if model.generate is used.
         if "cu_seq_lens_k" in kwargs:
             kwargs["cu_seq_lens_k"][-1] = key.shape[-2]
-        return func(module, query, key, value, attention_mask, dropout, **kwargs)
+        out = func(module, query, key, value, attention_mask, dropout, **kwargs)
+
+        # kvpress memory readout & fusion (if enabled by a press writing state onto module).
+        if isinstance(out, tuple):
+            attn_out = out[0]
+            attn_out = _maybe_add_kvpress_memory(module, query, attn_out)
+            return (attn_out,) + out[1:]
+        else:
+            return _maybe_add_kvpress_memory(module, query, out)
 
     return wrapper
 

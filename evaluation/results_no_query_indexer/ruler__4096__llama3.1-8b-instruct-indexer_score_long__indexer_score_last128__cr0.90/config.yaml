@@ -1,0 +1,26 @@
+dataset: ruler
+data_dir: 4096
+model: /aifs4su/guhao/checkpoints/llama3.1-8b-instruct-indexer_score_long
+device: cuda:0
+press_name: indexer_score_last128
+compression_ratio: 0.9
+key_channel_compression_ratio: null
+samples: null
+fraction: 1.0
+max_new_tokens: null
+max_context_length: null
+compress_questions: false
+needle_depth: null
+compression_interval: null
+target_size: null
+hidden_states_buffer_size: null
+output_dir: ./results_no_query_indexer
+log_level: INFO
+model_kwargs:
+  attn_implementation: flash_attention_2
+  dtype: auto
+  device_map: cuda:0
+press_init_command: IndexerScorePress(compression_ratio=0.9, mean_head=False, layer_running_mean=False,
+  scorer_attr='indexer', use_vnorm=False, n_sink=4, mask_fill_value=-10000.0, _initialized=False,
+  chunk_size=256, activation='relu', last_n_query=128)
+seed: 42

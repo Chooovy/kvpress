@@ -1,0 +1,35 @@
+dataset: longbench-v2
+data_dir: null
+model: /aifs4su/guhao/Models/Llama-3.3-70B-Instruct
+device: auto
+press_name: no_press
+compression_ratio: 0.0
+key_channel_compression_ratio: null
+samples: null
+fraction: 0.2
+max_new_tokens: null
+max_context_length: null
+use_chunk_prefill: false
+chunk_prefill_size: null
+max_input_tokens: 65536
+longbenchv2_eval: cloze
+longbenchv2_cloze_impl: forward
+longbenchv2_domain: Long Structured Data Understanding
+compress_questions: false
+needle_depth: null
+compression_interval: null
+target_size: null
+hidden_states_buffer_size: null
+output_dir: ./results_longbenchv2_baseline_long_structured_data_understanding_cloze_fwd_65536_frac0.2_8gpu
+log_level: INFO
+model_kwargs:
+  attn_implementation: null
+  dtype: auto
+  device_map: auto
+press_init_command: None
+seed: 42
+kv_cache_nbits: null
+kv_cache_backend: quanto
+kvq_smoke_test: false
+kvq_smoke_prompt_repeats: 512
+kvq_smoke_new_tokens: 256

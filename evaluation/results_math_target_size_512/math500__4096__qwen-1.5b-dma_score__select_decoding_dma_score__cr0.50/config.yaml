@@ -1,0 +1,26 @@
+dataset: math500
+data_dir: '4096'
+model: /aifs4su/guhao/checkpoints/qwen-1.5b-dma_score
+device: cuda:0
+press_name: select_decoding_dma_score
+compression_ratio: 0.5
+key_channel_compression_ratio: null
+samples: 20
+fraction: 1.0
+max_new_tokens: 8192
+max_context_length: null
+compress_questions: false
+needle_depth: null
+compression_interval: 128
+target_size: 512
+hidden_states_buffer_size: 128
+output_dir: ./results_math_target_size_512
+log_level: INFO
+model_kwargs:
+  attn_implementation: flash_attention_2
+  dtype: auto
+  device_map: cuda:0
+press_init_command: SelectiveDecodingPress(base_press=DMAScorePress(compression_ratio=0.0,
+  scorer_attr='dma_scorer', use_vnorm=False, n_sink=4, _initialized=False), compression_interval=128,
+  target_size=512, hidden_states_buffer_size=128)
+seed: 42

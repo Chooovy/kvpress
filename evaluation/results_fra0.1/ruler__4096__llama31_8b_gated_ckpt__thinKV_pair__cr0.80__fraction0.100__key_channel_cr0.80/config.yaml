@@ -1,0 +1,24 @@
+dataset: ruler
+data_dir: 4096
+model: /aifs4su/guhao/checkpoints/llama31_8b_gated_ckpt
+device: cuda:0
+press_name: thinKV_pair
+compression_ratio: 0.8
+key_channel_compression_ratio: 0.8
+samples: null
+fraction: 0.1
+max_new_tokens: null
+max_context_length: null
+compress_questions: false
+needle_depth: null
+compression_interval: null
+target_size: null
+hidden_states_buffer_size: null
+output_dir: ./results_fra0.1
+log_level: INFO
+model_kwargs:
+  attn_implementation: flash_attention_2
+  dtype: auto
+press_init_command: ThinKPress(key_channel_compression_ratio=0.8, window_size=32,
+  pairwise_prune=True, sync_kv_prune=True, qk_scale_correction=True)
+seed: 42

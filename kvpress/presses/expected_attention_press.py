@@ -107,10 +107,33 @@ class ExpectedAttentionPress(ScorerPress):
         cov : torch.Tensor
             The covariance matrix of the queries after RoPE.
         """
-        position_ids = torch.arange(q_len, q_len + self.n_future_positions).unsqueeze(0).to(mu.device)
-        head_dim = module.head_dim
-        cos, sin = module.rotary_emb(mu, position_ids)
-        cos, sin = cos[0], sin[0]
+        position_ids = torch.arange(q_len, q_len + self.n_future_positions, device=mu.device)
+        head_dim = int(getattr(module, "head_dim", mu.shape[-1]))
+
+        # Newer HF Llama computes RoPE in the model and passes `position_embeddings` to attention,
+        # so `LlamaAttention` may not have `rotary_emb`. Fall back to standard RoPE formula.
+        if hasattr(module, "rotary_emb"):
+            pos = position_ids.unsqueeze(0)
+            cos, sin = module.rotary_emb(mu, pos)
+            cos, sin = cos[0], sin[0]
+        else:
+            # Standard RoPE with base theta (ignore scaling variants; good enough for scoring).
+            theta = 10000.0
+            cfg = getattr(module, "config", None)
+            if cfg is not None and hasattr(cfg, "rope_theta") and getattr(cfg, "rope_theta") is not None:
+                try:
+                    theta = float(getattr(cfg, "rope_theta"))
+                except Exception:
+                    theta = 10000.0
+            half = head_dim // 2
+            if head_dim % 2 != 0:
+                raise ValueError(f"Expected even head_dim for RoPE, got head_dim={head_dim}")
+            inv_freq = 1.0 / (theta ** (torch.arange(0, half, device=mu.device, dtype=torch.float32) * (2.0 / head_dim)))
+            freqs = torch.einsum("p,d->pd", position_ids.to(dtype=torch.float32), inv_freq)  # (P, half)
+            emb = torch.cat([freqs, freqs], dim=-1)  # (P, head_dim)
+            cos = emb.cos().to(dtype=mu.dtype)
+            sin = emb.sin().to(dtype=mu.dtype)
+
         Id = torch.eye(head_dim, device=cos.device, dtype=cos.dtype)
         P = torch.zeros((head_dim, head_dim), device=cos.device, dtype=cos.dtype)
         P[head_dim // 2 :, : head_dim // 2], P[: head_dim // 2, head_dim // 2 :] = torch.eye(head_dim // 2), -torch.eye(

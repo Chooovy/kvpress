@@ -1,0 +1,25 @@
+dataset: aime24
+data_dir: '4096'
+model: /aifs4su/guhao/checkpoints/dpsk-llama8b-query_indexer
+device: cuda:0
+press_name: decoding_snapkv
+compression_ratio: 0.5
+key_channel_compression_ratio: null
+samples: 20
+fraction: 1.0
+max_new_tokens: null
+max_context_length: null
+compress_questions: false
+needle_depth: null
+compression_interval: 128
+target_size: 128
+hidden_states_buffer_size: 128
+output_dir: ./results_aime24
+log_level: INFO
+model_kwargs:
+  attn_implementation: flash_attention_2
+  dtype: auto
+press_init_command: DecodingPress(base_press=SnapKVPress(compression_ratio=0.0, mean_head=False,
+  layer_running_mean=False, window_size=64, kernel_size=5), compression_interval=128,
+  target_size=128, hidden_states_buffer_size=128)
+seed: 42

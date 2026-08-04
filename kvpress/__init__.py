@@ -32,12 +32,33 @@ from kvpress.presses.pyramidkv_press import PyramidKVPress
 from kvpress.presses.qfilter_press import QFilterPress
 from kvpress.presses.random_press import RandomPress
 from kvpress.presses.scorer_press import ScorerPress
+from kvpress.presses.scorer_press_debug import FixedLayerScoreEvictPress
 from kvpress.presses.simlayerkv_press import SimLayerKVPress
 from kvpress.presses.snapkv_press import SnapKVPress
 from kvpress.presses.streaming_llm_press import StreamingLLMPress
 from kvpress.presses.think_press import ThinKPress
 from kvpress.presses.tova_press import TOVAPress
 
+# ---- Score Presses ----
+from kvpress.presses.dma_score_press import DMAScorePress
+from kvpress.presses.indexer_score_press import IndexerScorePress
+from kvpress.presses.indexer_score_press_cache import CacheIndexerScorePress
+from kvpress.presses.indexer_score_query_press import QueryIndexerScorePress, QueryIndexerDecodingPress
+from kvpress.presses.random_press_w_sink import RandomPress_with_sink
+
+from kvpress.presses.memory_scorer_press import MemoryScorerPress
+
+from kvpress.presses.gated_press import GatedPress
+
+from kvpress.presses.rkv_press import RkvPress
+from kvpress.presses.h2o_press import H2OPress
+# ---- Decode Presses ----
+from kvpress.presses.selective_decoding_press import SelectiveDecodingPress
+from kvpress.presses.decoding_cache_indexer import CacheIndexerDecodingPress
+from kvpress.presses.decode_press import DecodePress
+from kvpress.presses.decode_only_press import DecodeOnlyPress
+from kvpress.presses.query_indexer_kvzip_press import QueryIndexer_KVzipScorePress
+from kvpress.presses.gt_score_press import GTScorePress
 # Patch the attention functions to support head-wise compression
 patch_attention_functions()
 
@@ -79,4 +100,23 @@ __all__ = [
     "CompactorPress",
     "LeverageScorePress",
     "NonCausalAttnPress",
+    # ---- Score Presses ----
+    "DMAScorePress",
+    "IndexerScorePress",
+    "CacheIndexerScorePress",
+    "QueryIndexerScorePress",
+    "MemoryScorerPress",
+    "RandomPress_with_sink",
+    "RkvPress",
+    "H2OPress",
+    "QueryIndexer_KVzipScorePress",
+    "GatedPress",
+    "FixedLayerScoreEvictPress",
+    "GTScorePress",
+    # ---- Decode Presses ----
+    "SelectiveDecodingPress",
+    "CacheIndexerDecodingPress",
+    "DecodePress",
+    "DecodeOnlyPress",
+    "QueryIndexerDecodingPress",
 ]

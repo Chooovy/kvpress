@@ -1,0 +1,20 @@
+accelerate launch --num_processes 8 train_score_gate.py \
+    --press_method gated \
+    --model_name_or_path /aifs4su/guhao/Models/Llama-3.1-8B-Instruct \
+    --output_dir /aifs4su/guhao/checkpoints/llama31_8b_gated_lm_distill_ruler \
+    --per_device_train_batch_size 1 \
+    --pt_context_len 4096 \
+    --max_train_samples 4096 \
+    --mixed_precision bf16 \
+    --gate_type elementwise \
+    --gate_init open \
+    --gate_init_open_p 0.99 \
+    --num_train_epochs 1 \
+    --learning_rate 1e-3 \
+    --logging_steps 10 \
+    --gated_objective lm_distill \
+    --distill_temperature 2.0 --distill_lambda 1.0 \
+    --distill_budget_lambda 5.0 --distill_budget_rho 0.5 \
+    --distill_bin_lambda 0.05 \
+    --train_gate_mode soft \
+    --attn_implementation sdpa

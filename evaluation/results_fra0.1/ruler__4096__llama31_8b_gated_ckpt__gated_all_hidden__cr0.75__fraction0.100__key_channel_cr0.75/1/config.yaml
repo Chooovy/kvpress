@@ -1,0 +1,27 @@
+dataset: ruler
+data_dir: 4096
+model: /aifs4su/guhao/checkpoints/llama31_8b_gated_ckpt
+device: cuda:0
+press_name: gated_all_hidden
+compression_ratio: 0.75
+key_channel_compression_ratio: 0.75
+samples: null
+fraction: 0.1
+max_new_tokens: null
+max_context_length: null
+compress_questions: false
+needle_depth: null
+compression_interval: null
+target_size: null
+hidden_states_buffer_size: null
+output_dir: ./results_fra0.1
+log_level: INFO
+model_kwargs:
+  attn_implementation: flash_attention_2
+  dtype: auto
+  device_map: cuda:0
+press_init_command: GatedPress(gate_type='elementwise', init='open', init_open_p=0.999,
+  bias=True, record_mse=False, mse_detach_target=True, mse_reduction='token_mean',
+  aux_fp32=False, reg_type='group_lasso', gate_sparsity_threshold=0.5, key_channel_compression_ratio=0.75,
+  window_size=-1, _warned_channel_prune_unsupported=False, capture_mode='gated', apply_kv_gate=True)
+seed: 42

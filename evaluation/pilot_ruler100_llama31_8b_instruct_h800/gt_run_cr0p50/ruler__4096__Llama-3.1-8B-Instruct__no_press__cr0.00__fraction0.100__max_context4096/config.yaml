@@ -1,0 +1,26 @@
+dataset: ruler
+data_dir: 4096
+model: /aifs4su/guhao/Models/Llama-3.1-8B-Instruct
+device: 0
+press_name: no_press
+compression_ratio: 0.0
+key_channel_compression_ratio: null
+samples: null
+fraction: 0.1
+max_new_tokens: 32
+max_context_length: 4096
+compress_questions: false
+needle_depth: null
+compression_interval: null
+target_size: null
+hidden_states_buffer_size: null
+output_dir: ./pilot_ruler100_llama31_8b_instruct_h800/gt_run_cr0p50
+log_level: INFO
+model_kwargs:
+  attn_implementation: null
+  dtype: auto
+press_init_command: None
+seed: 42
+gt_mode: true
+gt_out_dir: ./pilot_ruler100_llama31_8b_instruct_h800/gt_tokens_cr0p50
+gt_max_steps: null

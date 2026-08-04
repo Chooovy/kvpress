@@ -1,0 +1,223 @@
+\begin{figure*}
+    \centering
+    \includegraphics[width=0.9\linewidth]{Fig/method.pdf}
+    \caption{The overall pipeline of \textbf{IndexMem} is as follows: in the main attention stream, we use the learnable indexer to accurately select which KV tokens to save and evict the rest. The evicted tokens are then used to \textbf{update a latent memory online}, and the memory readout is added as \textbf{a residual to compensate} the main attention stream for the information lost due to eviction.}
+    \label{fig:method}
+\end{figure*}
+
+
+
+\section{Methods}
+\begin{figure}
+    \centering
+    \includegraphics[width=0.9\linewidth]{Fig/arch.pdf}
+    \caption{\textbf{Architectures of the Indexer and the Memory module.}
+    \textbf{Left:} the Indexer adopts an MQA-style design with norm on both multi head $\mathbf{q}$ and single head cached $\mathbf{k}$ ($\mathbf{k}$ are continuously cached during decoding); it computes token scores via gated $\mathbf{q},\mathbf{k}$ similarity, followed by max aggregation.
+    \textbf{Right:} the Memory module produces a residual readout $m(q)$ from a fixed-size latent state. Evicted tokens update the fast weights $(\mathbf{M},b)$ online, while $g(\cdot)$ and $\mathrm{Linear}_{\theta}(\cdot)$ are slow weights learned during training.}
+    \label{fig:arch}
+\end{figure}
+\subsection{Learnable Indexer for Token Importance}
+The core challenge in KV eviction is accurately estimating token importance through a proxy. Existing methods are limited by heuristic designs and a tendency to overemphasize local tokens. Motivated by the lightning indexer in DeepSeek Sparse Attention~\citep{liu2025deepseek}, we introduce a lightweight, learnable \textbf{indexer} to assess token importance for KV retention. Given hidden states $X\in\mathbb{R}^{L\times d_{\text{model}}}$ and (pre-RoPE) query states $Q\in\mathbb{R}^{H\times L\times d_{\text{head}}}$, the indexer outputs a dense query-to-key score matrix
+\[
+A=\mathrm{Indexer}(X,Q)\in\mathbb{R}^{L\times L},
+\]
+where $A_{s,t}$ measures how important the key token at position $t$ is to the query at position $s$.
+
+
+
+
+
+\paragraph{Architecture.}
+We first construct QK-Norm~\citep{henry2020query} features for stable training. Let $H_{\text{index}}$ and $d_{\text{index}}$ denote the number of indexer heads and the per-head dimension, respectively, where typically $H_{\text{index}} \ll H$ and $d_{\text{index}} \ll d_{\text{head}}$ to reduce computation. We obtain indexer queries $\mathbf{q}$ by down-projecting the multi-head query at position $s$:
+$$
+\mathbf{q}_{s}=U_q\,\mathrm{flatten}(Q_s)\in\mathbb{R}^{H_{\text{index}}d_{\text{index}}},
+$$
+and reshape $Q_{s}$ as per-head features $Q_{s,h}\in\mathbb{R}^{d_{\text{index}}}$. Keys $\mathbf{k}$ are derived from hidden states: $\mathbf{k}_{t}=U_k X_t\in\mathbb{R}^{d_{\text{index}}}.$ Following an MQA-style~\citep{shazeer2019fast} design, the indexer uses a single shared key $\mathbf{k}$ for all head. Then, we apply RMSNorm to obtain QK-Norm features: $\mathbf{q}=\mathrm{Norm}(\mathbf{q}),\, \mathbf{k}=\mathrm{Norm}(\mathbf{k}).$
+
+We add a learnable gate to modulate the contribution of indexer heads and improve expressiveness. For each position $s$, we compute a head-gating vector
+$$
+\mathbf{\alpha}_s = \frac{G X_s}{\sqrt{H_{\text{index}}d_{\text{index}}}} \in \mathbb{R}^{H_{\text{index}}}.
+$$
+Given a query position $s$ and a key position $t$, let $\mathbf{q}_s\in\mathbb{R}^{H_{\text{index}}\times d_{\text{index}}}$ be the query features and $\mathbf{k}_t\in\mathbb{R}^{d_{\text{index}}}$ the shared key feature. We compute the per-head similarities as $\mathbf{z}$ and aggregate them with the gate:
+$$
+\mathbf{z}_{s,t} = \mathrm{act}\left(\mathbf{q}_s,\mathbf{k}_t\right), \quad A_{s,t} = \mathbf{\alpha}_s^{\top} \, \mathbf{z}_{s,t} + Mask_{s,t},
+$$
+where $Mask_{s,t}$ is the causal mask. The resulting score matrix $A$ serves as a learnable proxy for token importance. We reduce scores over query set $\mathcal{Q}$ to obtain per-token importance for KV retention:
+$$
+\mathrm{imp}_{t}=\max_{s\in\mathcal{Q}} A_{s,t}
+$$
+We define the query set $\mathcal{Q}$ used for importance aggregation as follows: during prefill, the indexer uses all queries in the prompt; during decoding, it aggregates over the queries generated within each compression interval.
+
+
+This indexer design offers several advantages. During decoding, it reuses the growing $\mathbf{k}$ cache to predict token importance. Unlike methods such as Expected Attention and SnapKV that typically materialize all KV pairs then evict, our indexer enables \textbf{pre-eviction}: we first select the positions to keep, and only compute and store KV for those tokens (and discard the rest immediately), enabling bounded cache size. The overall architecture is illustrated in Figure~\ref{fig:arch}.
+% Moreover, thanks to the MQA-style design, the indexer naturally supports FlashAttention~\citep{dao2022flashattention} or SDPA-style implementation for efficient inference.
+
+
+
+% decode的时候有cache复用
+% 可以和chunk prefill适配
+% snapkv和EA需要算完所有的KV再evict
+
+\paragraph{Training.}
+Our proposed MQA-style indexer is a lightweight attention-like module that predicts the backbone attention scores. During training, we freeze the backbone LLM and optimize only the learnable indexer. Given a sequence of length $L$, the indexer outputs a score map $A\in\mathbb{R}^{L\times L}$, where $A(q,k)$ are logits over keys for each query $q$. We distill it to match the backbone’s attention behavior by aligning pooled per-key importance distributions derived from the teacher and the indexer. Concretely, we use the teacher attention logits $T = QK^\top/\sqrt{d_{\text{model}}}$ and apply a max aggregation over queries: a key is deemed important if it is highly scored by any query. We then minimize
+$$
+D_{\mathrm{KL}}\Big(\mathrm{softmax}\big(\max_{q} T(q,\cdot)\big)\ \Big|\Big|\ 
+\mathrm{softmax}\big(\max_{q} A(q,\cdot)\big)\Big).
+$$
+To stabilize optimization, we exclude \textbf{sink tokens}~\citep{xiao2023efficient} from the KL loss by masking out a fixed set of sink positions on the key axis, since their consistently large attention weights can dominate gradients.
+
+Naively materializing the full teacher score matrix ($T$) is prohibitively memory-intensive, as it requires storing $O(L^2)$ entries. Instead, we compute the pooled vectors $\max_q T(q,\cdot)$ and $\max_q A(q,\cdot)$ in a streaming (FlashAttention-style) manner: we iterate over queries in chunks and stream over keys, updating an$O(L)$running-max vector over keys, never instantiating the full $L\times L$ matrix. Finally, we apply a numerically-stable softmax on the key axis and compute the KL exactly for the pooled distributions while preventing materializing the full attention map.
+
+% 写为代码在appendix
+% 放indexer的map
+
+\paragraph{PyTorch-like pseudo-code.}
+\renewcommand{\thealgorithm}{} % hide algorithm numbering
+\definecolor{codeblue}{HTML}{7A8A9A}
+\definecolor{codekw}{HTML}{D92E80}
+\definecolor{codesign}{HTML}{C5E2FF}
+\definecolor{codefunc}{HTML}{0059DC}
+
+\lstdefinelanguage{PythonFuncColor}{
+  language=Python,
+  keywordstyle=\color{codesign}\bfseries,
+  commentstyle=\color{codeblue},
+  stringstyle=\color{orange},
+  showstringspaces=false,
+  basicstyle=\ttfamily\small,
+  literate=
+    {*}{{\color{codesign}*}}{1}
+    {indexer(}{{\color{codefunc}indexer(}}{7}
+    {mem_read(}{{\color{codefunc}mem\_read(}}{9}
+    {mem_write(}{{\color{codefunc}mem\_write(}}{10}
+    {U_q(}{{\color{codefunc}U\_q(}}{4}
+    {U_k(}{{\color{codefunc}U\_k(}}{4}
+    {Linear_theta(}{{\color{codefunc}Linear\_theta(}}{14}
+    {flatten(}{{\color{codefunc}flatten(}}{8}
+    {norm(}{{\color{codefunc}norm(}}{5}
+    {cat(}{{\color{codefunc}cat(}}{4}
+    {G(}{{\color{codefunc}G(}}{2}
+    {sqrt(}{{\color{codefunc}sqrt(}}{5}
+    {act(}{{\color{codefunc}act(}}{4}
+    {einsum(}{{\color{codefunc}einsum(}}{7}
+    {sum_h(}{{\color{codefunc}sum\_h(}}{7}
+    {range(}{{\color{codefunc}range(}}{6}
+    {max(}{{\color{codefunc}max(}}{4}
+    {outer(}{{\color{codefunc}outer(}}{6}
+    {attn(}{{\color{codefunc}attn(}}{5}
+    {g(}{{\color{codefunc}g(}}{2}
+}
+\lstset{
+  language=PythonFuncColor,
+  backgroundcolor=\color{white},
+  basicstyle=\fontsize{9pt}{9.9pt}\ttfamily\selectfont,
+  columns=fullflexible,
+  breaklines=true,
+  captionpos=b,
+}
+
+\begin{algorithm}[t]
+\caption{Indexer and latent memory (PyTorch-like)}
+\label{alg:indexmem_pseudocode}
+\begin{lstlisting}
+# Inputs:
+# X: [L, d_model] hidden states
+# Q: [H, L, d_head] pre-RoPE query states
+# Mask: [L, L] causal mask (added to logits)
+# Q_set: query indices for aggregation (prefill: all; decode: window)
+# cache: k_cache grows during decoding
+def indexer(X, Q, Mask=None, Q_set=None, use_cache=False):
+    # down-project multi-head queries and normalize
+    q = U_q(flatten(Q, dims=(0,1)))             # [L, H_index * d_index]
+    q = q.view(L, H_index, d_index)
+    q = norm(q)                                  # QK-Norm
+
+    # shared key for all heads (MQA-style)
+    k = U_k(X)                                   # [L, d_index]
+    k = norm(k)
+
+    # optional cache reuse in decoding
+    if use_cache:
+        k_cache = cat(k_cache, k, dim=0)
+        K = k_cache
+    else:
+        K = k
+
+    # head gate from hidden state
+    alpha = G(X) / sqrt(H_index * d_index)       # [L, H_index]
+
+    # gated similarity + causal mask
+    z = act(einsum("lhd,td->lth", q, K))         # [L, L, H_index]
+    A = sum_h(alpha[:, h] * z[:, :, h])          # [L, L]
+    if Mask is not None:
+        A = A + Mask
+
+    # per-token importance via max aggregation
+    if Q_set is None: Q_set = range(L)
+    imp = max(A[Q_set, :], dim=0)                # [L]
+    return A, imp
+
+# Latent memory (shared across heads)
+# State: M [d_mem, d_model], b [d_mem]
+def mem_read(q):
+    phi_q = Linear_theta(q)                      # [d_mem]
+    denom = (phi_q**2 @ b) + eps
+    return (phi_q.T @ M) / denom                 # [d_model]
+
+def mem_write(evicted_k, evicted_v):
+    # evicted_v is summed across heads per token
+    phi_k = Linear_theta(evicted_k)              # [N, d_mem]
+    M = lambda * M + eta * sum(outer(phi_k[i], evicted_v[i]) for i in range(N))
+    b = lambda * b + eta * sum(phi_k[i]**2 for i in range(N))
+
+# Residual compensation
+o = attn(q, KV_kept) + g(q) * mem_read(q)
+\end{lstlisting}
+\end{algorithm}
+
+\subsection{Latent Memory for Evicted Tokens}
+Most KV cache compression methods rely on an \textbf{evict or keep} decision: once a token is evicted, its KV states are permanently discarded. This design is often sufficient for \textbf{retrieval style} benchmarks (e.g., needle-in-a-haystack/RULER), where preserving a small set of evidence tokens is enough. However, for \textbf{holistic long-context reasoning} (e.g., QA and summarization), useful information can be spread across many seemingly low saliency tokens. Aggressive eviction therefore introduces an irreversible information loss that accumulates over time.
+
+Existing approaches to mitigate forgetting in KV cache eviction have explored reconstruction based methods like KVReviver~\citep{yuan2025kvreviver}, which rebuild KV from compact sketches, yet suffer from error amplification during softmax. Offloading alternatives (e.g., NOSA~\citep{huang2025nosa}, InfLLM~\citep{xiao2024infllm}) preserve tokens in CPU memory, yet they introduce throughput bottlenecks due to the high latency of CPU-GPU data transfers.
+
+
+To address these problems, we compact evicted tokens into a fixed-size latent memory. Our memory design consists of two components: \textbf{how to write} evicted information into memory, and \textbf{how to read} it back to compensate attention.
+
+\paragraph{Why not memory-as-tokens.} A straightforward approach is to write evicted KV into a small set of latent KV tokens (``memory-as-tokens'') and let standard softmax attention read both retained tokens and latent memory. In practice, token placement is tricky: putting latent tokens at the prefix often turns them into attention sinks, that attract large attention mass. While placing them later makes them unable to access for early queries. A simple fix is a special attention mask that makes latent tokens globally visible to all queries. More fundamentally, this formulation can be brittle: the latent tokens may collapse to a general ``mean'' summary, and softmax can amplify small mismatch.
+
+\paragraph{Readout as residual compensation.} Instead of injecting latent memory as additional KV tokens inside softmax, we treat memory as an explicit compensation residual for the information removed by eviction. Concretely, we augment the original attention output with a gated memory readout:
+\begin{equation}
+o \;=\; o_{\mathrm{attn}} \;+\; g(q) \cdot m(q),
+\label{eq:latent_residual_fuse}
+\end{equation}
+where $o_{\mathrm{attn}}$ is computed only over the retained KV cache. The memory readout $m(q)$ summarizes useful signals from evicted tokens conditioned on the current query $q$. The gate $g(q)\in[0,1]$ controls whether and how much the model should rely on the latent memory for current query, enabling a safe fallback that $g(q)=0$.
+
+\newcommand{\mem}{\mathrm{Linear}_\theta}
+\newcommand{\memstate}{\mathbf{M}}
+
+
+\paragraph{Slow and fast weights in the memory module.} We use one latent memory module per layer, shared across all attention heads. The module consists of (i) slow weights $\theta$, updated by gradients during training, and (ii) fast weights, updated online at inference time by simple update rules. Using slow weights alone often collapses to a dataset-specific mean compensation for evicted attention. The fast weights maintain a fixed-size state matrix $\memstate\in\mathbb{R}^{d_{\text{mem}}\times d_{\text{model}}}$ and a stabilizer vector $b\in\mathbb{R}^{d_{\text{mem}}}$, where $d_{\text{mem}}$ is the memory-state dimension. Given a query $q\in\mathbb{R}^{d_{\text{model}}}$, we compute a projection $\mem(q)\in\mathbb{R}^{d_{\text{mem}}}$ and read from memory as
+\begin{equation}
+m(q) \;=\; \frac{\mem(q)^{\top} \memstate}{\mem(q)^{\odot 2 \;\top} b + \epsilon},
+\label{eq:latent_readout}
+\end{equation}
+where \(\mem(q)^{\odot 2}=\mem(q)\odot\mem(q)\) and \(\epsilon\) is a small constant.
+
+
+\paragraph{Online write as fast-weight updates.} The memory state $(\memstate,b)$ is updated online per evict step. Given the evicted set $\mathcal{E}$ with key-value pairs $\{(k_i,v_i)\}_{i\in\mathcal{E}}$, we apply an outer-product accumulation with decay:
+\begin{align}
+\memstate &\leftarrow \lambda \memstate \;+\; \eta \sum_{i\in\mathcal{E}} \mem(k_i)\, v_i^{\top},
+\label{eq:latent_write_A}\\
+b \leftarrow \lambda b& \;+\; \eta \sum_{i\in\mathcal{E}} \mem(k_i)\odot \mem(k_i),
+\label{eq:latent_write_b}
+\end{align}
+where $\lambda\in(0,1]$ is a decay factor and $\eta>0$ is the write strength. 
+% Since the latent memory is shared across heads, we first sum the per-head values into a single vector $v_i=\sum_{h=1}^{H} v_i^{(h)}$ for each evicted token.
+\paragraph{Slow-weight training.} We train the slow-weight components (the projection $\mem(\cdot)$ and gate $g(\cdot)$) by gradient to make the memory readout match the missing residual introduced by eviction. Concretely, we minimize an MSE objective
+\begin{equation}
+\mathcal{L}_{\mathrm{mem}}
+\;=\;
+\big\|\, o - o_{\mathrm{attn}} - g(q)\cdot m(q) \,\big\|_2^2,
+\label{eq:mem_mse}
+\end{equation}
+where $o$ is the full attention output and $o_{\mathrm{attn}}$ is the output computed from the compressed KV cache.

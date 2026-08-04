@@ -1,0 +1,18 @@
+accelerate launch --num_processes 8 train_score_memory_alone.py \
+    --model_name_or_path /aifs4su/guhao/Models/Llama-3.1-8B-Instruct \
+    --output_dir /aifs4su/guhao/checkpoints/llama3.1-8b-instruct-memory-EA \
+    --per_device_train_batch_size 1 \
+    --per_device_eval_batch_size 1 \
+    --gradient_accumulation_steps 4 \
+    --press_method EA \
+    --num_train_epochs 1 \
+    --learning_rate 1e-3 \
+    --n_sink 4 \
+    --pt_context_len 13312 \
+    --max_train_samples 4096 \
+    --attn_implementation eager \
+    --chunk_size 128 \
+    --memory_d_phi 128 \
+    --memory_compression_ratio 0.75 \
+    --memory_loss_weight 10.0 \
+    --ruler_supervise_prefix \

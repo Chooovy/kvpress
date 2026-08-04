@@ -1,0 +1,28 @@
+dataset: ruler
+data_dir: 4096
+model: /aifs4su/guhao/checkpoints/llama3.1-8b-instruct-query-indexer_score_long
+device: cuda:0
+press_name: query_indexer_score_top_p
+compression_ratio: 0.9
+key_channel_compression_ratio: null
+samples: null
+fraction: 1.0
+max_new_tokens: null
+max_context_length: null
+compress_questions: true
+needle_depth: null
+compression_interval: null
+target_size: null
+hidden_states_buffer_size: null
+output_dir: ./results_no_rope_mask_include_questions
+log_level: INFO
+model_kwargs:
+  attn_implementation: flash_attention_2
+  dtype: auto
+  device_map: cuda:0
+press_init_command: QueryIndexerScorePress(compression_ratio=0.9, mean_head=False,
+  layer_running_mean=False, scorer_attr='indexer', use_vnorm=False, n_sink=4, mask_fill_value=-10000.0,
+  _initialized=False, enable_low_rank=True, max_batch_size=8, max_seq_len=4096, chunk_size=128,
+  activation='relu', last_n_query=None, query_reduce='top_p', block_size=16, recency_half_life=32.0,
+  top_p_mass=0.9, top_p_keep_ratio=0.25, top_p_min_queries=8, top_p_topk=256, question_len=0)
+seed: 42

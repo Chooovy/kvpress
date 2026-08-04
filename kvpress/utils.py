@@ -35,11 +35,18 @@ def get_prerope_query_states(module: nn.Module, hidden_states: torch.Tensor) -> 
     num_heads = module.config.num_attention_heads
     head_dim = module.head_dim
 
+    # Ensure input dtype matches projection weight dtype to avoid matmul dtype mismatches.
     if isinstance(module, Phi3Attention):
+        target_dtype = module.qkv_proj.weight.dtype
+        if hidden_states.dtype != target_dtype:
+            hidden_states = hidden_states.to(target_dtype)
         qkv = module.qkv_proj(hidden_states)
         query_states = qkv[..., : num_heads * head_dim]
     elif hasattr(module, "q_proj"):
         # Assume Llama-like attention layer
+        target_dtype = module.q_proj.weight.dtype
+        if hidden_states.dtype != target_dtype:
+            hidden_states = hidden_states.to(target_dtype)
         query_states = module.q_proj(hidden_states)
     else:
         raise NotImplementedError(f"Press not yet implemented for {module.__class__}.")

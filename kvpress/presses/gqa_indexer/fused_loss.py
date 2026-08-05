@@ -56,13 +56,20 @@ EPS = 1e-10
 
 def accumulation_dtype(*tensors: torch.Tensor) -> torch.dtype:
     """
-    Pick the accumulation dtype: fp32 for low-precision inputs, otherwise keep the input's.
+    Pick the accumulation dtype: fp32 for low-precision inputs, otherwise the promoted one.
 
     Unconditionally calling ``.float()`` would silently *downcast* float64, which both
     loses the precision a caller explicitly asked for and breaks gradient checks against a
     float64 reference.
+
+    ``torch.result_type`` is strictly binary, so promotion is folded pairwise with
+    ``torch.promote_types`` instead of being splatted over all inputs.
     """
-    dtype = torch.result_type(*tensors) if len(tensors) > 1 else tensors[0].dtype
+    if not tensors:
+        raise ValueError("accumulation_dtype needs at least one tensor")
+    dtype = tensors[0].dtype
+    for other in tensors[1:]:
+        dtype = torch.promote_types(dtype, other.dtype)
     return torch.float32 if dtype.itemsize < 4 else dtype
 
 

@@ -9,6 +9,7 @@ import torch
 from kvpress.presses.gqa_indexer import (
     GQAIndexer,
     GQAIndexerConfig,
+    accumulation_dtype,
     build_indexer_mask,
     fused_indexer_ce_rows,
     fused_indexer_loss,
@@ -290,6 +291,34 @@ def test_teacher_probs_rejects_indivisible_group_size():
 # ----------------------------------------------------------------------
 # Dtype handling
 # ----------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "dtypes,expected",
+    [
+        ((torch.float64,), torch.float64),
+        ((torch.float32,), torch.float32),
+        ((torch.float16,), torch.float32),  # upcast
+        ((torch.bfloat16,), torch.float32),  # upcast
+        ((torch.float64, torch.float64, torch.float64), torch.float64),
+        ((torch.float16, torch.float16, torch.float32), torch.float32),
+        ((torch.bfloat16, torch.bfloat16, torch.bfloat16), torch.float32),
+        ((torch.float32, torch.float32, torch.float64), torch.float64),  # promote wins
+        ((torch.float16, torch.bfloat16), torch.float32),
+    ],
+)
+def test_accumulation_dtype(dtypes, expected):
+    """
+    Promotion must fold pairwise: torch.result_type only accepts two tensors, so calling
+    it with three raised TypeError for every fused-loss path.
+    """
+    tensors = [torch.zeros(1, dtype=dt) for dt in dtypes]
+    assert accumulation_dtype(*tensors) == expected
+
+
+def test_accumulation_dtype_requires_a_tensor():
+    with pytest.raises(ValueError, match="at least one tensor"):
+        accumulation_dtype()
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_output_dtype_follows_input(dtype):
     """

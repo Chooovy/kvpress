@@ -33,6 +33,7 @@ from kvpress.presses.gqa_indexer.aggregate import (
     reduce_queries,
 )
 from kvpress.presses.gqa_indexer.fused_loss import (
+    accumulation_dtype,
     fused_indexer_ce_rows,
     fused_indexer_loss,
     make_recompute_teacher,
@@ -95,6 +96,7 @@ __all__ = [
     "load_indexer_state_dict",
     "fused_indexer_ce_rows",
     "fused_indexer_loss",
+    "accumulation_dtype",
     "make_recompute_teacher",
     "teacher_lse_from_qk",
     "teacher_probs_from_lse",

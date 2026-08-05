@@ -1,0 +1,338 @@
+# SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""KV cache compression driven by the GQA lightning indexer."""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+
+import torch
+from torch import nn
+
+from kvpress.presses.gqa_indexer.aggregate import aggregate_chunk_scores, reduce_queries
+from kvpress.presses.gqa_indexer.indexer import (
+    GQAIndexer,
+    GQAIndexerConfig,
+    build_indexer_mask,
+    slice_rope_tables,
+)
+from kvpress.presses.scorer_press import ScorerPress
+
+logger = logging.getLogger(__name__)
+
+
+def get_language_model(model: nn.Module) -> nn.Module:
+    """Return the text backbone, unwrapping the VL nesting used by multimodal models."""
+    return model.model.language_model if hasattr(model.model, "language_model") else model.model
+
+
+@dataclass
+class GQAIndexerPress(ScorerPress):
+    """
+    Prune the KV cache using a learned per-KV-head lightning indexer.
+
+    The indexer scores every (query, key) pair once per KV head, those scores are reduced
+    over the query axis into one importance value per key, and the lowest-scoring keys are
+    evicted -- independently for each KV head, which is what GQA's separate caches allow.
+
+    Because scores are per-KV-head, this press relies on kvpress's head-wise compression
+    path. Set ``mean_head=True`` to collapse to a single shared selection instead (useful
+    as an ablation against the head-uniform DSA-style behaviour).
+
+    Parameters
+    ----------
+    compression_ratio : float
+        Fraction of KV pairs to remove.
+    n_kv_heads, group_size, head_dim : int, optional
+        Indexer geometry. Left as ``None`` they are derived from the model config as
+        ``n_kv_heads = num_key_value_heads``, ``group_size = n_heads // n_kv_heads``,
+        ``head_dim = module.head_dim`` -- i.e. the indexer mirrors the attention layout.
+    rope_dim : int, optional
+        Channels to rotate. ``None`` rotates the full ``head_dim`` (capped by the model's
+        rotary dim); ``0`` disables RoPE.
+    activation : str
+        Logit activation before group reduction.
+    group_reduce : str
+        How the ``group_size`` query heads of a KV group combine: ``weights_proj``,
+        ``sum``, ``mean`` or ``amax``.
+    query_reduce : str
+        How the query axis collapses: ``mean``, ``max``, ``last`` or ``recency``.
+    last_n_query : int, optional
+        Restrict query reduction to the final N queries.
+    recency_half_life : float
+        Half-life for ``query_reduce="recency"``.
+    n_sink : int
+        Always-kept tokens at the start of the sequence.
+    n_local : int
+        Always-kept most recent tokens. Sink+local protection is standard for streaming
+        eviction and is applied on top of whatever the indexer scores.
+    chunk_size : int
+        ``0`` selects at token granularity. ``>0`` pools token scores into chunks of this
+        size and selects whole chunks, which preserves local contiguity.
+    chunk_aggregate : str
+        ``mean`` or ``max`` pooling over each chunk's token scores.
+    use_vnorm : bool
+        Scale scores by the value-vector norm, as several kvpress scorers do.
+    scorer_attr : str
+        Attribute name the indexer is registered under on each attention module.
+    """
+
+    compression_ratio: float = 0.0
+    mean_head: bool = False
+
+    # Indexer geometry (None -> derive from model config)
+    n_kv_heads: int | None = None
+    group_size: int | None = None
+    head_dim: int | None = None
+    rope_dim: int | None = None
+
+    activation: str = "relu"
+    group_reduce: str = "weights_proj"
+
+    # Query-axis reduction
+    query_reduce: str = "mean"
+    last_n_query: int | None = None
+    recency_half_life: float = 32.0
+
+    # Protection
+    n_sink: int = 4
+    n_local: int = 0
+
+    # Chunk-level selection (applied to token scores)
+    chunk_size: int = 0
+    chunk_aggregate: str = "mean"
+
+    use_vnorm: bool = False
+    scorer_attr: str = "indexer"
+
+    _initialized: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.n_sink < 0 or self.n_local < 0:
+            raise ValueError("n_sink and n_local must be non-negative")
+        if self.chunk_size < 0:
+            raise ValueError("chunk_size must be non-negative")
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+    def build_indexer_config(self, model: nn.Module, module: nn.Module) -> GQAIndexerConfig:
+        """Derive indexer geometry from the model, honouring any explicit overrides."""
+        config = model.config
+        text_config = getattr(config, "text_config", config)
+
+        n_kv_heads = self.n_kv_heads or text_config.num_key_value_heads
+        n_heads = text_config.num_attention_heads
+        group_size = self.group_size or max(1, n_heads // n_kv_heads)
+        head_dim = self.head_dim or getattr(
+            module, "head_dim", text_config.hidden_size // n_heads
+        )
+
+        if self.rope_dim is None:
+            # Default to rotating everything, but never claim more rotary channels than
+            # the model's tables actually provide.
+            model_rotary = getattr(text_config, "head_dim", head_dim)
+            partial = getattr(text_config, "partial_rotary_factor", 1.0) or 1.0
+            rope_dim = min(head_dim, int(model_rotary * partial))
+            rope_dim -= rope_dim % 2
+        else:
+            rope_dim = self.rope_dim
+
+        return GQAIndexerConfig(
+            hidden_size=text_config.hidden_size,
+            n_kv_heads=n_kv_heads,
+            group_size=group_size,
+            head_dim=head_dim,
+            rope_dim=rope_dim,
+            activation=self.activation,
+            group_reduce=self.group_reduce,
+        )
+
+    def post_init_from_model(self, model: nn.Module, force_reinit: bool = False) -> None:
+        """Attach a :class:`GQAIndexer` to every attention layer (idempotent)."""
+        if self._initialized and not force_reinit:
+            return
+
+        language_model = get_language_model(model)
+        created = 0
+        for layer in language_model.layers:
+            attn = layer.self_attn
+            if hasattr(attn, self.scorer_attr) and not force_reinit:
+                continue
+            indexer_config = self.build_indexer_config(model, attn)
+            indexer = GQAIndexer(indexer_config).to(device=model.device, dtype=model.dtype)
+            attn.register_module(self.scorer_attr, indexer)
+            created += 1
+
+        self._initialized = True
+        if created:
+            logger.info("Initialized %d %s modules", created, self.scorer_attr)
+
+    def get_indexer(self, module: nn.Module) -> GQAIndexer:
+        indexer = getattr(module, self.scorer_attr, None)
+        if indexer is None:
+            raise RuntimeError(
+                f"No {self.scorer_attr!r} found on {type(module).__name__}. "
+                "Call post_init_from_model(model) before using this press."
+            )
+        return indexer
+
+    # ------------------------------------------------------------------
+    # RoPE plumbing
+    # ------------------------------------------------------------------
+    def get_rope_tables(self, indexer: GQAIndexer, kwargs: dict) -> tuple:
+        """
+        Narrow the layer's RoPE tables to the indexer's rotary width.
+
+        Returns ``(None, None)`` when the indexer has RoPE disabled or the tables are
+        unavailable. The narrowing itself is subtle -- see
+        :func:`~kvpress.presses.gqa_indexer.indexer.slice_rope_tables`.
+        """
+        if indexer.rope_dim == 0:
+            return None, None
+        position_embeddings = kwargs.get("position_embeddings")
+        if position_embeddings is None:
+            return None, None
+        cos, sin = position_embeddings
+        if cos.dim() == 4:  # some models emit (B, 1, S, D)
+            cos, sin = cos.squeeze(1), sin.squeeze(1)
+        return slice_rope_tables(cos, sin, indexer.rope_dim)
+
+    # ------------------------------------------------------------------
+    # Scoring
+    # ------------------------------------------------------------------
+    def indexer_logits(
+        self, module: nn.Module, hidden_states: torch.Tensor, kwargs: dict, k_len: int | None = None
+    ) -> torch.Tensor:
+        """
+        Run the indexer and return causally-masked token logits (B, n_kv_heads, Sq, Sk).
+
+        Shared by the press and the training code so both see identical logits -- the
+        single most important invariant here, since any divergence between the two silently
+        trains the indexer for a scoring function it never uses at inference.
+        """
+        indexer = self.get_indexer(module)
+        cos, sin = self.get_rope_tables(indexer, kwargs)
+        q_len = hidden_states.shape[1]
+        k_len = k_len if k_len is not None else q_len
+        mask = build_indexer_mask(
+            q_len,
+            k_len,
+            hidden_states.device,
+            attention_mask=kwargs.get("attention_mask"),
+        )
+        return indexer(hidden_states, cos=cos, sin=sin, mask=mask)
+
+    def token_scores(
+        self, module: nn.Module, hidden_states: torch.Tensor, kwargs: dict, k_len: int
+    ) -> torch.Tensor:
+        """Per-KV-head, per-token importance -> (B, n_kv_heads, k_len)."""
+        logits = self.indexer_logits(module, hidden_states, kwargs, k_len=k_len)
+        return reduce_queries(
+            logits,
+            self.query_reduce,
+            last_n_query=self.last_n_query,
+            recency_half_life=self.recency_half_life,
+        )
+
+    def protect_boundaries(self, scores: torch.Tensor) -> torch.Tensor:
+        """
+        Force sink and local tokens to outrank every scored token.
+
+        A finite sentinel (``max of the finite scores + 1``) is used rather than ``+inf``:
+        infinities poison later arithmetic (``inf * 0`` is NaN) and would leak through
+        reductions. Protected tokens all share the sentinel, so among themselves top-k falls
+        back to index order -- which is fine, since they are all kept.
+
+        If protection alone exceeds the keep budget, ScorerPress's top-k will silently drop
+        some protected tokens -- warn rather than let that pass unnoticed.
+        """
+        k_len = scores.shape[-1]
+        n_sink = min(self.n_sink, k_len)
+        n_local = min(self.n_local, max(k_len - n_sink, 0))
+        if n_sink == 0 and n_local == 0:
+            return scores
+
+        n_protected = n_sink + n_local
+        n_kept = int(k_len * (1 - self.compression_ratio))
+        if n_protected > n_kept > 0:
+            logger.warning(
+                "n_sink + n_local = %d exceeds the keep budget of %d at compression_ratio=%.2f; "
+                "some protected tokens will be evicted.",
+                n_protected,
+                n_kept,
+                self.compression_ratio,
+            )
+
+        finite_max = torch.nan_to_num(scores, neginf=0.0, posinf=0.0).amax()
+        sentinel = finite_max + 1.0
+        scores = scores.clone()
+        if n_sink:
+            scores[..., :n_sink] = sentinel
+        if n_local:
+            scores[..., k_len - n_local :] = sentinel
+        return scores
+
+    def score(
+        self,
+        module: nn.Module,
+        hidden_states: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        attentions: torch.Tensor,
+        kwargs: dict,
+    ) -> torch.Tensor:
+        """
+        Importance scores, (B, num_kv_heads, k_len).
+
+        Chunk-level selection is expressed here as a score transform rather than a custom
+        ``compress`` override: every token in a kept chunk inherits the chunk's pooled
+        score, so ScorerPress's ordinary top-k picks up whole chunks while sink/local
+        protection and the ragged tail keep working unchanged.
+        """
+        k_len = keys.shape[2]
+        scores = self.token_scores(module, hidden_states, kwargs, k_len)
+
+        if scores.shape[-1] != k_len:
+            raise RuntimeError(
+                f"indexer scored {scores.shape[-1]} keys but the cache holds {k_len}. "
+                "This press currently supports prefill-time compression only."
+            )
+
+        if self.use_vnorm:
+            # Applied to token scores, before any chunk pooling, so a chunk's pooled score
+            # reflects value magnitude too.
+            scores = scores * values.norm(dim=-1).to(scores.dtype)
+
+        if self.chunk_size > 0:
+            scores = self.broadcast_chunk_scores(scores)
+
+        if self.mean_head:
+            # Ablation back to DSA-style head-uniform selection. Implemented as a score
+            # transform so ScorerPress's ordinary per-head top-k then picks identical
+            # positions for every head -- main's ScorerPress has no mean_head of its own.
+            scores = scores.mean(dim=1, keepdim=True).expand_as(scores).contiguous()
+
+        return self.protect_boundaries(scores)
+
+    def broadcast_chunk_scores(self, token_scores: torch.Tensor) -> torch.Tensor:
+        """
+        Replace each token's score with its chunk's pooled score.
+
+        The ragged tail (fewer than ``chunk_size`` tokens) keeps its token-level scores: a
+        short chunk pooled by ``mean`` would compete unfairly against full chunks, and by
+        ``max`` it would be indistinguishable from one.
+        """
+        chunk_scores, complete_end = aggregate_chunk_scores(
+            token_scores, self.chunk_size, self.chunk_aggregate
+        )
+        if complete_end == 0:
+            return token_scores
+        broadcast = chunk_scores.repeat_interleave(self.chunk_size, dim=-1)
+        if complete_end == token_scores.shape[-1]:
+            return broadcast.to(token_scores.dtype)
+        tail = token_scores[..., complete_end:]
+        return torch.cat([broadcast.to(token_scores.dtype), tail], dim=-1)

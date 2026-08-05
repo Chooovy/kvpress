@@ -17,6 +17,7 @@ from kvpress.presses.gqa_indexer import (
     get_attention_modules,
     teacher_query_states,
 )
+from kvpress.presses.gqa_indexer import HAS_TRITON, build_indexer_mask, decompose_mask
 from kvpress.presses.gqa_indexer.indexer import MASK_NEG
 from tests.fixtures import unit_test_model, unit_test_model_output_attention  # noqa: F401
 
@@ -561,3 +562,115 @@ def test_negative_forced_slots_raise(unit_test_model):  # noqa: F811
     press.post_init_from_model(unit_test_model)
     with pytest.raises(ValueError, match="non-negative"):
         FusedIndexerTrainer(press=press, force_local=-1)
+
+
+# ----------------------------------------------------------------------
+# Backend dispatch
+# ----------------------------------------------------------------------
+def test_torch_backend_is_forced(unit_test_model):  # noqa: F811
+    model = unit_test_model
+    trainer = make_trainer(model, backend="torch", key_tile=8)
+    loss, _ = fused_indexer_training_step(
+        model, trainer, input_ids=torch.randint(0, 1024, (1, 16), device=model.device)
+    )
+    assert torch.isfinite(loss)
+    assert trainer.backend_used == "torch"
+
+
+def test_auto_backend_declines_without_cuda(unit_test_model):  # noqa: F811
+    """
+    On CPU 'auto' must land on torch -- and say so.
+
+    Also the case under TRITON_INTERPRET=1: the interpreter is correct but far slower than
+    the PyTorch path, so 'auto' choosing it would be a pessimization dressed as an
+    optimization.
+    """
+    model = unit_test_model
+    trainer = make_trainer(model, backend="auto", key_tile=8)
+    loss, _ = fused_indexer_training_step(
+        model, trainer, input_ids=torch.randint(0, 1024, (1, 16), device=model.device)
+    )
+    assert torch.isfinite(loss)
+    expected = "triton" if (torch.cuda.is_available() and HAS_TRITON) else "torch"
+    assert trainer.backend_used == expected
+
+
+def test_auto_and_torch_backends_agree(unit_test_model):  # noqa: F811
+    """Whichever path 'auto' takes, it must produce the same number as the reference."""
+    model = unit_test_model
+    input_ids = torch.randint(0, 1024, (1, 20), device=model.device)
+
+    reference = make_trainer(model, backend="torch", key_tile=1024, query_tile=1024)
+    ref_loss, _ = fused_indexer_training_step(model, reference, input_ids=input_ids)
+
+    auto = FusedIndexerTrainer(press=reference.press, backend="auto", key_tile=1024)
+    loss, _ = fused_indexer_training_step(model, auto, input_ids=input_ids)
+    torch.testing.assert_close(loss, ref_loss, rtol=1e-4, atol=1e-5)
+
+
+def test_triton_backend_raises_rather_than_falling_back(unit_test_model):  # noqa: F811
+    """
+    backend='triton' must fail loudly when it cannot run.
+
+    Falling back silently would let a benchmark measure the PyTorch path while reporting a
+    kernel number -- the failure mode that makes performance work untrustworthy.
+    """
+    model = unit_test_model
+    if torch.cuda.is_available() and HAS_TRITON:
+        pytest.skip("the kernels can actually run here")
+
+    trainer = make_trainer(model, backend="triton", key_tile=8)
+    with pytest.raises(RuntimeError, match="backend='triton'"):
+        fused_indexer_training_step(
+            model, trainer, input_ids=torch.randint(0, 1024, (1, 16), device=model.device)
+        )
+
+
+def test_triton_backend_rejects_stage_two(unit_test_model):  # noqa: F811
+    press = GQAIndexerPress(compression_ratio=0.5)
+    press.post_init_from_model(unit_test_model)
+    with pytest.raises(NotImplementedError, match="stage 1 only"):
+        FusedIndexerTrainer(press=press, backend="triton", stage="sparse")
+
+
+def test_unknown_backend_raises(unit_test_model):  # noqa: F811
+    press = GQAIndexerPress(compression_ratio=0.5)
+    press.post_init_from_model(unit_test_model)
+    with pytest.raises(ValueError, match="backend must be"):
+        FusedIndexerTrainer(press=press, backend="cuda")
+
+
+def test_non_power_of_two_block_raises(unit_test_model):  # noqa: F811
+    press = GQAIndexerPress(compression_ratio=0.5)
+    press.post_init_from_model(unit_test_model)
+    with pytest.raises(ValueError, match="powers of two"):
+        FusedIndexerTrainer(press=press, block_m=48)
+
+
+def test_sink_skip_still_decomposes_for_the_kernels(unit_test_model):  # noqa: F811
+    """
+    A sink skip is per-key, so it must not knock the run off the kernel path.
+
+    Checked via decompose_mask on the trainer's own mask rather than through backend_used,
+    so the assertion holds on CPU too.
+    """
+    model = unit_test_model
+    q_len = 16
+    trainer = make_trainer(model, key_tile=8, skip_sink_in_loss=4)
+    mask = trainer.apply_sink_skip(
+        build_indexer_mask(q_len, q_len, model.device, dtype=torch.float32)
+    )
+    ok, keep = decompose_mask(mask, q_len, q_len, 0)
+    assert ok, "a sink skip must remain kernel-representable"
+    assert keep is not None and keep[0, :4].tolist() == [0, 0, 0, 0]
+
+
+def test_backend_used_is_cleared_by_reset(unit_test_model):  # noqa: F811
+    model = unit_test_model
+    trainer = make_trainer(model, backend="torch", key_tile=8)
+    fused_indexer_training_step(
+        model, trainer, input_ids=torch.randint(0, 1024, (1, 16), device=model.device)
+    )
+    assert trainer.backend_used == "torch"
+    trainer.reset()
+    assert trainer.backend_used is None

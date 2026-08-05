@@ -366,3 +366,76 @@ scatters with `index_add` rather than a dense einsum, since each query row touch
 own `topk` keys.
 
 
+
+## Triton kernels (stage 1)
+
+`fused_loss.py` is already `O(L)` in memory, but every tile round-trips through HBM: the
+student logits, `exp_logits`, the teacher's `alpha` and `p_bar` are each a separate
+`(B, h, query_tile, key_tile)` tensor written and read back. `triton_fused_loss.py` keeps all
+of that in registers and shared memory.
+
+```python
+trainer = FusedIndexerTrainer(press=press, backend="auto")    # kernels when possible
+trainer = FusedIndexerTrainer(press=press, backend="triton")  # force; raises if it can't run
+trainer = FusedIndexerTrainer(press=press, backend="torch")   # reference path
+print(trainer.backend_used)   # which one actually ran
+```
+
+`backend="triton"` deliberately **raises** instead of falling back. A silent fallback would
+let a benchmark measure the PyTorch path while reporting a kernel number — the failure mode
+that makes performance work untrustworthy. `auto` falls back and logs at debug level; it also
+declines under `TRITON_INTERPRET=1`, where the kernels are correct but far slower than
+PyTorch, so choosing them would be a pessimization dressed as an optimization.
+
+Two wins here are structural, not just bandwidth:
+
+**No dense mask.** The PyTorch path takes an additive `(B, 1, Sq, Sk)` mask — itself `O(L²)`,
+64 GiB of fp32 at `L=128K`, dwarfing everything the tiling saved. The kernels derive causality
+from `query_offset` arithmetic and take padding as a `(B, Sk)` keep vector. `decompose_mask`
+splits a mask into `(causal, keep)` when it can, and reports failure when it cannot:
+
+| mask | decomposes | note |
+|---|---|---|
+| causal | ✅ | `keep=None`, no load at all |
+| causal + padding | ✅ | keep vector recovered exactly |
+| causal + sink skip | ✅ | masking the first N keys *is* per-key |
+| sliding window | ❌ | per-row, cannot factor |
+| arbitrary per-pair bias | ❌ | |
+| built with a different `query_offset` | ❌ | |
+
+Rejection is the *correct* outcome, not a limitation: a wrong decomposition would train
+against a mask the student never sees, with nothing downstream to catch it. Verified by an
+exhaustive random sweep — every accepted mask rebuilds exactly from `(causal, keep)`, and every
+non-decomposable one is rejected.
+
+**Causal early exit.** A query block starting at `m` sees keys only up to
+`m + BLOCK_M − 1 + query_offset`, so the key loop stops there rather than running to `Sk`.
+That halves the work on a square causal problem. Verified never to skip a needed key across
+every shape × block-size combination, including `Sq > Sk` (where a leading block's bound goes
+negative and the loop correctly runs zero times).
+
+`dK` parallelizes over **key** blocks so each program's output range is disjoint — no atomics,
+even though the reduction runs over queries.
+
+`tl.dot` is pinned to `input_precision="ieee"`, so results match the PyTorch path to fp32
+rounding rather than TF32's ~1e-3. That costs throughput on Ampere+; it is deliberate for a
+reference kernel whose job is to be trusted, and it is the first knob to turn once it is.
+
+fp64 is declined rather than demoted — `tl.dot` has no fp64 path, and quietly dropping to fp32
+would break the gradient tests that rely on fp64 to reach 1e-10.
+
+### Dead rows diverge, by design
+
+A query row with no visible key (padding + causality can produce one) gets a **different**
+per-row value from the two paths. PyTorch *adds* a finite `MASK_NEG = -1e4`, so the row's
+`lse` lands near `−9997`; the kernels use a true `−inf` and clamp, landing near `−23`.
+
+Both are finite — the property that matters, since a NaN would poison every gradient in the
+batch — and both are meaningless. The difference is unobservable because both loss functions
+weight rows by `row_valid`, making `d(loss)/d(row)` exactly zero there: scalar losses and all
+gradients agree (verified) even though the raw rows do not. **Compare raw `rows` between the
+two implementations only on live rows.**
+
+Stage 2 is torch-only for now; `backend="triton"` with `stage="sparse"` raises rather than
+pretending. Fusing it needs top-k inside the kernel, which is a different problem — the
+selection has to be complete before the loss pass can start.

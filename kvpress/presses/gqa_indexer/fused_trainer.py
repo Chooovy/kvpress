@@ -47,6 +47,13 @@ from kvpress.presses.gqa_indexer.fused_sparse_loss import (
 from kvpress.presses.gqa_indexer.indexer import MASK_NEG, build_indexer_mask
 from kvpress.presses.gqa_indexer.press import GQAIndexerPress, get_language_model
 from kvpress.presses.gqa_indexer.sparse_support import resolve_topk, streaming_topk_support
+from kvpress.presses.gqa_indexer.triton_fused_loss import (
+    HAS_TRITON,
+    decompose_mask,
+    kernels_available,
+    triton_indexer_loss,
+    triton_interpret_enabled,
+)
 from kvpress.utils import extract_keys_and_values, get_prerope_query_states
 
 logger = logging.getLogger(__name__)
@@ -130,6 +137,13 @@ class FusedIndexerTrainer:
         Stage-2 slots reserved per query row for the leading keys and the row's own most
         recent keys, mirroring MSA's always-selected local block. Distinct from the press's
         ``n_sink``/``n_local``, which protect keys globally after the query axis is reduced.
+    backend : str
+        ``auto`` (default) takes the Triton kernels when they can run and the mask
+        decomposes, else PyTorch. ``torch`` forces the reference path. ``triton`` forces the
+        kernels and *raises* rather than falling back, so a benchmark cannot silently measure
+        the wrong thing. Stage 2 is torch-only for now.
+    block_m, block_n : int
+        Triton tile sizes; must be powers of two.
     """
 
     press: GQAIndexerPress
@@ -148,8 +162,14 @@ class FusedIndexerTrainer:
     force_sink: int = 0
     force_local: int = 0
 
+    # Kernel backend
+    backend: str = "auto"
+    block_m: int = 64
+    block_n: int = 64
+
     per_layer_losses: dict[int, torch.Tensor] = field(default_factory=dict)
     per_layer_recall: dict[int, float] = field(default_factory=dict)
+    backend_used: str | None = field(default=None, init=False)
 
     def __post_init__(self):
         if self.stage not in ("dense", "sparse"):
@@ -162,11 +182,23 @@ class FusedIndexerTrainer:
             raise ValueError(f"teacher_mode must be one of {TEACHER_MODES}, got {self.teacher_mode!r}")
         if self.force_sink < 0 or self.force_local < 0:
             raise ValueError("force_sink and force_local must be non-negative")
+        if self.backend not in ("auto", "torch", "triton"):
+            raise ValueError(f"backend must be 'auto', 'torch' or 'triton', got {self.backend!r}")
+        if self.block_m & (self.block_m - 1) or self.block_n & (self.block_n - 1):
+            raise ValueError(
+                f"block_m/block_n must be powers of two, got {self.block_m}, {self.block_n}"
+            )
+        if self.backend == "triton" and self.stage == "sparse":
+            raise NotImplementedError(
+                "the Triton path currently covers stage 1 only; stage 2 runs on the torch "
+                "backend. Use backend='auto' with stage='sparse'."
+            )
 
     def reset(self) -> None:
         """Drop the losses from the previous forward pass."""
         self.per_layer_losses = {}
         self.per_layer_recall = {}
+        self.backend_used = None
 
     def total_loss(self) -> torch.Tensor:
         """Mean loss over the layers that fired. Raises if none did."""
@@ -250,6 +282,35 @@ class FusedIndexerTrainer:
                 query_tile=self.query_tile,
             )
 
+        if self.use_triton(indexer, hidden_states, query_states, key_states):
+            ok, keep = decompose_mask(mask, q_len, k_len, k_len - q_len)
+            if ok:
+                self.backend_used = "triton"
+                return triton_indexer_loss(
+                    indexer,
+                    hidden_states,
+                    query_states,
+                    key_states,
+                    lse,
+                    scaling=scaling,
+                    cos=cos,
+                    sin=sin,
+                    keep=keep,
+                    query_offset=k_len - q_len,
+                    row_valid=row_valid,
+                    block_m=self.block_m,
+                    block_n=self.block_n,
+                    loss_coeff=self.loss_coeff,
+                )
+            if self.backend == "triton":
+                raise RuntimeError(
+                    "backend='triton' was requested but this layer's mask is not "
+                    "causal + per-key padding, which the kernels cannot represent. Use "
+                    "backend='auto' to fall back, or backend='torch'."
+                )
+            logger.debug("mask is not kernel-representable; falling back to the torch backend")
+
+        self.backend_used = "torch"
         teacher_alpha = make_recompute_teacher(query_states, key_states, scaling, group_size)
 
         return fused_indexer_loss(
@@ -266,6 +327,38 @@ class FusedIndexerTrainer:
             query_tile=self.query_tile,
             loss_coeff=self.loss_coeff,
         )
+
+    def use_triton(self, indexer, hidden_states, query_states, key_states) -> bool:
+        """
+        Whether to take the Triton path for this layer.
+
+        ``auto`` requires CUDA and a kernel-supported dtype, and additionally declines under
+        ``TRITON_INTERPRET=1``: the interpreter is correct but much slower than the PyTorch
+        path, so silently choosing it would make ``auto`` a pessimization. ``triton`` forces
+        it (including under the interpreter, which is the point of that mode) and raises if it
+        cannot run, rather than quietly measuring the fallback.
+        """
+        if self.backend == "torch":
+            return False
+
+        probe = (
+            indexer.w_q.weight,
+            hidden_states,
+            query_states,
+            key_states,
+        )
+        if self.backend == "triton":
+            if not HAS_TRITON:
+                raise RuntimeError("backend='triton' was requested but Triton is not installed")
+            if not kernels_available(*probe):
+                raise RuntimeError(
+                    "backend='triton' was requested but the kernels cannot run on these "
+                    f"tensors (cuda={all(t.is_cuda for t in probe)}, "
+                    f"dtypes={[t.dtype for t in probe]}); float64 in particular has no tl.dot"
+                )
+            return True
+
+        return kernels_available(*probe) and not triton_interpret_enabled()
 
     def sparse_layer_loss(
         self,
@@ -293,6 +386,7 @@ class FusedIndexerTrainer:
         """
         k_len = key_states.shape[2]
         topk = resolve_topk(k_len, self.topk, self.keep_ratio)
+        self.backend_used = "torch"
 
         with torch.no_grad():
             support, valid = streaming_topk_support(

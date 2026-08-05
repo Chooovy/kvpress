@@ -93,6 +93,14 @@ from kvpress.presses.gqa_indexer.train import (
     indexer_state_dict,
     load_indexer_state_dict,
 )
+from kvpress.presses.gqa_indexer.triton_fused_loss import (
+    HAS_TRITON,
+    decompose_mask,
+    kernels_available,
+    triton_indexer_ce_rows,
+    triton_indexer_loss,
+    triton_interpret_enabled,
+)
 
 __all__ = [
     "GQAIndexer",
@@ -144,4 +152,11 @@ __all__ = [
     "make_sparse_recompute_teacher",
     "fused_sparse_indexer_kl_rows",
     "fused_sparse_indexer_loss",
+    # Triton kernels for stage 1
+    "HAS_TRITON",
+    "kernels_available",
+    "triton_interpret_enabled",
+    "decompose_mask",
+    "triton_indexer_ce_rows",
+    "triton_indexer_loss",
 ]

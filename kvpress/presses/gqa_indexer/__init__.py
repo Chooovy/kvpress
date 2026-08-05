@@ -5,16 +5,22 @@
 GQA lightning indexer: a small learned scorer that predicts, per KV head, which
 cached tokens matter.
 
-The design mirrors DeepSeek's lightning indexer (DSA) but is adapted to grouped-query
-attention. Two structural differences from the MLA original:
+The design follows DeepSeek's lightning indexer (DSA) but is adapted to grouped-query
+attention, which drops three of DSA's components rather than porting them:
 
-1. MLA keeps a single shared latent KV, so DSA must collapse its indexer heads into
-   one selection via a learned ``weights_proj`` pooling. GQA has ``num_key_value_heads``
-   physically independent caches, so we keep one score per KV head and let each KV head
-   evict independently.
-2. MLA feeds the indexer the already-computed low-rank query (``q_lora``). GQA has no
-   such tensor, so queries are projected straight from ``hidden_states`` -- the same
-   choice MiniMax M3's GQA indexer makes.
+1. MLA keeps a single shared latent KV cache, so DSA must collapse many indexer heads into
+   ONE score -- hence its ReLU (to keep per-head contributions non-negative before they are
+   summed) and its learned ``weights_proj`` pooling. GQA has ``num_key_value_heads``
+   physically independent caches, so we emit one score per KV head and let each evict
+   independently. With no cross-head sum, the activation and the pooling weights have
+   nothing left to do: top-k is invariant to strictly increasing maps, and a per-head
+   scalar is constant along the key axis so it cannot reorder a row. MiniMax M3, the one
+   production GQA indexer, likewise has neither.
+2. The key side is MQA (a single shared key head), so the indexer's own cache costs
+   ``head_dim`` per token rather than ``n_heads * head_dim``. Heads differ on the query
+   side only.
+3. MLA feeds the indexer the already-computed low-rank query (``q_lora``). GQA has no such
+   tensor, so queries are projected straight from ``hidden_states`` -- again matching M3.
 
 Selection stays at token granularity inside the indexer; chunk/block aggregation is a
 separate, optional post-processing step on the token scores (see

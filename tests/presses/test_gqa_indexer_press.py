@@ -7,6 +7,7 @@ import math
 
 import pytest
 import torch
+import torch.nn.functional as F
 from transformers import DynamicCache
 
 from kvpress import GQAIndexerPress
@@ -33,11 +34,10 @@ from kvpress.presses.gqa_indexer.indexer import MASK_NEG, apply_rotary, rotate_h
 from tests.fixtures import unit_test_model, unit_test_model_output_attention  # noqa: F401
 
 
-def make_indexer(n_kv_heads=2, group_size=2, head_dim=8, hidden_size=16, **kw):
+def make_indexer(n_heads=2, head_dim=8, hidden_size=16, **kw):
     config = GQAIndexerConfig(
         hidden_size=hidden_size,
-        n_kv_heads=n_kv_heads,
-        group_size=group_size,
+        n_heads=n_heads,
         head_dim=head_dim,
         **kw,
     )
@@ -154,34 +154,64 @@ def test_mask_accepts_4d_additive_mask():
 # ----------------------------------------------------------------------
 # Indexer forward
 # ----------------------------------------------------------------------
-def test_indexer_emits_one_score_per_kv_head():
-    indexer = make_indexer(n_kv_heads=3, group_size=4)
+def test_indexer_emits_one_score_per_head():
+    indexer = make_indexer(n_heads=3)
     out = indexer(torch.randn(2, 7, 16))
     assert out.shape == (2, 3, 7, 7)
     assert out.dtype == torch.float32  # fp32 accumulation
 
 
-def test_indexer_projection_shapes_follow_h_times_g():
-    """w_q must emit h*g heads and w_k exactly h heads."""
-    indexer = make_indexer(n_kv_heads=8, group_size=4, head_dim=128, hidden_size=4096)
-    assert indexer.w_q.weight.shape == (8 * 4 * 128, 4096)
-    assert indexer.w_k.weight.shape == (8 * 128, 4096)
+def test_indexer_is_mqa_on_the_key_side():
+    """
+    w_q emits n_heads heads; w_k emits exactly ONE.
+
+    The single key head is what keeps the indexer's own cache at head_dim per token
+    instead of n_heads * head_dim (8x smaller for Llama-3.1-8B).
+    """
+    indexer = make_indexer(n_heads=8, head_dim=128, hidden_size=4096)
+    assert indexer.w_q.weight.shape == (8 * 128, 4096)
+    assert indexer.w_k.weight.shape == (128, 4096)  # MQA: one key head
     assert indexer.w_q.bias is None and indexer.w_k.bias is None  # bias-free like DSA/M3
 
 
-@pytest.mark.parametrize("group_reduce", ["weights_proj", "sum", "mean", "amax"])
-def test_group_reduce_variants(group_reduce):
-    indexer = make_indexer(group_reduce=group_reduce)
-    out = indexer(torch.randn(1, 5, 16))
-    assert out.shape == (1, 2, 5, 5)
-    assert torch.isfinite(out).all()
-    # weights_proj is the only variant that should allocate the pooling layer
-    assert (indexer.weights_proj is not None) == (group_reduce == "weights_proj")
+def test_indexer_has_no_activation_or_pooling_parameters():
+    """
+    The DSA components that only exist to collapse heads must be gone.
+
+    A per-head scalar weight cannot reorder a row (it is constant along the key axis), and
+    an activation cannot change a per-head top-k. Keeping either would be dead weight.
+    """
+    indexer = make_indexer()
+    assert not hasattr(indexer, "weights_proj")
+    assert not hasattr(indexer, "group_reduce")
+    param_names = {n for n, _ in indexer.named_parameters()}
+    assert param_names == {
+        "w_q.weight",
+        "w_k.weight",
+        "q_norm.weight",
+        "q_norm.bias",
+        "k_norm.weight",
+        "k_norm.bias",
+    }
 
 
-def test_per_kv_head_scores_are_distinct():
-    """The whole point of the refactor: heads must not collapse to one shared score."""
-    indexer = make_indexer(n_kv_heads=4, group_size=2)
+def test_scores_are_a_plain_dot_product():
+    """No activation: the score must be exactly q . k, so it can take either sign."""
+    indexer = make_indexer(n_heads=2, head_dim=8, hidden_size=16)
+    hidden = torch.randn(1, 6, 16)
+    out = indexer(hidden)
+
+    q = indexer.project_q(hidden)
+    k = indexer.project_k(hidden)
+    expected = torch.einsum("bhqd,bkd->bhqk", q.float(), k.float())
+    torch.testing.assert_close(out, expected)
+    # both signs present -> nothing is clamping the range
+    assert (out > 0).any() and (out < 0).any()
+
+
+def test_per_head_scores_are_distinct():
+    """The whole point: heads must not collapse to one shared score."""
+    indexer = make_indexer(n_heads=4)
     out = indexer(torch.randn(1, 6, 16))
     for i in range(1, 4):
         assert not torch.allclose(out[0, 0], out[0, i]), f"head {i} duplicates head 0"
@@ -196,12 +226,6 @@ def test_indexer_respects_mask():
     assert (out[0, 0].triu(1) < MASK_NEG / 2).all()
 
 
-def test_relu_activation_keeps_logits_nonnegative_before_mask():
-    indexer = make_indexer(activation="relu", group_reduce="sum")
-    out = indexer(torch.randn(1, 5, 16))
-    assert (out >= 0).all()
-
-
 def test_indexer_accepts_separate_key_hidden_states():
     """Decode-time scoring: 1 query against a longer key history."""
     indexer = make_indexer()
@@ -210,12 +234,56 @@ def test_indexer_accepts_separate_key_hidden_states():
 
 
 def test_config_rejects_invalid_settings():
-    with pytest.raises(ValueError, match="group_reduce"):
-        GQAIndexerConfig(hidden_size=16, n_kv_heads=2, group_size=2, head_dim=8, group_reduce="nope")
     with pytest.raises(ValueError, match="rope_dim must be even"):
-        GQAIndexerConfig(hidden_size=16, n_kv_heads=2, group_size=2, head_dim=8, rope_dim=3)
+        GQAIndexerConfig(hidden_size=16, n_heads=2, head_dim=8, rope_dim=3)
     with pytest.raises(ValueError, match="cannot exceed head_dim"):
-        GQAIndexerConfig(hidden_size=16, n_kv_heads=2, group_size=2, head_dim=8, rope_dim=16)
+        GQAIndexerConfig(hidden_size=16, n_heads=2, head_dim=8, rope_dim=16)
+    with pytest.raises(ValueError, match="n_heads must be positive"):
+        GQAIndexerConfig(hidden_size=16, n_heads=0, head_dim=8)
+
+
+# ----------------------------------------------------------------------
+# Why activation / per-head weights were dropped.
+# These pin the arguments so nobody re-adds them without a new reason.
+# ----------------------------------------------------------------------
+def test_topk_is_invariant_to_strictly_increasing_activation():
+    """softplus / exp cannot change a per-head selection, so they buy nothing."""
+    scores = torch.randn(64)
+    k = 20
+    base = set(scores.topk(k).indices.tolist())
+    for name, fn in [("softplus", F.softplus), ("exp", torch.exp), ("affine", lambda x: 2 * x + 1)]:
+        assert set(fn(scores).topk(k).indices.tolist()) == base, f"{name} changed the selection"
+
+
+def test_relu_would_tie_negative_scores_and_randomise_selection():
+    """
+    ReLU is NOT strictly increasing: it flattens every negative score to 0.
+
+    At moderate compression the keep boundary falls inside that negative region, so ReLU
+    would decide part of the selection by arbitrary tie-break. This is the concrete reason
+    the indexer has no activation.
+    """
+    torch.manual_seed(0)
+    scores = torch.randn(64) - 1.0  # mostly negative
+    k = 40  # boundary lands among the negatives
+    assert (scores < 0).sum() > k // 2, "fixture should be mostly negative"
+
+    raw = set(scores.topk(k).indices.tolist())
+    relued = set(F.relu(scores).topk(k).indices.tolist())
+    assert F.relu(scores).eq(0).sum() > 1, "relu should produce ties"
+    assert raw != relued, "relu must be shown to perturb the selection"
+
+
+def test_per_head_scalar_weight_cannot_reorder_a_row():
+    """
+    A weights_proj-style scalar is constant along the key axis: a no-op when positive and a
+    ranking reversal when negative. Either way it adds nothing to per-head selection.
+    """
+    scores = torch.randn(64)
+    k = 20
+    base = set(scores.topk(k).indices.tolist())
+    assert set((3.7 * scores).topk(k).indices.tolist()) == base
+    assert set((-3.7 * scores).topk(k).indices.tolist()) != base
 
 
 # ----------------------------------------------------------------------
@@ -340,7 +408,7 @@ def test_sparse_target_aligns_with_topk_and_ignores_padding_slots():
 @pytest.mark.parametrize("stage", ["dense", "sparse"])
 def test_indexer_layer_loss_is_finite_and_differentiable(stage):
     n_kv_heads, n_heads, q_len, k_len = 2, 4, 5, 5
-    indexer = make_indexer(n_kv_heads=n_kv_heads, group_size=n_heads // n_kv_heads)
+    indexer = make_indexer(n_heads=n_kv_heads)
     hidden = torch.randn(1, q_len, 16)
     mask = build_indexer_mask(q_len, k_len, hidden.device)
     logits = indexer(hidden, mask=mask)
@@ -483,16 +551,23 @@ def test_press_mean_head_matches_head_uniform_behaviour(unit_test_model):  # noq
     assert cache.layers[0].keys.shape[2] == 16
 
 
-def test_press_geometry_defaults_mirror_attention(unit_test_model):  # noqa: F811
+def test_press_geometry_defaults_to_one_head_per_kv_head(unit_test_model):  # noqa: F811
+    """
+    The default must be n_heads == num_key_value_heads, NOT num_attention_heads.
+
+    Mirroring the full query-head count would cost ~4x the parameters and FLOPs while
+    still producing only num_key_value_heads usable scores.
+    """
     press = GQAIndexerPress()
     press.post_init_from_model(unit_test_model)
     module = get_attention_modules(unit_test_model)[0]
     indexer = press.get_indexer(module)
 
     config = unit_test_model.config
-    assert indexer.n_kv_heads == config.num_key_value_heads
-    assert indexer.group_size == config.num_attention_heads // config.num_key_value_heads
-    assert indexer.n_q_heads == config.num_attention_heads
+    assert indexer.n_heads == config.num_key_value_heads
+    assert indexer.head_dim == module.head_dim
+    # w_k stays single-head regardless of n_heads
+    assert indexer.w_k.weight.shape[0] == indexer.head_dim
 
 
 def test_post_init_is_idempotent(unit_test_model):  # noqa: F811

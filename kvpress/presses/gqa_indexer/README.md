@@ -17,44 +17,68 @@ therefore free capacity, and kvpress's `ScorerPress.compress` already does per-h
 
 MiniMax M3 — the one production GQA indexer among the references — confirms the shape:
 `index_n_heads == num_key_value_heads`, one independent selection per group, and **no**
-`weights_proj` at all.
+activation and **no** `weights_proj`.
 
 ## Geometry
 
-For Llama-3.1-8B (32 attention heads, 8 KV heads, `head_dim` 128) with `h=8`, `g=4`:
+For Llama-3.1-8B (32 attention heads, 8 KV heads, `head_dim` 128):
 
 | | shape | note |
 |---|---|---|
-| `w_q` | `hidden -> (h*g) x head_dim` = 32 heads | one query per attention head |
-| `w_k` | `hidden -> h x head_dim` = 8 heads | one key per KV head; cache cost is `h x head_dim`/token |
+| `w_q` | `hidden -> n_heads x head_dim` = 8 heads | one query head per KV head |
+| `w_k` | `hidden -> head_dim` = **1 head (MQA)** | shared across heads; cache cost is `head_dim`/token |
 | output | `(B, 8, Sq, Sk)` | one score per KV head |
 
+`n_heads` defaults to `num_key_value_heads`, **not** `num_attention_heads`. Mirroring the
+full query-head count costs ~4× the parameters and score-GEMM FLOPs while still producing
+only `num_key_value_heads` usable scores:
+
+| | params/layer | GEMM heads | indexer k-cache |
+|---|---|---|---|
+| 32 q heads, 8 k heads | 21.0M | 32 | 2048 B/token |
+| **8 q heads, 1 k head** | **4.7M** | **8** | **256 B/token** |
+
 Queries come straight from `hidden_states`. MLA feeds its indexer the already-computed
-`q_lora`, which is a free-reuse optimization, not a design requirement — GQA has no such
-tensor, and adding a bottleneck purely for the indexer would cost parameters and lose
-information.
+`q_lora`, which is free reuse rather than a design requirement — GQA has no such tensor,
+and adding a bottleneck purely for the indexer would cost parameters and lose information.
+
+## No activation, no cross-head reduction, no per-head weights
+
+DSA's ReLU and `weights_proj` exist to make a **cross-head sum** well-behaved: ReLU keeps
+per-head contributions non-negative so they cannot cancel, and `weights_proj` learns how to
+weight them. With one score per KV head there is no sum, and both become inert or harmful:
+
+- **An activation cannot change a per-head top-k.** Top-k is invariant to strictly
+  increasing maps, so `softplus`/`exp` are pure overhead.
+- **ReLU is worse than inert.** It is not strictly increasing — it flattens every negative
+  score to exactly 0. At moderate compression the keep boundary falls *inside* that
+  negative region, so ReLU decides part of the selection by arbitrary tie-break. It also
+  caps how strongly the student can reject a key (floor at `exp(0)`), halves the gradient
+  paths, and forces the backward pass to recompute `z` for the `1[z>0]` mask.
+- **A per-head scalar weight cannot reorder a row.** It is constant along the key axis:
+  `topk(w·s) == topk(s)` for `w > 0`, and reverses the ranking for `w < 0`. No-op or bug.
+
+This is also why the three reference implementations disagree: DeepSeek-V3.2 sums heads and
+needs ReLU; GLM5 and M3 do not sum and do not use it.
+
+`tests/presses/test_gqa_indexer_press.py` pins each of these arguments so they are not
+silently re-added.
 
 ## Pipeline
 
 ```
 hidden_states
-  -> w_q / w_k  (+ LayerNorm, + RoPE on the leading rope_dim channels)
-  -> logits        (B, h, g, Sq, Sk)   fp32
-  -> activation    relu | softplus | leaky_relu | none
-  -> group_reduce  (B, h, Sq, Sk)      weights_proj | sum | mean | amax
+  -> w_q (n_heads) / w_k (1, MQA)  + LayerNorm  + RoPE on the leading rope_dim channels
+  -> scores          (B, h, Sq, Sk)   fp32, einsum('bhqd,bkd->bhqk')
   -> + causal/padding mask
-  -> reduce_queries (B, h, Sk)         mean | max | last | recency
-  -> [optional] chunk pooling          mean | max
+  -> reduce_queries  (B, h, Sk)       mean | max | last | recency
+  -> [optional] chunk pooling         mean | max
   -> sink/local protection
   -> ScorerPress topk + gather (per KV head)
 ```
 
 Chunk aggregation deliberately runs **after** token-level scoring, so the indexer stays a
 pure token scorer and chunking remains a swappable policy.
-
-`group_reduce` note: with per-head `topk`, a per-head scalar weight cannot change any
-ranking (`topk(w_h * s) == topk(s)` for `w_h > 0`), so `weights_proj` is only
-load-bearing for the *within-group* reduction — which is exactly where it is applied here.
 
 ## Training
 
@@ -96,6 +120,10 @@ torch.save(indexer_state_dict(model), "indexer.pt")
 
 Note `compute_indexer_loss` scores layer `i` from `hidden_states[i]` (its **input**), not
 `hidden_states[i + 1]`, which is what the attention layer actually consumes.
+
+The teacher is grouped **per KV group**, not averaged over all heads — matching MiniMax M3
+Eq. 9. Averaging across groups would give every indexer head an identical target and waste
+the per-head capacity that motivates the whole design.
 
 ## Correctness notes
 

@@ -45,18 +45,13 @@ class GQAIndexerPress(ScorerPress):
     ----------
     compression_ratio : float
         Fraction of KV pairs to remove.
-    n_kv_heads, group_size, head_dim : int, optional
-        Indexer geometry. Left as ``None`` they are derived from the model config as
-        ``n_kv_heads = num_key_value_heads``, ``group_size = n_heads // n_kv_heads``,
-        ``head_dim = module.head_dim`` -- i.e. the indexer mirrors the attention layout.
+    n_heads, head_dim : int, optional
+        Indexer geometry. Left as ``None`` they default to ``num_key_value_heads`` and the
+        attention ``head_dim``: one indexer query head per KV head, so each KV head scores
+        and evicts independently.
     rope_dim : int, optional
         Channels to rotate. ``None`` rotates the full ``head_dim`` (capped by the model's
         rotary dim); ``0`` disables RoPE.
-    activation : str
-        Logit activation before group reduction.
-    group_reduce : str
-        How the ``group_size`` query heads of a KV group combine: ``weights_proj``,
-        ``sum``, ``mean`` or ``amax``.
     query_reduce : str
         How the query axis collapses: ``mean``, ``max``, ``last`` or ``recency``.
     last_n_query : int, optional
@@ -83,13 +78,9 @@ class GQAIndexerPress(ScorerPress):
     mean_head: bool = False
 
     # Indexer geometry (None -> derive from model config)
-    n_kv_heads: int | None = None
-    group_size: int | None = None
+    n_heads: int | None = None
     head_dim: int | None = None
     rope_dim: int | None = None
-
-    activation: str = "relu"
-    group_reduce: str = "weights_proj"
 
     # Query-axis reduction
     query_reduce: str = "mean"
@@ -124,11 +115,11 @@ class GQAIndexerPress(ScorerPress):
         config = model.config
         text_config = getattr(config, "text_config", config)
 
-        n_kv_heads = self.n_kv_heads or text_config.num_key_value_heads
-        n_heads = text_config.num_attention_heads
-        group_size = self.group_size or max(1, n_heads // n_kv_heads)
+        # One indexer head per KV head: that is the granularity at which GQA holds
+        # physically separate caches, so it is the granularity at which eviction can differ.
+        n_heads = self.n_heads or text_config.num_key_value_heads
         head_dim = self.head_dim or getattr(
-            module, "head_dim", text_config.hidden_size // n_heads
+            module, "head_dim", text_config.hidden_size // text_config.num_attention_heads
         )
 
         if self.rope_dim is None:
@@ -143,12 +134,9 @@ class GQAIndexerPress(ScorerPress):
 
         return GQAIndexerConfig(
             hidden_size=text_config.hidden_size,
-            n_kv_heads=n_kv_heads,
-            group_size=group_size,
+            n_heads=n_heads,
             head_dim=head_dim,
             rope_dim=rope_dim,
-            activation=self.activation,
-            group_reduce=self.group_reduce,
         )
 
     def post_init_from_model(self, model: nn.Module, force_reinit: bool = False) -> None:

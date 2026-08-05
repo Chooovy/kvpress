@@ -40,6 +40,12 @@ from kvpress.presses.gqa_indexer.fused_loss import (
     teacher_lse_from_qk,
     teacher_probs_from_lse,
 )
+from kvpress.presses.gqa_indexer.fused_trainer import (
+    FusedIndexerTrainer,
+    attention_scaling,
+    fused_indexer_training_step,
+    teacher_query_states,
+)
 from kvpress.presses.gqa_indexer.indexer import (
     GQAIndexer,
     GQAIndexerConfig,
@@ -97,6 +103,10 @@ __all__ = [
     "fused_indexer_ce_rows",
     "fused_indexer_loss",
     "accumulation_dtype",
+    "FusedIndexerTrainer",
+    "attention_scaling",
+    "fused_indexer_training_step",
+    "teacher_query_states",
     "make_recompute_teacher",
     "teacher_lse_from_qk",
     "teacher_probs_from_lse",

@@ -201,21 +201,32 @@ the most padding. flash-attention's `lse` covers causal masking only, so
 `teacher_lse_from_qk` is the fallback that folds any mask in before the logsumexp.
 
 ```python
+from kvpress import GQAIndexerPress
 from kvpress.presses.gqa_indexer import (
-    capture_teacher_lse, fused_indexer_loss, make_recompute_teacher,
+    FusedIndexerTrainer, freeze_all_but_indexer, fused_indexer_training_step,
+    indexer_state_dict,
 )
 
-# Free teacher lse from the frozen model's own flash-attention forward.
-with capture_teacher_lse(model) as lse_by_layer:
-    model(input_ids, use_cache=False)
+press = GQAIndexerPress(compression_ratio=0.5)
+press.post_init_from_model(model)
+optimizer = torch.optim.AdamW(freeze_all_but_indexer(model), lr=1e-4)
 
-loss = fused_indexer_loss(
-    press.get_indexer(module), hidden_states,
-    make_recompute_teacher(query_states, key_states, module.scaling, group_size),
-    lse_by_layer[module.layer_idx],
-    group_size=group_size, mask=mask, key_tile=512,
-)
+trainer = FusedIndexerTrainer(press=press, key_tile=512)
+loss, per_layer = fused_indexer_training_step(model, trainer, input_ids=input_ids)
+loss.backward(); optimizer.step()
+torch.save(indexer_state_dict(model), "indexer.pt")
 ```
+
+`FusedIndexerTrainer` computes each layer's loss **inside** that layer's forward, via a
+hook, and keeps only the resulting scalar. That is not an optimization detail — storing
+every layer's teacher Q/K would cost 10 GiB at L=32K and 40 GiB at L=128K on
+Llama-3.1-8B, which would undo the whole point of the tiled loss. One layer's teacher
+tensors are live at a time.
+
+The teacher needs no extra forward pass: post-RoPE keys are already in the KV cache when
+the hook fires, and queries are rebuilt from `hidden_states` with the layer's own `q_proj`
+and the same `position_embeddings` it just used. So `use_cache=True` is required, and
+`output_attentions` is deliberately never set — the base model keeps its fast kernel.
 
 `key_tile` trades peak memory against launch overhead; the result is bit-comparable across
 values (tested at 1, 2, 3, 5, 9, 64, 128).

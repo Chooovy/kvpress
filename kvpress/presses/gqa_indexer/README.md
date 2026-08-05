@@ -152,19 +152,21 @@ reads `1.0` at masked slots. Always pass the same `valid_mask` when consuming it
 
 ## Status
 
-Two loss implementations, same objective up to a constant:
+Three loss implementations:
 
-| | `train.indexer_layer_loss` | `fused_loss.fused_indexer_loss` |
-|---|---|---|
-| objective | full KL | cross-entropy (`KL + H(pbar)`) |
-| gradients | identical | identical |
-| memory | `O(L²)` | **`O(L·h)`** |
-| teacher | `output_attentions=True` (forces eager) | logits recomputed per tile from Q/K + `lse` |
-| passes | autograd | 1 fwd (loss + `dQ`), 1 transposed (`dK`) |
+| | `train.indexer_layer_loss` | `fused_loss.fused_indexer_loss` | `fused_sparse_loss` |
+|---|---|---|---|
+| stage | 1 and 2 | 1 | 2 |
+| objective | full KL | cross-entropy (`KL + H(p̄)`) | **full KL** |
+| memory | `O(L²)` | `O(L·h)` | `O(L·h)` |
+| compute | `O(L²)` | `O(L²)` | **`O(L·topk)`** |
+| teacher | `output_attentions=True` (forces eager) | recomputed per tile from Q/K + `lse` | recomputed at the support |
+| passes | autograd | 1 fwd (loss + `dQ`), 1 transposed (`dK`) | + 1 `no_grad` selection pass |
 
-Use the dense one as the readable reference and for exact-KL numbers; use the fused one for
-anything long. Both are exercised against each other in
-`tests/presses/test_gqa_indexer_fused_loss.py`.
+Use the dense one as the readable reference and for exact-KL numbers; use the fused ones for
+anything long. All three are exercised against each other — with `topk == k_len` the sparse
+path reproduces the dense stage-1 KL exactly, which is a strong end-to-end check since the
+two share no code.
 
 Prefill-time compression only — `score` raises if the cache is longer than the scored
 hidden states. `GQAIndexer.forward` already accepts separate `key_hidden_states` for a
@@ -266,4 +268,101 @@ Only valid for causal-only masking — flash-attention's `lse` does not know abo
 and `exp(alpha - lse)` would then not sum to one over the kept keys.
 `assert_lse_mask_compatible` raises on that combination rather than letting it train
 slightly wrong.
+
+## Stage 2: sparse
+
+Stage 1 is `O(L)` in *memory* but still `O(L²)` in *compute* — every key has to be visited
+to normalize the softmax. Stage 2 restricts the objective to each query row's own top-`topk`
+support, which turns the teacher recompute into `H·L·topk·d`. This is AngelPTM's central
+stage-2 optimization: its `lighting_indexer` returns `(topk_scores, topk_indices)` and the
+teacher is only ever recovered *at those positions*.
+
+| `L` | `topk` | dense | sparse | |
+|---|---|---|---|---|
+| 32K | 512 | 8.80 TFLOP | 0.14 | **64×** |
+| 128K | 512 | 140.74 TFLOP | 0.55 | **256×** |
+| 128K | 2048 | 140.74 TFLOP | 2.20 | **64×** |
+
+```python
+trainer = FusedIndexerTrainer(
+    press=press, stage="sparse", keep_ratio=1 - press.compression_ratio,
+    query_tile=512, topk_tile=512, force_local=64,
+)
+loss, per_layer = fused_indexer_training_step(model, trainer, input_ids=input_ids)
+print(trainer.mean_recall())   # teacher mass the support captured
+```
+
+Two passes. Pass 1 (`sparse_support.py`) runs under `no_grad` and emits only int64 indices,
+so it adds nothing to the autograd graph — 8 MiB at `L=32K, topk=512, h=8`. Pass 2
+recomputes the indexer's logits at the support *with* gradients. Top-k is not
+differentiable, so treating the support as a constant is not an approximation; it is the
+only option, and it is what DSA and AngelPTM do.
+
+The support selection streams as a tournament merge against each key tile, so no `(Sq, Sk)`
+score matrix is ever built. `force_sink`/`force_local` reserve per-row slots (MSA's
+always-selected local block) by **excluding** those positions from the top-k pool and
+concatenating them back, rather than by biasing their logits — exclusion is magnitude-free,
+so no large logit can defeat it and no sentinel can overflow. These are per-query-row, unlike
+the press's `n_sink`/`n_local`, which protect keys globally after the query axis is reduced.
+
+### Full KL, not cross-entropy
+
+Stage 1 optimizes CE because `KL = CE − H(p̄)` and a *fixed* teacher makes the entropy a
+constant with identical gradients. **Stage 2 must not take that shortcut.** Its teacher is
+restricted to the student's own support, so `H(p̄)` moves as the support moves — measured
+drift of 1.166 → 1.232 nats across supports on one fixed teacher. A CE curve would mix
+objective progress with support churn. The entropy is also cheap here: the support is `topk`
+wide, not `L` wide, so `Σ p log p` streams as easily as the cross term.
+
+That makes `KL ≥ 0` an available assertion, which stage 1 cannot make. It is the check that
+catches a mis-derived normalizer: a missing `log Z` shows up immediately as a negative KL.
+
+### `teacher_mode`
+
+Two defensible teachers, and they are genuinely different objectives — measured max
+elementwise gap 0.238:
+
+| | normalizes over | needs dense `lse` | `Z` |
+|---|---|---|---|
+| `global` (default) | full key axis, then renormalized on the support | yes | teacher recall |
+| `support` | the support only, per head | **no** | `1` identically |
+
+They coincide only when every head in a group captures the same support mass; measured
+per-head mass within one group spread from 0.005 to 0.995, so not in practice. `global` is
+the default because it keeps the teacher fixed across steps, so the loss curve means the
+same thing at step 1 and step 10000. `support` matches sparse-MLA (whose `lse` is by
+construction over the selected keys) and makes stage 2 `O(L·topk)` end to end.
+
+Both run through one code path: the mode only chooses which `lse` feeds `exp(α − lse)`. In
+support mode `Z == 1` identically (verified to 2.2e-16), so the renormalization is a no-op
+rather than a special case.
+
+### `mean_recall`
+
+`global` mode's normalizer `Z` is the teacher probability mass the support actually
+captured, so it comes for free and is exposed via `trainer.mean_recall()`. Worth watching:
+a low value means `topk` is too small for how spread out the teacher really is, and **the
+loss alone will not say so** — it can look healthy while the objective ignores most of the
+teacher's mass.
+
+### Accumulators
+
+Five per-row scalars, streamed over `(query_tile, topk_tile)` blocks:
+
+| | |
+|---|---|
+| `m, ell` | student online-softmax max and sumexp |
+| `Z` | teacher mass on the support |
+| `A` | `Σ p̄_raw log p̄_raw` — the entropy term |
+| `C` | `Σ p̄_raw · I` — the cross term |
+
+then `KL = A/Z − log Z − C/Z + lse`. Every accumulator is linear in the teacher weights,
+which is exactly what lets the row sum `Z` be divided out *after* the fact instead of being
+needed up front — the same property that makes stage 1's CE streamable.
+
+As in stage 1, `dQ` accumulates during the forward pass (the row-wise gradient `q̂ − p̄` is
+separable, so backward only scales it) and `dK` needs a second transposed pass. Here `dK`
+scatters with `index_add` rather than a dense einsum, since each query row touches only its
+own `topk` keys.
+
 

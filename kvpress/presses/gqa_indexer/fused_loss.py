@@ -54,6 +54,18 @@ from kvpress.presses.gqa_indexer.indexer import GQAIndexer
 EPS = 1e-10
 
 
+def accumulation_dtype(*tensors: torch.Tensor) -> torch.dtype:
+    """
+    Pick the accumulation dtype: fp32 for low-precision inputs, otherwise keep the input's.
+
+    Unconditionally calling ``.float()`` would silently *downcast* float64, which both
+    loses the precision a caller explicitly asked for and breaks gradient checks against a
+    float64 reference.
+    """
+    dtype = torch.result_type(*tensors) if len(tensors) > 1 else tensors[0].dtype
+    return torch.float32 if dtype.itemsize < 4 else dtype
+
+
 def teacher_probs_from_lse(
     alpha: torch.Tensor, lse: torch.Tensor, group_size: int
 ) -> torch.Tensor:
@@ -87,7 +99,8 @@ def teacher_probs_from_lse(
     bsz, n_heads, q_len, tile = alpha.shape
     if n_heads % group_size != 0:
         raise ValueError(f"H={n_heads} is not divisible by group_size={group_size}")
-    probs = torch.exp(alpha.float() - lse.float().unsqueeze(-1))
+    acc = accumulation_dtype(alpha, lse)
+    probs = torch.exp(alpha.to(acc) - lse.to(acc).unsqueeze(-1))
     return probs.view(bsz, n_heads // group_size, group_size, q_len, tile).mean(dim=2)
 
 
@@ -113,7 +126,8 @@ class _FusedIndexerCE(torch.autograd.Function):
     ):
         bsz, n_idx_heads, q_len, dim = q_idx.shape
         k_len = k_idx.shape[1]
-        device, acc_dtype = q_idx.device, torch.float32
+        device = q_idx.device
+        acc_dtype = accumulation_dtype(q_idx, k_idx, teacher_lse)
 
         run_max = torch.full((bsz, n_idx_heads, q_len), -float("inf"), device=device, dtype=acc_dtype)
         run_sum = torch.zeros((bsz, n_idx_heads, q_len), device=device, dtype=acc_dtype)
@@ -124,10 +138,11 @@ class _FusedIndexerCE(torch.autograd.Function):
         tea_q = torch.zeros((bsz, n_idx_heads, q_len, dim), device=device, dtype=acc_dtype)
         cross = torch.zeros((bsz, n_idx_heads, q_len), device=device, dtype=acc_dtype)
 
+        q_acc = q_idx.to(acc_dtype)
         for start in range(0, k_len, key_tile):
             stop = min(start + key_tile, k_len)
-            k_tile = k_idx[:, start:stop]
-            logits = torch.einsum("bhqd,bkd->bhqk", q_idx.float(), k_tile.float())
+            k_tile = k_idx[:, start:stop].to(acc_dtype)
+            logits = torch.einsum("bhqd,bkd->bhqk", q_acc, k_tile)
             if mask is not None:
                 logits = logits + mask[..., start:stop].to(acc_dtype)
 
@@ -139,7 +154,7 @@ class _FusedIndexerCE(torch.autograd.Function):
             exp_logits = torch.exp(logits - new_max.unsqueeze(-1))
             run_sum = run_sum * rescale + exp_logits.sum(dim=-1)
             acc_q = acc_q * rescale.unsqueeze(-1) + torch.einsum(
-                "bhqk,bkd->bhqd", exp_logits, k_tile.float()
+                "bhqk,bkd->bhqd", exp_logits, k_tile
             )
             run_max = new_max
 
@@ -149,9 +164,9 @@ class _FusedIndexerCE(torch.autograd.Function):
             alpha = teacher_alpha(start, stop)
             if mask is not None:
                 alpha = alpha + mask[..., start:stop].to(alpha.dtype)
-            p_bar = teacher_probs_from_lse(alpha, teacher_lse, group_size)
+            p_bar = teacher_probs_from_lse(alpha, teacher_lse, group_size).to(acc_dtype)
             cross = cross + (p_bar * logits).sum(dim=-1)
-            tea_q = tea_q + torch.einsum("bhqk,bkd->bhqd", p_bar, k_tile.float())
+            tea_q = tea_q + torch.einsum("bhqk,bkd->bhqd", p_bar, k_tile)
 
         lse_student = run_max + torch.log(run_sum.clamp_min(EPS))
         loss_rows = lse_student - cross  # (B, h, Sq)
@@ -171,7 +186,8 @@ class _FusedIndexerCE(torch.autograd.Function):
     def backward(ctx, grad_rows):
         q_idx, k_idx, lse_student, teacher_lse, dq_unit = ctx.saved_tensors
         mask, key_tile, group_size = ctx.mask, ctx.key_tile, ctx.group_size
-        grad_rows = grad_rows.float()
+        acc_dtype = dq_unit.dtype
+        grad_rows = grad_rows.to(acc_dtype)
 
         # dQ was already accumulated in the forward pass; the row-wise loss makes the
         # gradient separable, so it only needs scaling by the upstream gradient.
@@ -179,23 +195,24 @@ class _FusedIndexerCE(torch.autograd.Function):
 
         # dK needs the final normalizers, hence a transposed pass over key tiles. Both
         # lse values are final here, so probabilities are recovered directly.
-        grad_k = torch.zeros_like(k_idx, dtype=torch.float32)
+        grad_k = torch.zeros_like(k_idx, dtype=acc_dtype)
+        q_acc = q_idx.to(acc_dtype)
         k_len = k_idx.shape[1]
         for start in range(0, k_len, key_tile):
             stop = min(start + key_tile, k_len)
-            k_tile = k_idx[:, start:stop]
-            logits = torch.einsum("bhqd,bkd->bhqk", q_idx.float(), k_tile.float())
+            k_tile = k_idx[:, start:stop].to(acc_dtype)
+            logits = torch.einsum("bhqd,bkd->bhqk", q_acc, k_tile)
             if mask is not None:
-                logits = logits + mask[..., start:stop].to(logits.dtype)
+                logits = logits + mask[..., start:stop].to(acc_dtype)
             p_hat = torch.exp(logits - lse_student.unsqueeze(-1))
 
             alpha = ctx.teacher_alpha(start, stop)
             if mask is not None:
                 alpha = alpha + mask[..., start:stop].to(alpha.dtype)
-            p_bar = teacher_probs_from_lse(alpha, teacher_lse, group_size)
+            p_bar = teacher_probs_from_lse(alpha, teacher_lse, group_size).to(acc_dtype)
 
             weighted = (p_hat - p_bar) * grad_rows.unsqueeze(-1)
-            grad_k[:, start:stop] = torch.einsum("bhqk,bhqd->bkd", weighted, q_idx.float())
+            grad_k[:, start:stop] = torch.einsum("bhqk,bhqd->bkd", weighted, q_acc)
 
         return grad_q.to(q_idx.dtype), grad_k.to(k_idx.dtype), None, None, None, None, None
 
@@ -278,10 +295,12 @@ def make_recompute_teacher(
             raise ValueError(f"H={n_heads} is not divisible by key heads={n_kv}")
         key_states = key_states.repeat_interleave(n_heads // n_kv, dim=1)
 
+    acc = accumulation_dtype(query_states, key_states)
+    q_acc = query_states.to(acc)
+    k_acc = key_states.to(acc)
+
     def teacher_alpha(start: int, stop: int) -> torch.Tensor:
-        return torch.einsum(
-            "bhqd,bhkd->bhqk", query_states.float(), key_states[:, :, start:stop].float()
-        ) * scaling
+        return torch.einsum("bhqd,bhkd->bhqk", q_acc, k_acc[:, :, start:stop]) * scaling
 
     return teacher_alpha
 
@@ -311,18 +330,17 @@ def teacher_lse_from_qk(
     if key_states.shape[1] != n_heads:
         key_states = key_states.repeat_interleave(n_heads // key_states.shape[1], dim=1)
 
+    acc = accumulation_dtype(query_states, key_states)
+    q_acc = query_states.to(acc)
+    k_acc = key_states.to(acc)
+
     run_max = torch.full(
-        (bsz, n_heads, q_len), -float("inf"), device=query_states.device, dtype=torch.float32
+        (bsz, n_heads, q_len), -float("inf"), device=query_states.device, dtype=acc
     )
     run_sum = torch.zeros_like(run_max)
     for start in range(0, k_len, key_tile):
         stop = min(start + key_tile, k_len)
-        logits = (
-            torch.einsum(
-                "bhqd,bhkd->bhqk", query_states.float(), key_states[:, :, start:stop].float()
-            )
-            * scaling
-        )
+        logits = torch.einsum("bhqd,bhkd->bhqk", q_acc, k_acc[:, :, start:stop]) * scaling
         if mask is not None:
             logits = logits + mask[..., start:stop].to(logits.dtype)
         new_max = torch.maximum(run_max, logits.amax(dim=-1))

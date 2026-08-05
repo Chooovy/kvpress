@@ -25,6 +25,11 @@ import torch
 INDEXER_LOSS_EPS = 1e-10
 
 
+def to_accum(x: torch.Tensor) -> torch.Tensor:
+    """Upcast to fp32 for accumulation, but never downcast a higher-precision input."""
+    return x.float() if x.dtype.itemsize < 4 else x
+
+
 def normalize_indexer_target(target: torch.Tensor) -> torch.Tensor:
     """L1-normalize a non-negative target along the key dimension."""
     return target / target.sum(dim=-1, keepdim=True).clamp_min(INDEXER_LOSS_EPS)
@@ -183,7 +188,7 @@ def build_dense_indexer_target(
     torch.Tensor
         (B, n_kv_heads, Sq, Sk) normalized, non-negative target.
     """
-    target = group_attention_by_kv_head(attentions.float(), n_kv_heads, head_reduce)
+    target = group_attention_by_kv_head(to_accum(attentions), n_kv_heads, head_reduce)
     target = target.masked_fill(~valid_mask.expand_as(target), 0.0)
     return normalize_indexer_target(target)
 
@@ -219,7 +224,7 @@ def build_sparse_indexer_target(
     torch.Tensor
         (B, n_kv_heads, Sq, topk) normalized target aligned with ``topk_indices``.
     """
-    grouped = group_attention_by_kv_head(attentions.float(), n_kv_heads, head_reduce)
+    grouped = group_attention_by_kv_head(to_accum(attentions), n_kv_heads, head_reduce)
     valid = topk_indices >= 0
     gathered = grouped.gather(-1, topk_indices.clamp_min(0))
     gathered = gathered.masked_fill(~valid, 0.0)

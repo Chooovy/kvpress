@@ -222,8 +222,13 @@ def test_indexer_respects_mask():
     hidden = torch.randn(1, 5, 16)
     mask = build_indexer_mask(5, 5, hidden.device)
     out = indexer(hidden, mask=mask)
-    # upper triangle must be pushed far negative
-    assert (out[0, 0].triu(1) < MASK_NEG / 2).all()
+    # Index the upper triangle explicitly: out.triu(1) would zero-fill the lower triangle
+    # and those zeros would then fail the comparison.
+    rows, cols = torch.triu_indices(5, 5, offset=1)
+    assert (out[0, 0][rows, cols] < MASK_NEG / 2).all()
+    # and the allowed (lower-triangular) entries are untouched
+    rows, cols = torch.tril_indices(5, 5)
+    assert (out[0, 0][rows, cols] > MASK_NEG / 2).all()
 
 
 def test_indexer_accepts_separate_key_hidden_states():

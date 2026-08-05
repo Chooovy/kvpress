@@ -34,6 +34,7 @@ from torch import nn
 
 from kvpress.presses.gqa_indexer.indexer import MASK_NEG
 from kvpress.presses.gqa_indexer.loss import (
+    to_accum,
     build_dense_indexer_target,
     build_sparse_indexer_target,
     indexer_loss_from_target,
@@ -173,7 +174,7 @@ def indexer_layer_loss(
         target = build_dense_indexer_target(
             attentions, valid_mask, n_kv_heads=n_kv_heads, head_reduce=config.head_reduce
         )
-        log_probs = masked_log_softmax(indexer_logits.float(), valid_mask)
+        log_probs = masked_log_softmax(to_accum(indexer_logits), valid_mask)
         return indexer_loss_from_target(
             target,
             log_probs,
@@ -199,7 +200,7 @@ def indexer_layer_loss(
     target = build_sparse_indexer_target(
         attentions, topk_indices, n_kv_heads=n_kv_heads, head_reduce=config.head_reduce
     )
-    log_probs = masked_log_softmax(topk_logits.float(), topk_valid)
+    log_probs = masked_log_softmax(to_accum(topk_logits), topk_valid)
     return indexer_loss_from_target(
         target,
         log_probs,

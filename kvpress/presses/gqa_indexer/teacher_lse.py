@@ -33,6 +33,8 @@ from contextlib import contextmanager
 import torch
 from torch import nn
 
+from kvpress.presses.gqa_indexer.indexer import MASK_NEG
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,17 +44,21 @@ def assert_lse_mask_compatible(attention_mask: torch.Tensor | None, source: str)
 
     Raises rather than warns: a mismatch produces an un-normalized teacher, which trains
     quietly and slightly wrongly instead of failing.
+
+    Additive masks are tested against ``MASK_NEG / 2`` rather than ``finfo.min / 2``.
+    :func:`~.indexer.build_indexer_mask` deliberately uses a *finite* sentinel (``-1e4``),
+    which sits far above ``finfo.min / 2`` -- so the wider threshold classified every
+    masked entry as "kept" and the guard never fired.
     """
     if attention_mask is None:
         return
     if attention_mask.dim() == 2:
         fully_attended = bool(attention_mask.all())
     else:
-        keep = (
-            attention_mask
-            if attention_mask.dtype == torch.bool
-            else attention_mask > (torch.finfo(attention_mask.dtype).min / 2)
-        )
+        if attention_mask.dtype == torch.bool:
+            keep = attention_mask
+        else:
+            keep = attention_mask > (MASK_NEG / 2)
         # A pure causal mask keeps exactly the lower triangle; anything sparser is extra.
         q_len, k_len = keep.shape[-2], keep.shape[-1]
         if q_len == k_len:

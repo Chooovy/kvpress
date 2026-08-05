@@ -221,9 +221,11 @@ class GQAIndexer(nn.Module):
         q = self.project_q(hidden_states, cos, sin)  # (B, h, Sq, D)
         k = self.project_k(key_hidden_states, key_cos, key_sin)  # (B, Sk, D)
 
-        # fp32 accumulation, as in the reference kernels. The single key head broadcasts
+        # Accumulate in at least fp32, as the reference kernels do -- but never below the
+        # input precision, so a float64 caller keeps it. The single key head broadcasts
         # across the head axis.
-        scores = torch.einsum("bhqd,bkd->bhqk", q.float(), k.float())
+        acc = torch.float32 if q.dtype.itemsize < 4 else q.dtype
+        scores = torch.einsum("bhqd,bkd->bhqk", q.to(acc), k.to(acc))
 
         if mask is not None:
             scores = scores + mask.to(scores.dtype)

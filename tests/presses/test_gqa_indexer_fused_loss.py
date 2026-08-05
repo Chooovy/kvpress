@@ -288,6 +288,57 @@ def test_teacher_probs_rejects_indivisible_group_size():
 
 
 # ----------------------------------------------------------------------
+# Dtype handling
+# ----------------------------------------------------------------------
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_output_dtype_follows_input(dtype):
+    """
+    Accumulation upcasts low precision but must never DOWNCAST float64.
+
+    An unconditional ``.float()`` silently truncated float64 inputs, which both discarded
+    precision the caller asked for and broke gradient comparisons against a float64
+    reference.
+    """
+    torch.manual_seed(0)
+    q_idx = torch.randn(1, 2, 6, 4, dtype=dtype, requires_grad=True)
+    k_idx = torch.randn(1, 6, 4, dtype=dtype, requires_grad=True)
+    q_tea = torch.randn(1, 4, 6, 5, dtype=dtype)
+    k_tea = torch.randn(1, 4, 6, 5, dtype=dtype)
+
+    mask = build_indexer_mask(6, 6, q_idx.device, dtype=dtype)
+    lse = teacher_lse_from_qk(q_tea, k_tea, 5**-0.5, mask=mask)
+    assert lse.dtype == dtype
+
+    rows = fused_indexer_ce_rows(
+        q_idx, k_idx, make_recompute_teacher(q_tea, k_tea, 5**-0.5, 2), lse,
+        group_size=2, mask=mask, key_tile=3,
+    )
+    assert rows.dtype == dtype
+    rows.sum().backward()
+    assert q_idx.grad.dtype == dtype and k_idx.grad.dtype == dtype
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_low_precision_inputs_accumulate_in_fp32(dtype):
+    torch.manual_seed(0)
+    q_idx = torch.randn(1, 2, 6, 4, dtype=dtype)
+    k_idx = torch.randn(1, 6, 4, dtype=dtype)
+    q_tea = torch.randn(1, 2, 6, 5, dtype=dtype)
+    k_tea = torch.randn(1, 2, 6, 5, dtype=dtype)
+
+    mask = build_indexer_mask(6, 6, q_idx.device, dtype=torch.float32)
+    lse = teacher_lse_from_qk(q_tea, k_tea, 5**-0.5, mask=mask)
+    assert lse.dtype == torch.float32  # upcast, not left in half precision
+
+    rows = fused_indexer_ce_rows(
+        q_idx, k_idx, make_recompute_teacher(q_tea, k_tea, 5**-0.5, 1), lse,
+        group_size=1, mask=mask, key_tile=3,
+    )
+    assert rows.dtype == torch.float32
+    assert torch.isfinite(rows).all()
+
+
+# ----------------------------------------------------------------------
 # lse / mask compatibility guard
 # ----------------------------------------------------------------------
 def test_assert_lse_mask_compatible_accepts_causal_only():

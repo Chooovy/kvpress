@@ -23,6 +23,19 @@ one over the kept keys -- the padded mass is silently missing -- which under-wei
 rows with the most padding. :func:`assert_lse_mask_compatible` refuses that combination,
 and :func:`~.fused_loss.teacher_lse_from_qk` is the fallback that folds any mask in before
 taking the logsumexp.
+
+Verified against the flash-attention source (``flash_attn/flash_attn_interface.py``):
+
+- ``flash_attn_func(..., return_attn_probs=True)`` returns
+  ``(out, softmax_lse, S_dmask)`` with ``softmax_lse`` of shape
+  ``(batch_size, nheads, seqlen)`` -- the layout :func:`normalize_captured_lse` expects
+  first.
+- ``causal=True`` aligns the mask to the **bottom-right** corner, which is what
+  :func:`~.indexer.build_indexer_mask` produces for its default
+  ``query_offset = k_len - q_len``. The two agree for both ``Sq < Sk`` and ``Sq > Sk``.
+- GQA maps query head ``i`` to KV head ``i // group_size`` ("head 0, 1, 2 of Q will
+  attention to head 0 of K, V"), matching the ``repeat_interleave`` in
+  :func:`~.fused_loss.make_recompute_teacher`.
 """
 
 from __future__ import annotations
@@ -80,9 +93,10 @@ def normalize_captured_lse(lse: torch.Tensor, bsz: int, n_heads: int, q_len: int
     """
     Coerce a flash-attention ``lse`` into ``(B, H, Sq)``.
 
-    Layout varies by version and entry point -- ``(B, H, Sq)``, ``(B, Sq, H)``, or a packed
-    ``(H, total_tokens)`` for varlen -- so it is normalized once here rather than at every
-    call site.
+    ``flash_attn_func``'s documented layout is already ``(batch_size, nheads, seqlen)``, so
+    the first branch is the fast path. The alternatives cover other entry points and
+    versions -- ``(B, Sq, H)``, or a squeezed 2D form -- rather than being guesses; anything
+    unrecognized raises with the shape it received.
     """
     if lse.dim() == 3:
         if lse.shape == (bsz, n_heads, q_len):

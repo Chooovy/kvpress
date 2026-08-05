@@ -389,6 +389,49 @@ def test_unnormalized_teacher_is_what_the_guard_prevents():
 
 
 # ----------------------------------------------------------------------
+# flash-attention contract
+# ----------------------------------------------------------------------
+def test_causal_mask_matches_flash_attn_bottom_right_alignment():
+    """
+    build_indexer_mask must use flash-attn's bottom-right causal alignment.
+
+    A captured `lse` is only consistent with the loss if both use the same causal
+    convention. Cases quoted verbatim from the flash_attn_func docstring: for
+    seqlen_q=2/seqlen_k=5 the keep mask is [[1,1,1,1,0],[1,1,1,1,1]], and for
+    seqlen_q=5/seqlen_k=2 it is [[0,0],[0,0],[0,0],[1,0],[1,1]]. Top-left alignment
+    would differ, and nothing else in the pipeline would notice.
+    """
+    device = torch.device("cpu")
+
+    wide = build_indexer_mask(2, 5, device) == 0
+    expected_wide = torch.tensor([[1, 1, 1, 1, 0], [1, 1, 1, 1, 1]], dtype=torch.bool)
+    torch.testing.assert_close(wide[0, 0], expected_wide)
+
+    tall = build_indexer_mask(5, 2, device) == 0
+    expected_tall = torch.tensor(
+        [[0, 0], [0, 0], [0, 0], [1, 0], [1, 1]], dtype=torch.bool
+    )
+    torch.testing.assert_close(tall[0, 0], expected_tall)
+
+
+def test_gqa_head_mapping_matches_flash_attn():
+    """
+    Query head i must read KV head i // group_size.
+
+    flash_attn_func: "if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will
+    attention to head 0 of K, V, and head 3, 4, 5 of Q will attention to head 1".
+    """
+    torch.manual_seed(0)
+    q_tea = torch.randn(1, 6, 4, 3, dtype=torch.float64)
+    k_kv = torch.randn(1, 2, 4, 3, dtype=torch.float64)
+    alpha = make_recompute_teacher(q_tea, k_kv, 1.0, 3)(0, 4)
+
+    for q_head, kv_head in enumerate([0, 0, 0, 1, 1, 1]):
+        expected = torch.einsum("bqd,bkd->bqk", q_tea[:, q_head], k_kv[:, kv_head])
+        torch.testing.assert_close(alpha[:, q_head], expected)
+
+
+# ----------------------------------------------------------------------
 # lse layout normalization
 # ----------------------------------------------------------------------
 @pytest.mark.parametrize(

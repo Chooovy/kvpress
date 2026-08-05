@@ -17,6 +17,7 @@ from kvpress.presses.gqa_indexer import (
     get_attention_modules,
     teacher_query_states,
 )
+from kvpress.presses.gqa_indexer.indexer import MASK_NEG
 from tests.fixtures import unit_test_model, unit_test_model_output_attention  # noqa: F401
 
 
@@ -298,3 +299,265 @@ def test_requires_the_kv_cache(unit_test_model):  # noqa: F811
     with pytest.raises(RuntimeError, match="KV cache"):
         with trainer.hooks(model):
             model(input_ids=input_ids, use_cache=False)
+
+
+# ----------------------------------------------------------------------
+# Stage 2: sparse
+# ----------------------------------------------------------------------
+def test_sparse_stage_produces_a_finite_non_negative_loss(unit_test_model):  # noqa: F811
+    """Stage 2 reports full KL, so it must be non-negative -- a check stage 1's CE cannot make."""
+    model = unit_test_model
+    trainer = make_trainer(model, stage="sparse", key_tile=8, query_tile=8, topk_tile=4, keep_ratio=0.5)
+    input_ids = torch.randint(0, 1024, (1, 24), device=model.device)
+
+    loss, per_layer = fused_indexer_training_step(model, trainer, input_ids=input_ids)
+    assert torch.isfinite(loss)
+    assert len(per_layer) == model.config.num_hidden_layers
+    assert all(v.item() >= -1e-5 for v in per_layer.values()), (
+        f"negative KL: {min(v.item() for v in per_layer.values())}"
+    )
+
+
+def test_sparse_stage_gradients_reach_only_the_indexer(unit_test_model):  # noqa: F811
+    model = unit_test_model
+    trainer = make_trainer(model, stage="sparse", key_tile=8, topk_tile=4, keep_ratio=0.5)
+    freeze_all_but_indexer(model)
+    model.zero_grad(set_to_none=True)
+
+    input_ids = torch.randint(0, 1024, (1, 24), device=model.device)
+    loss, _ = fused_indexer_training_step(model, trainer, input_ids=input_ids)
+    loss.backward()
+
+    touched = [n for n, p in model.named_parameters() if p.grad is not None]
+    assert touched, "no parameter received a gradient"
+    assert all(".indexer." in n for n in touched), [n for n in touched if ".indexer." not in n]
+    assert any(p.grad.abs().sum() > 0 for _, p in model.named_parameters() if p.grad is not None)
+
+
+@pytest.mark.parametrize("query_tile,topk_tile", [(4, 2), (8, 4), (64, 64)])
+def test_sparse_loss_is_tile_invariant_end_to_end(unit_test_model, query_tile, topk_tile):  # noqa: F811
+    model = unit_test_model
+    input_ids = torch.randint(0, 1024, (1, 20), device=model.device)
+
+    reference = make_trainer(
+        model, stage="sparse", key_tile=1024, query_tile=1024, topk_tile=1024, keep_ratio=0.5
+    )
+    ref_loss, _ = fused_indexer_training_step(model, reference, input_ids=input_ids)
+
+    trainer = FusedIndexerTrainer(
+        press=reference.press,
+        stage="sparse",
+        key_tile=1024,
+        query_tile=query_tile,
+        topk_tile=topk_tile,
+        keep_ratio=0.5,
+    )
+    loss, _ = fused_indexer_training_step(model, trainer, input_ids=input_ids)
+    torch.testing.assert_close(loss, ref_loss, rtol=1e-4, atol=1e-5)
+
+
+def test_sparse_stage_with_full_keep_ratio_matches_the_dense_kl(unit_test_model):  # noqa: F811
+    """
+    keep_ratio=1.0 makes the support the whole key axis, so stage 2 must equal stage 1's KL.
+
+    Stage 1 optimizes cross-entropy, which sits above the KL by H(pbar), so the two losses
+    differ by a positive offset rather than matching -- checked as an inequality plus
+    finiteness, since the entropy itself is not recoverable from the fused path.
+    """
+    model = unit_test_model
+    input_ids = torch.randint(0, 1024, (1, 16), device=model.device)
+
+    sparse = make_trainer(model, stage="sparse", key_tile=8, topk_tile=8, keep_ratio=1.0)
+    sparse_loss, _ = fused_indexer_training_step(model, sparse, input_ids=input_ids)
+
+    dense = FusedIndexerTrainer(press=sparse.press, stage="dense", key_tile=8)
+    dense_loss, _ = fused_indexer_training_step(model, dense, input_ids=input_ids)
+
+    assert torch.isfinite(sparse_loss) and sparse_loss.item() >= -1e-5
+    assert dense_loss.item() > sparse_loss.item(), (
+        "stage 1's cross-entropy must exceed stage 2's KL by the teacher entropy"
+    )
+
+
+def test_sparse_stage_reports_recall(unit_test_model):  # noqa: F811
+    """
+    Recall says whether topk is large enough; the loss alone never reveals that.
+
+    A tiny support can show a healthy-looking KL while ignoring most of the teacher's mass,
+    so this number is the one that has to be watched during stage 2.
+    """
+    model = unit_test_model
+    input_ids = torch.randint(0, 1024, (1, 24), device=model.device)
+
+    narrow = make_trainer(model, stage="sparse", key_tile=8, topk_tile=4, topk=2)
+    fused_indexer_training_step(model, narrow, input_ids=input_ids)
+    wide = FusedIndexerTrainer(
+        press=narrow.press, stage="sparse", key_tile=8, topk_tile=8, keep_ratio=1.0
+    )
+    fused_indexer_training_step(model, wide, input_ids=input_ids)
+
+    assert narrow.mean_recall() is not None
+    assert 0.0 < narrow.mean_recall() <= 1.0 + 1e-6
+    assert wide.mean_recall() == pytest.approx(1.0, abs=1e-4), (
+        "a full support must capture all of the teacher's mass"
+    )
+    assert narrow.mean_recall() < wide.mean_recall()
+
+
+def test_dense_stage_reports_no_recall(unit_test_model):  # noqa: F811
+    model = unit_test_model
+    trainer = make_trainer(model, key_tile=8)
+    fused_indexer_training_step(model, trainer, input_ids=torch.randint(0, 1024, (1, 16), device=model.device))
+    assert trainer.mean_recall() is None
+
+
+def test_support_teacher_mode_needs_no_dense_lse(unit_test_model):  # noqa: F811
+    """
+    teacher_mode='support' normalizes over the support, making stage 2 O(L * topk) end to end.
+
+    It is a different objective from 'global', not another way to compute it, so the two
+    losses must differ.
+    """
+    model = unit_test_model
+    input_ids = torch.randint(0, 1024, (1, 20), device=model.device)
+
+    glob = make_trainer(model, stage="sparse", key_tile=8, topk_tile=4, keep_ratio=0.4)
+    global_loss, _ = fused_indexer_training_step(model, glob, input_ids=input_ids)
+
+    sup = FusedIndexerTrainer(
+        press=glob.press,
+        stage="sparse",
+        key_tile=8,
+        topk_tile=4,
+        keep_ratio=0.4,
+        teacher_mode="support",
+    )
+    support_loss, _ = fused_indexer_training_step(model, sup, input_ids=input_ids)
+
+    assert torch.isfinite(support_loss) and support_loss.item() >= -1e-5
+    assert not torch.allclose(global_loss, support_loss)
+    assert sup.mean_recall() == pytest.approx(1.0, abs=1e-5), "support mode normalizes to Z=1"
+
+
+def test_sparse_force_local_changes_the_support(unit_test_model):  # noqa: F811
+    model = unit_test_model
+    input_ids = torch.randint(0, 1024, (1, 20), device=model.device)
+
+    plain = make_trainer(model, stage="sparse", key_tile=8, topk_tile=4, topk=6)
+    plain_loss, _ = fused_indexer_training_step(model, plain, input_ids=input_ids)
+
+    forced = FusedIndexerTrainer(
+        press=plain.press, stage="sparse", key_tile=8, topk_tile=4, topk=6,
+        force_sink=1, force_local=2,
+    )
+    forced_loss, _ = fused_indexer_training_step(model, forced, input_ids=input_ids)
+
+    assert torch.isfinite(forced_loss)
+    assert not torch.allclose(plain_loss, forced_loss)
+
+
+def test_sparse_stage_handles_padding(unit_test_model):  # noqa: F811
+    model = unit_test_model
+    input_ids = torch.randint(0, 1024, (2, 16), device=model.device)
+    attention_mask = torch.ones(2, 16, dtype=torch.long, device=model.device)
+    attention_mask[1, :5] = 0
+
+    trainer = make_trainer(model, stage="sparse", key_tile=4, topk_tile=4, keep_ratio=0.5)
+    loss, per_layer = fused_indexer_training_step(
+        model, trainer, input_ids=input_ids, attention_mask=attention_mask
+    )
+    assert torch.isfinite(loss)
+    assert all(torch.isfinite(v) for v in per_layer.values())
+
+
+def test_sparse_never_selects_a_padded_key(unit_test_model):  # noqa: F811
+    """
+    A padded key in the support would put teacher mass on a token that does not exist.
+
+    Verified by intercepting the support the trainer actually built -- the loss would stay
+    finite either way, so it cannot be inferred from the loss value. The interception wraps
+    ``streaming_topk_support`` in the trainer's own module, so it observes the real call
+    rather than re-deriving one that could drift out of sync.
+    """
+    import kvpress.presses.gqa_indexer.fused_trainer as trainer_mod
+
+    model = unit_test_model
+    q_len = 16
+    input_ids = torch.randint(0, 1024, (2, q_len), device=model.device)
+    attention_mask = torch.ones(2, q_len, dtype=torch.long, device=model.device)
+    attention_mask[1, :6] = 0
+
+    seen = []
+    original = trainer_mod.streaming_topk_support
+
+    def spy(*args, **kwargs):
+        support, valid = original(*args, **kwargs)
+        seen.append((support, valid, kwargs.get("mask")))
+        return support, valid
+
+    trainer = make_trainer(
+        model, stage="sparse", key_tile=4, query_tile=8, topk_tile=4, keep_ratio=0.5
+    )
+    trainer_mod.streaming_topk_support = spy
+    try:
+        fused_indexer_training_step(
+            model, trainer, input_ids=input_ids, attention_mask=attention_mask
+        )
+    finally:
+        trainer_mod.streaming_topk_support = original
+
+    assert len(seen) == model.config.num_hidden_layers, "the support was not built per layer"
+    for support, valid, mask in seen:
+        assert mask is not None, "the trainer must pass its mask into the selection"
+        keep = mask > (MASK_NEG / 2)
+        keep = keep.expand(support.shape[0], support.shape[1], *keep.shape[-2:])
+        picked_allowed = keep.gather(-1, support.clamp_min(0))
+        assert (picked_allowed | ~valid).all(), "a masked/padded key entered the support"
+        # the padded row must also end up with fewer usable slots than the clean one
+        assert valid[1].sum() < valid[0].sum()
+
+
+def test_unknown_stage_raises(unit_test_model):  # noqa: F811
+    press = GQAIndexerPress(compression_ratio=0.5)
+    press.post_init_from_model(unit_test_model)
+    with pytest.raises(ValueError, match="stage must be"):
+        FusedIndexerTrainer(press=press, stage="mixture")
+
+
+def test_invalid_keep_ratio_raises(unit_test_model):  # noqa: F811
+    press = GQAIndexerPress(compression_ratio=0.5)
+    press.post_init_from_model(unit_test_model)
+    with pytest.raises(ValueError, match="keep_ratio"):
+        FusedIndexerTrainer(press=press, keep_ratio=0.0)
+    with pytest.raises(ValueError, match="keep_ratio"):
+        FusedIndexerTrainer(press=press, keep_ratio=1.5)
+
+
+def test_reset_clears_recall(unit_test_model):  # noqa: F811
+    model = unit_test_model
+    trainer = make_trainer(model, stage="sparse", key_tile=8, topk_tile=4, keep_ratio=0.5)
+    fused_indexer_training_step(model, trainer, input_ids=torch.randint(0, 1024, (1, 16), device=model.device))
+    assert trainer.per_layer_recall
+    trainer.reset()
+    assert not trainer.per_layer_recall
+    assert trainer.mean_recall() is None
+
+
+def test_invalid_teacher_mode_raises_at_construction(unit_test_model):  # noqa: F811
+    """
+    A typo must fail immediately, not once the run reaches stage 2.
+
+    Validating only where the mode is consumed would let a dense warmup run to completion
+    with a bad config, then crash hours later at the stage switch.
+    """
+    press = GQAIndexerPress(compression_ratio=0.5)
+    press.post_init_from_model(unit_test_model)
+    with pytest.raises(ValueError, match="teacher_mode"):
+        FusedIndexerTrainer(press=press, teacher_mode="mixture")
+
+
+def test_negative_forced_slots_raise(unit_test_model):  # noqa: F811
+    press = GQAIndexerPress(compression_ratio=0.5)
+    press.post_init_from_model(unit_test_model)
+    with pytest.raises(ValueError, match="non-negative"):
+        FusedIndexerTrainer(press=press, force_local=-1)

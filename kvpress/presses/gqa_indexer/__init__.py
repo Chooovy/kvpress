@@ -40,6 +40,14 @@ from kvpress.presses.gqa_indexer.fused_loss import (
     teacher_lse_from_qk,
     teacher_probs_from_lse,
 )
+from kvpress.presses.gqa_indexer.fused_sparse_loss import (
+    expand_to_heads,
+    fused_sparse_indexer_kl_rows,
+    fused_sparse_indexer_loss,
+    make_sparse_recompute_teacher,
+    sparse_teacher_probs,
+    support_teacher_lse,
+)
 from kvpress.presses.gqa_indexer.fused_trainer import (
     FusedIndexerTrainer,
     attention_scaling,
@@ -62,6 +70,15 @@ from kvpress.presses.gqa_indexer.loss import (
     normalize_indexer_target,
 )
 from kvpress.presses.gqa_indexer.press import GQAIndexerPress
+from kvpress.presses.gqa_indexer.sparse_support import (
+    causal_keep,
+    excluded_key_mask,
+    forced_support_positions,
+    gather_support_keys,
+    resolve_topk,
+    sort_support,
+    streaming_topk_support,
+)
 from kvpress.presses.gqa_indexer.teacher_lse import (
     assert_lse_mask_compatible,
     capture_teacher_lse,
@@ -113,4 +130,18 @@ __all__ = [
     "assert_lse_mask_compatible",
     "capture_teacher_lse",
     "normalize_captured_lse",
+    # Stage 2: sparse support selection + KL on the support
+    "resolve_topk",
+    "forced_support_positions",
+    "excluded_key_mask",
+    "causal_keep",
+    "sort_support",
+    "streaming_topk_support",
+    "gather_support_keys",
+    "expand_to_heads",
+    "support_teacher_lse",
+    "sparse_teacher_probs",
+    "make_sparse_recompute_teacher",
+    "fused_sparse_indexer_kl_rows",
+    "fused_sparse_indexer_loss",
 ]

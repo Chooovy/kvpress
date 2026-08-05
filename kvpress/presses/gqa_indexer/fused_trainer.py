@@ -39,8 +39,14 @@ from kvpress.presses.gqa_indexer.fused_loss import (
     make_recompute_teacher,
     teacher_lse_from_qk,
 )
+from kvpress.presses.gqa_indexer.fused_sparse_loss import (
+    TEACHER_MODES,
+    fused_sparse_indexer_loss,
+    make_sparse_recompute_teacher,
+)
 from kvpress.presses.gqa_indexer.indexer import MASK_NEG, build_indexer_mask
 from kvpress.presses.gqa_indexer.press import GQAIndexerPress, get_language_model
+from kvpress.presses.gqa_indexer.sparse_support import resolve_topk, streaming_topk_support
 from kvpress.utils import extract_keys_and_values, get_prerope_query_states
 
 logger = logging.getLogger(__name__)
@@ -86,9 +92,18 @@ class FusedIndexerTrainer:
     ----------
     press : GQAIndexerPress
         Supplies the per-layer indexers and the RoPE narrowing.
+    stage : str
+        ``dense`` (stage 1) streams the full key axis; ``sparse`` (stage 2) restricts the
+        objective to each row's own top-k support, turning the teacher recompute from
+        ``H * L^2 * d`` into ``H * L * topk * d`` -- 64x at ``L=32K, topk=512``. Run dense
+        first: stage 2's support is only meaningful once the indexer roughly knows where to
+        look, and MiniMax MSA reports the same warmup ordering.
     key_tile, query_tile : int
         Tile sizes for the fused loss. Peak tile memory is ``O(query_tile * key_tile)``, so
         both must be bounded for the footprint to stay flat in sequence length.
+    topk_tile : int
+        Support-axis tile width in stage 2. Stage 2's scratch carries a gathered-key tensor
+        of ``O(query_tile * topk_tile * D)``, so it wants smaller tiles than stage 1.
     loss_coeff : float
         Scalar multiplier on each layer's loss.
     skip_sink_in_loss : int
@@ -99,20 +114,59 @@ class FusedIndexerTrainer:
         letting KL gradients reach the backbone lets it lower the loss by *simplifying its
         own attention* instead of improving the indexer, which shows up as gradient-norm
         spikes and short-context regression.
+    topk : int, optional
+        Stage-2 support size. ``None`` derives it from ``keep_ratio``.
+    keep_ratio : float
+        Used when ``topk`` is None: ``topk = max(1, int(k_len * keep_ratio))``. Set this to
+        ``1 - compression_ratio`` so stage 2 trains at the eviction budget used at eval.
+    teacher_mode : str
+        ``global`` or ``support``; see
+        :mod:`kvpress.presses.gqa_indexer.fused_sparse_loss`. These are different
+        objectives, not two ways to compute one. ``global`` keeps the teacher fixed across
+        steps (so the loss curve means the same thing throughout) at the cost of a dense
+        ``teacher_lse``; ``support`` drops that cost and makes stage 2 ``O(L * topk)`` end to
+        end.
+    force_sink, force_local : int
+        Stage-2 slots reserved per query row for the leading keys and the row's own most
+        recent keys, mirroring MSA's always-selected local block. Distinct from the press's
+        ``n_sink``/``n_local``, which protect keys globally after the query axis is reduced.
     """
 
     press: GQAIndexerPress
+    stage: str = "dense"
     key_tile: int = 512
     query_tile: int = 512
+    topk_tile: int = 512
     loss_coeff: float = 1.0
     skip_sink_in_loss: int = 0
     detach_teacher: bool = True
 
+    # Stage 2 only
+    topk: int | None = None
+    keep_ratio: float = 0.25
+    teacher_mode: str = "global"
+    force_sink: int = 0
+    force_local: int = 0
+
     per_layer_losses: dict[int, torch.Tensor] = field(default_factory=dict)
+    per_layer_recall: dict[int, float] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.stage not in ("dense", "sparse"):
+            raise ValueError(f"stage must be 'dense' or 'sparse', got {self.stage!r}")
+        if not 0 < self.keep_ratio <= 1:
+            raise ValueError(f"keep_ratio must be in (0, 1], got {self.keep_ratio}")
+        # Checked here rather than only where it is used, so a typo surfaces at construction
+        # instead of silently riding along until the run switches to stage 2.
+        if self.teacher_mode not in TEACHER_MODES:
+            raise ValueError(f"teacher_mode must be one of {TEACHER_MODES}, got {self.teacher_mode!r}")
+        if self.force_sink < 0 or self.force_local < 0:
+            raise ValueError("force_sink and force_local must be non-negative")
 
     def reset(self) -> None:
         """Drop the losses from the previous forward pass."""
         self.per_layer_losses = {}
+        self.per_layer_recall = {}
 
     def total_loss(self) -> torch.Tensor:
         """Mean loss over the layers that fired. Raises if none did."""
@@ -121,6 +175,18 @@ class FusedIndexerTrainer:
                 "no layer losses were recorded; register hooks() and run a forward pass first"
             )
         return torch.stack([self.per_layer_losses[k] for k in sorted(self.per_layer_losses)]).mean()
+
+    def mean_recall(self) -> float | None:
+        """
+        Mean teacher mass the stage-2 support captured, or ``None`` outside stage 2.
+
+        Worth watching: a low value means ``topk`` is too small for how spread out the
+        teacher actually is, and the loss alone will not say so -- it can look healthy while
+        the objective ignores most of the teacher's mass.
+        """
+        if not self.per_layer_recall:
+            return None
+        return sum(self.per_layer_recall.values()) / len(self.per_layer_recall)
 
     def layer_loss(self, module: nn.Module, kwargs: dict, keys: torch.Tensor) -> torch.Tensor:
         """Tiled loss for one layer, given its cached (post-RoPE) keys."""
@@ -149,15 +215,32 @@ class FusedIndexerTrainer:
         )
         mask = self.apply_sink_skip(mask)
         row_valid = self.row_validity(mask, kwargs)
+        cos, sin = self.press.get_rope_tables(indexer, kwargs)
 
         with torch.no_grad():
             query_states = teacher_query_states(module, hidden_states, position_embeddings)
             key_states = keys
             if self.detach_teacher:
                 query_states, key_states = query_states.detach(), key_states.detach()
-
             group_size = query_states.shape[1] // key_states.shape[1]
             scaling = attention_scaling(module)
+
+        if self.stage == "sparse":
+            return self.sparse_layer_loss(
+                indexer,
+                hidden_states,
+                query_states,
+                key_states,
+                scaling,
+                group_size,
+                mask=mask,
+                row_valid=row_valid,
+                cos=cos,
+                sin=sin,
+                layer_idx=int(module.layer_idx),
+            )
+
+        with torch.no_grad():
             lse = teacher_lse_from_qk(
                 query_states,
                 key_states,
@@ -168,7 +251,6 @@ class FusedIndexerTrainer:
             )
 
         teacher_alpha = make_recompute_teacher(query_states, key_states, scaling, group_size)
-        cos, sin = self.press.get_rope_tables(indexer, kwargs)
 
         return fused_indexer_loss(
             indexer,
@@ -184,6 +266,92 @@ class FusedIndexerTrainer:
             query_tile=self.query_tile,
             loss_coeff=self.loss_coeff,
         )
+
+    def sparse_layer_loss(
+        self,
+        indexer,
+        hidden_states: torch.Tensor,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        scaling: float,
+        group_size: int,
+        *,
+        mask: torch.Tensor,
+        row_valid: torch.Tensor,
+        cos,
+        sin,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        """
+        Stage 2: pick each row's top-k support, then run the KL only there.
+
+        Pass 1 is ``no_grad`` and emits int64 indices, so it contributes no autograd state.
+        Pass 2 re-projects q/k *with* gradients -- the projections are recomputed rather than
+        reused from pass 1 precisely so pass 1 can stay under ``no_grad``. That costs one
+        extra ``hidden -> q/k`` GEMM, which is negligible against the ``L * topk`` term it
+        buys.
+        """
+        k_len = key_states.shape[2]
+        topk = resolve_topk(k_len, self.topk, self.keep_ratio)
+
+        with torch.no_grad():
+            support, valid = streaming_topk_support(
+                indexer.project_q(hidden_states, cos, sin).detach(),
+                indexer.project_k(hidden_states, cos, sin).detach(),
+                topk,
+                mask=mask,
+                force_sink=self.force_sink,
+                force_local=self.force_local,
+                key_tile=self.key_tile,
+                query_tile=self.query_tile,
+            )
+
+            teacher_lse = None
+            if self.teacher_mode == "global":
+                teacher_lse = teacher_lse_from_qk(
+                    query_states,
+                    key_states,
+                    scaling,
+                    mask=mask,
+                    key_tile=self.key_tile,
+                    query_tile=self.query_tile,
+                )
+
+        teacher_alpha = make_sparse_recompute_teacher(
+            query_states,
+            key_states,
+            scaling,
+            group_size,
+            teacher_lse=teacher_lse,
+            teacher_mode=self.teacher_mode,
+            support=support,
+            valid=valid,
+            topk_tile=self.topk_tile,
+        )
+
+        stats: dict = {}
+        loss = fused_sparse_indexer_loss(
+            indexer,
+            hidden_states,
+            support,
+            valid,
+            teacher_alpha,
+            group_size=group_size,
+            cos=cos,
+            sin=sin,
+            row_valid=row_valid & valid.any(dim=-1),
+            query_tile=self.query_tile,
+            topk_tile=self.topk_tile,
+            loss_coeff=self.loss_coeff,
+            stats=stats,
+        )
+        if "recall" in stats:
+            rows = row_valid & valid.any(dim=-1)
+            weight = rows.to(stats["recall"].dtype).expand_as(stats["recall"])
+            self.per_layer_recall[layer_idx] = float(
+                (stats["recall"] * weight).sum() / weight.sum().clamp_min(1.0)
+            )
+        return loss
 
     def apply_sink_skip(self, mask: torch.Tensor) -> torch.Tensor:
         """

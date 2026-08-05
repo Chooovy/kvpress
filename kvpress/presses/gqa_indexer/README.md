@@ -152,11 +152,71 @@ reads `1.0` at masked slots. Always pass the same `valid_mask` when consuming it
 
 ## Status
 
-Written for clarity, not throughput: the full `(B, h, Sq, Sk)` logits and dense attention
-target are materialized, which is fine for warmup-scale sequences but needs a
-fused/chunked kernel for long context. The seams for that are `indexer_layer_loss` and the
-target builders.
+Two loss implementations, same objective up to a constant:
+
+| | `train.indexer_layer_loss` | `fused_loss.fused_indexer_loss` |
+|---|---|---|
+| objective | full KL | cross-entropy (`KL + H(pbar)`) |
+| gradients | identical | identical |
+| memory | `O(L²)` | **`O(L·h)`** |
+| teacher | `output_attentions=True` (forces eager) | logits recomputed per tile from Q/K + `lse` |
+| passes | autograd | 1 fwd (loss + `dQ`), 1 transposed (`dK`) |
+
+Use the dense one as the readable reference and for exact-KL numbers; use the fused one for
+anything long. Both are exercised against each other in
+`tests/presses/test_gqa_indexer_fused_loss.py`.
 
 Prefill-time compression only — `score` raises if the cache is longer than the scored
 hidden states. `GQAIndexer.forward` already accepts separate `key_hidden_states` for a
 decode-time path; caching indexer keys across steps is not wired up yet.
+
+### Tiled loss
+
+The fused path exists because the dense one caps out around a few thousand tokens: at
+L=32K a single layer's `(B, h, Sq, Sk)` fp32 logits are 32 GiB. Streaming key tiles brings
+persistent state down to `3·H·L + 2·h·L` floats — 14 MiB at L=32K, 56 MiB at L=128K.
+
+Three things make one pass possible, and all three are consequences of the simplified
+indexer:
+
+1. `I[j,t,s]` depends only on that `(t,s)` pair (no activation, no cross-head reduction), so
+   `Σ_s pbar·I` is **linear** in the teacher probabilities and accumulates exactly like
+   FlashAttention's `Σ_s p·V`.
+2. `p_bar = exp(alpha − lse)` is exact, so the teacher needs no running state at all — just
+   its `lse`, which flash-attention already computes.
+3. `dloss/dI = phat − pbar` depends only on its own row, so the forward pass accumulates a
+   unit-weight `dQ` and backward just scales it.
+
+`dK` still needs a second, transposed pass: `dK[s] = Σ_j Σ_t (phat−pbar)·q[j,t]` sums over
+*queries* while the forward streams *keys*, and its student half carries `1/ell[j,t]`, final
+only after every tile. One key tile's contribution mixes many per-query normalizers, so no
+scalar can fix it up afterwards. This is a layout constraint, not an activation artifact —
+StreamKL splits the same way.
+
+**The `lse`/mask contract is the sharp edge.** `teacher_lse` must be computed under the same
+mask the loss applies. Masking `p_bar` after the fact does *not* work: the rows stop summing
+to one (the masked mass is simply gone), which quietly down-weights exactly the rows with
+the most padding. flash-attention's `lse` covers causal masking only, so
+`assert_lse_mask_compatible` **raises** when the batch also has padding, and
+`teacher_lse_from_qk` is the fallback that folds any mask in before the logsumexp.
+
+```python
+from kvpress.presses.gqa_indexer import (
+    capture_teacher_lse, fused_indexer_loss, make_recompute_teacher,
+)
+
+# Free teacher lse from the frozen model's own flash-attention forward.
+with capture_teacher_lse(model) as lse_by_layer:
+    model(input_ids, use_cache=False)
+
+loss = fused_indexer_loss(
+    press.get_indexer(module), hidden_states,
+    make_recompute_teacher(query_states, key_states, module.scaling, group_size),
+    lse_by_layer[module.layer_idx],
+    group_size=group_size, mask=mask, key_tile=512,
+)
+```
+
+`key_tile` trades peak memory against launch overhead; the result is bit-comparable across
+values (tested at 1, 2, 3, 5, 9, 64, 128).
+

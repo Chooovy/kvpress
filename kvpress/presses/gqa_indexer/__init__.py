@@ -32,6 +32,13 @@ from kvpress.presses.gqa_indexer.aggregate import (
     expand_chunk_indices,
     reduce_queries,
 )
+from kvpress.presses.gqa_indexer.fused_loss import (
+    fused_indexer_ce_rows,
+    fused_indexer_loss,
+    make_recompute_teacher,
+    teacher_lse_from_qk,
+    teacher_probs_from_lse,
+)
 from kvpress.presses.gqa_indexer.indexer import (
     GQAIndexer,
     GQAIndexerConfig,
@@ -48,6 +55,11 @@ from kvpress.presses.gqa_indexer.loss import (
     normalize_indexer_target,
 )
 from kvpress.presses.gqa_indexer.press import GQAIndexerPress
+from kvpress.presses.gqa_indexer.teacher_lse import (
+    assert_lse_mask_compatible,
+    capture_teacher_lse,
+    normalize_captured_lse,
+)
 from kvpress.presses.gqa_indexer.train import (
     IndexerTrainConfig,
     compute_indexer_loss,
@@ -81,4 +93,12 @@ __all__ = [
     "indexer_layer_loss",
     "indexer_state_dict",
     "load_indexer_state_dict",
+    "fused_indexer_ce_rows",
+    "fused_indexer_loss",
+    "make_recompute_teacher",
+    "teacher_lse_from_qk",
+    "teacher_probs_from_lse",
+    "assert_lse_mask_compatible",
+    "capture_teacher_lse",
+    "normalize_captured_lse",
 ]

@@ -173,19 +173,30 @@ def capture_teacher_lse(model: nn.Module):
         # contract of returning (attn_output, attn_weights) with attn_output as (B, Sq, H, D).
         return out, None
 
-    previous_impl = model.config._attn_implementation
+    # Configs that carry their own copy of the flag; multimodal models nest one.
+    configs = [model.config]
+    text_config = getattr(model.config, "text_config", None)
+    if text_config is not None:
+        configs.append(text_config)
+    previous_impls = [cfg._attn_implementation for cfg in configs]
+
+    # register() writes to the CLASS-level _global_mapping, while __delitem__ (and hence
+    # MutableMapping.pop) only touches the instance's _local_mapping. So pop() raises
+    # KeyError internally and leaves the entry behind forever -- the cleanup has to go
+    # through _global_mapping directly, restoring any pre-existing entry.
+    global_mapping = type(ALL_ATTENTION_FUNCTIONS)._global_mapping
+    had_previous = impl_name in global_mapping
+    previous_fn = global_mapping.get(impl_name)
+
     ALL_ATTENTION_FUNCTIONS.register(impl_name, capture_attention)
     try:
-        model.config._attn_implementation = impl_name
-        # Sub-configs carry their own copy on multimodal models.
-        text_config = getattr(model.config, "text_config", None)
-        previous_text_impl = None
-        if text_config is not None:
-            previous_text_impl = text_config._attn_implementation
-            text_config._attn_implementation = impl_name
+        for cfg in configs:
+            cfg._attn_implementation = impl_name
         yield captured
     finally:
-        model.config._attn_implementation = previous_impl
-        if text_config is not None and previous_text_impl is not None:
-            text_config._attn_implementation = previous_text_impl
-        ALL_ATTENTION_FUNCTIONS.pop(impl_name, None)
+        for cfg, previous in zip(configs, previous_impls):
+            cfg._attn_implementation = previous
+        if had_previous:
+            global_mapping[impl_name] = previous_fn
+        else:
+            global_mapping.pop(impl_name, None)

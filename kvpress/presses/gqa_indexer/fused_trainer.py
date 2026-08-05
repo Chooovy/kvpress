@@ -86,8 +86,9 @@ class FusedIndexerTrainer:
     ----------
     press : GQAIndexerPress
         Supplies the per-layer indexers and the RoPE narrowing.
-    key_tile : int
-        Keys per tile in the fused loss.
+    key_tile, query_tile : int
+        Tile sizes for the fused loss. Peak tile memory is ``O(query_tile * key_tile)``, so
+        both must be bounded for the footprint to stay flat in sequence length.
     loss_coeff : float
         Scalar multiplier on each layer's loss.
     skip_sink_in_loss : int
@@ -102,6 +103,7 @@ class FusedIndexerTrainer:
 
     press: GQAIndexerPress
     key_tile: int = 512
+    query_tile: int = 512
     loss_coeff: float = 1.0
     skip_sink_in_loss: int = 0
     detach_teacher: bool = True
@@ -157,7 +159,12 @@ class FusedIndexerTrainer:
             group_size = query_states.shape[1] // key_states.shape[1]
             scaling = attention_scaling(module)
             lse = teacher_lse_from_qk(
-                query_states, key_states, scaling, mask=mask, key_tile=self.key_tile
+                query_states,
+                key_states,
+                scaling,
+                mask=mask,
+                key_tile=self.key_tile,
+                query_tile=self.query_tile,
             )
 
         teacher_alpha = make_recompute_teacher(query_states, key_states, scaling, group_size)
@@ -174,6 +181,7 @@ class FusedIndexerTrainer:
             mask=mask,
             row_valid=row_valid,
             key_tile=self.key_tile,
+            query_tile=self.query_tile,
             loss_coeff=self.loss_coeff,
         )
 

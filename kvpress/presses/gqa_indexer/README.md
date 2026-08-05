@@ -228,6 +228,42 @@ the hook fires, and queries are rebuilt from `hidden_states` with the layer's ow
 and the same `position_embeddings` it just used. So `use_cache=True` is required, and
 `output_attentions` is deliberately never set — the base model keeps its fast kernel.
 
-`key_tile` trades peak memory against launch overhead; the result is bit-comparable across
-values (tested at 1, 2, 3, 5, 9, 64, 128).
+`key_tile` and `query_tile` trade peak memory against launch overhead; the result is
+bit-comparable across every combination (tested at 1–128 on both axes).
+
+**Both axes must be tiled.** With key tiling alone each tile is `(B, H, Sq, key_tile)`,
+which grows with sequence length — 14 GiB at L=128K. That is the same `O(L·tile)` trap
+FlashKL's own reference implementation falls into. Tiling queries too makes the per-tile
+footprint `O(query_tile · key_tile)`:
+
+| L | key-only | both axes |
+|---|---|---|
+| 4K | 0.44 GiB | **0.055 GiB** |
+| 32K | 3.5 GiB | **0.055 GiB** |
+| 128K | 14 GiB | **0.055 GiB** |
+
+Query tiles are independent for the loss and `dQ` (each query row owns its own running
+max/sumexp/accumulator), so that loop is parallelizable. `dK` is the exception — it sums
+over queries, so every query tile accumulates into it.
+
+### Free teacher lse
+
+`teacher_lse_from_qk` recomputes the teacher's logsumexp, costing a second `H·L²·d` pass.
+`capture_teacher_lse` avoids that by taking the value flash-attention already computes:
+
+```python
+from kvpress.presses.gqa_indexer import capture_teacher_lse
+
+with capture_teacher_lse(model) as lse_by_layer:
+    model(input_ids, use_cache=True)
+```
+
+Verified against the flash-attention source: `softmax_lse` is `(batch, nheads, seqlen)`,
+`causal=True` aligns bottom-right (matching `build_indexer_mask`'s default
+`query_offset = k_len - q_len`), and query head `i` reads KV head `i // group_size`.
+
+Only valid for causal-only masking — flash-attention's `lse` does not know about padding,
+and `exp(alpha - lse)` would then not sum to one over the kept keys.
+`assert_lse_mask_compatible` raises on that combination rather than letting it train
+slightly wrong.
 

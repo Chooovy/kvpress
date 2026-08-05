@@ -41,7 +41,7 @@ def make_case(bsz=2, h=3, group_size=2, q_len=9, k_len=9, dim=4, d_tea=5, seed=0
 def dense_reference(q_idx, k_idx, teacher_alpha, lse, mask, group_size, k_len):
     """Materialize everything and compute the same objective the naive way."""
     logits = torch.einsum("bhqd,bkd->bhqk", q_idx, k_idx)
-    alpha = teacher_alpha(0, k_len)
+    alpha = teacher_alpha(0, q_idx.shape[2], 0, k_len)
     if mask is not None:
         logits = logits + mask
         alpha = alpha + mask
@@ -56,14 +56,14 @@ def dense_reference(q_idx, k_idx, teacher_alpha, lse, mask, group_size, k_len):
 def test_teacher_probs_from_lse_are_normalized():
     """exp(alpha - lse) must sum to 1 once the mask is folded in before the lse."""
     q_idx, k_idx, teacher_alpha, lse, mask, group_size, _ = make_case()
-    alpha = teacher_alpha(0, k_idx.shape[1]) + mask
+    alpha = teacher_alpha(0, q_idx.shape[2], 0, k_idx.shape[1]) + mask
     p_bar = teacher_probs_from_lse(alpha, lse, group_size)
     torch.testing.assert_close(p_bar.sum(-1), torch.ones_like(p_bar.sum(-1)))
 
 
 def test_teacher_probs_match_explicit_softmax():
     q_idx, k_idx, teacher_alpha, lse, mask, group_size, n_heads = make_case()
-    alpha = teacher_alpha(0, k_idx.shape[1]) + mask
+    alpha = teacher_alpha(0, q_idx.shape[2], 0, k_idx.shape[1]) + mask
     expected = torch.softmax(alpha, dim=-1)
     expected = expected.view(
         alpha.shape[0], n_heads // group_size, group_size, alpha.shape[2], alpha.shape[3]
@@ -96,7 +96,7 @@ def test_recompute_teacher_expands_kv_heads():
     torch.manual_seed(0)
     q_tea = torch.randn(1, 8, 5, 4, dtype=torch.float64)
     k_kv = torch.randn(1, 2, 5, 4, dtype=torch.float64)
-    alpha = make_recompute_teacher(q_tea, k_kv, 1.0, 4)(0, 5)
+    alpha = make_recompute_teacher(q_tea, k_kv, 1.0, 4)(0, 5, 0, 5)
     assert alpha.shape == (1, 8, 5, 5)
     # heads 0..3 share KV head 0
     expected0 = torch.einsum("bqd,bkd->bqk", q_tea[:, 0], k_kv[:, 0])
@@ -402,7 +402,7 @@ def test_unnormalized_teacher_is_what_the_guard_prevents():
     mask = build_indexer_mask(6, 6, q_tea.device, dtype=torch.float64)
 
     good = teacher_probs_from_lse(
-        make_recompute_teacher(q_tea, k_tea, scaling, 1)(0, 6) + mask,
+        make_recompute_teacher(q_tea, k_tea, scaling, 1)(0, 6, 0, 6) + mask,
         teacher_lse_from_qk(q_tea, k_tea, scaling, mask=mask),
         1,
     )
@@ -410,7 +410,7 @@ def test_unnormalized_teacher_is_what_the_guard_prevents():
 
     # lse WITHOUT the mask, probabilities zeroed afterwards -> rows no longer sum to 1
     bad = teacher_probs_from_lse(
-        make_recompute_teacher(q_tea, k_tea, scaling, 1)(0, 6),
+        make_recompute_teacher(q_tea, k_tea, scaling, 1)(0, 6, 0, 6),
         teacher_lse_from_qk(q_tea, k_tea, scaling),
         1,
     ) * (mask > -1e3)
@@ -453,7 +453,7 @@ def test_gqa_head_mapping_matches_flash_attn():
     torch.manual_seed(0)
     q_tea = torch.randn(1, 6, 4, 3, dtype=torch.float64)
     k_kv = torch.randn(1, 2, 4, 3, dtype=torch.float64)
-    alpha = make_recompute_teacher(q_tea, k_kv, 1.0, 3)(0, 4)
+    alpha = make_recompute_teacher(q_tea, k_kv, 1.0, 3)(0, 4, 0, 4)
 
     for q_head, kv_head in enumerate([0, 0, 0, 1, 1, 1]):
         expected = torch.einsum("bqd,bkd->bqk", q_tea[:, q_head], k_kv[:, kv_head])
@@ -481,3 +481,108 @@ def test_normalize_captured_lse_transposes_correctly():
 def test_normalize_captured_lse_rejects_unknown_layout():
     with pytest.raises(ValueError, match="cannot interpret"):
         normalize_captured_lse(torch.zeros(2, 7, 9), bsz=2, n_heads=4, q_len=8)
+
+
+# ----------------------------------------------------------------------
+# Query-axis tiling
+# ----------------------------------------------------------------------
+@pytest.mark.parametrize("query_tile", [1, 2, 3, 9, 64])
+def test_query_tiling_matches_dense_reference(query_tile):
+    """
+    Tiling the query axis is what keeps peak memory flat in L.
+
+    With key tiling alone a tile is (B, H, Sq, key_tile) -- 20 GiB at L=128K on
+    Llama-3.1-8B, the same O(L * tile) trap FlashKL's reference implementation has.
+    """
+    q_idx, k_idx, teacher_alpha, lse, mask, group_size, _ = make_case()
+    rows = fused_indexer_ce_rows(
+        q_idx,
+        k_idx,
+        teacher_alpha,
+        lse,
+        group_size=group_size,
+        mask=mask,
+        key_tile=4,
+        query_tile=query_tile,
+    )
+    expected, _, _ = dense_reference(
+        q_idx, k_idx, teacher_alpha, lse, mask, group_size, k_idx.shape[1]
+    )
+    torch.testing.assert_close(rows, expected)
+
+
+@pytest.mark.parametrize("query_tile,key_tile", [(1, 1), (2, 3), (3, 2), (5, 9), (64, 64)])
+def test_gradients_are_invariant_to_both_tile_axes(query_tile, key_tile):
+    """
+    dQ is owned by its query tile, but dK ACCUMULATES across them.
+
+    A missing accumulation would leave dK holding only the last query tile's contribution,
+    which this catches while the loss itself would still look correct.
+    """
+    q_idx, k_idx, teacher_alpha, lse, mask, group_size, _ = make_case()
+    grad_out = torch.rand(q_idx.shape[0], q_idx.shape[1], q_idx.shape[2], dtype=torch.float64)
+
+    rows = fused_indexer_ce_rows(
+        q_idx,
+        k_idx,
+        teacher_alpha,
+        lse,
+        group_size=group_size,
+        mask=mask,
+        key_tile=key_tile,
+        query_tile=query_tile,
+    )
+    (rows * grad_out).sum().backward()
+
+    q2 = q_idx.detach().clone().requires_grad_(True)
+    k2 = k_idx.detach().clone().requires_grad_(True)
+    dense_rows, _, _ = dense_reference(q2, k2, teacher_alpha, lse, mask, group_size, k_idx.shape[1])
+    (dense_rows * grad_out).sum().backward()
+
+    torch.testing.assert_close(q_idx.grad, q2.grad)
+    torch.testing.assert_close(k_idx.grad, k2.grad)
+
+
+def test_teacher_lse_is_query_tile_invariant():
+    torch.manual_seed(0)
+    q_tea = torch.randn(1, 4, 10, 6, dtype=torch.float64)
+    k_tea = torch.randn(1, 4, 10, 6, dtype=torch.float64)
+    mask = build_indexer_mask(10, 10, q_tea.device, dtype=torch.float64)
+    ref = teacher_lse_from_qk(q_tea, k_tea, 6**-0.5, mask=mask, key_tile=64, query_tile=64)
+    for query_tile in (1, 3, 7):
+        for key_tile in (2, 5):
+            got = teacher_lse_from_qk(
+                q_tea, k_tea, 6**-0.5, mask=mask, key_tile=key_tile, query_tile=query_tile
+            )
+            torch.testing.assert_close(got, ref)
+
+
+def test_query_tile_must_be_positive():
+    q_idx, k_idx, teacher_alpha, lse, mask, group_size, _ = make_case()
+    with pytest.raises(ValueError, match="query_tile must be positive"):
+        fused_indexer_ce_rows(
+            q_idx, k_idx, teacher_alpha, lse, group_size=group_size, query_tile=0
+        )
+
+
+def test_teacher_callable_receives_the_requested_tile_ranges():
+    """The callable must be asked for exactly the tile the loss is working on."""
+    q_idx, k_idx, _, lse, mask, group_size, n_heads = make_case(q_len=6, k_len=6)
+    seen = []
+
+    def spy(q_start, q_stop, k_start, k_stop):
+        seen.append((q_start, q_stop, k_start, k_stop))
+        return torch.zeros(
+            q_idx.shape[0], n_heads, q_stop - q_start, k_stop - k_start, dtype=torch.float64
+        )
+
+    fused_indexer_ce_rows(
+        q_idx, k_idx, spy, lse, group_size=group_size, mask=mask, key_tile=4, query_tile=2
+    )
+    assert seen, "teacher callable was never invoked"
+    for q_start, q_stop, k_start, k_stop in seen:
+        assert 0 <= q_start < q_stop <= 6
+        assert 0 <= k_start < k_stop <= 6
+        assert q_stop - q_start <= 2 and k_stop - k_start <= 4
+    # every (query tile, key tile) pair is visited exactly once
+    assert len(set(seen)) == len(seen) == 3 * 2

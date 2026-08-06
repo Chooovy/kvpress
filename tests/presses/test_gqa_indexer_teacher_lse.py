@@ -13,6 +13,7 @@ import torch
 
 from kvpress import GQAIndexerPress
 from kvpress.presses.gqa_indexer import (
+    assert_flash_dtype_supported,
     assert_lse_mask_compatible,
     build_indexer_mask,
     capture_teacher_lse,
@@ -38,6 +39,21 @@ def flash_attn_available() -> bool:
 requires_flash_attn = pytest.mark.skipif(
     not flash_attn_available(), reason="needs flash-attn and a CUDA device"
 )
+
+
+@pytest.fixture(scope="module")
+def bf16_model(unit_test_model):  # noqa: F811
+    """
+    The unit fixture loads in fp32, which flash-attention cannot run.
+
+    Deep-copied rather than cast in place: the fixture is session-scoped, so mutating its dtype
+    would silently change every other test that shares it. `capture_teacher_lse` deliberately
+    refuses to cast internally -- the kernel returns the attention output too, so a cast there
+    would alter the model's own forward rather than just the lse.
+    """
+    import copy
+
+    return copy.deepcopy(unit_test_model).to(torch.bfloat16).eval()
 
 
 def global_mapping():
@@ -100,8 +116,8 @@ def test_attn_implementation_is_restored_on_exception(unit_test_model):  # noqa:
 # Capture correctness
 # ----------------------------------------------------------------------
 @requires_flash_attn
-def test_captures_one_lse_per_layer(unit_test_model):  # noqa: F811
-    model = unit_test_model
+def test_captures_one_lse_per_layer(bf16_model):
+    model = bf16_model
     input_ids = torch.randint(0, 1024, (1, 32), device=model.device)
 
     with capture_teacher_lse(model) as lse_by_layer:
@@ -115,7 +131,7 @@ def test_captures_one_lse_per_layer(unit_test_model):  # noqa: F811
 
 
 @requires_flash_attn
-def test_captured_lse_matches_the_streaming_fallback(unit_test_model):  # noqa: F811
+def test_captured_lse_matches_the_streaming_fallback(bf16_model):
     """
     The captured value must equal teacher_lse_from_qk on the same Q/K.
 
@@ -124,7 +140,7 @@ def test_captured_lse_matches_the_streaming_fallback(unit_test_model):  # noqa: 
     loss performs. A mismatch in any of the three would otherwise train against a subtly
     wrong teacher with nothing to flag it.
     """
-    model = unit_test_model
+    model = bf16_model
     press = GQAIndexerPress(compression_ratio=0.5)
     press.post_init_from_model(model)
     modules = get_attention_modules(model)
@@ -166,32 +182,49 @@ def test_captured_lse_matches_the_streaming_fallback(unit_test_model):  # noqa: 
         expected = teacher_lse_from_qk(
             query_states, keys, attention_scaling(module), mask=mask, key_tile=16
         )
+        # Both paths see the same bf16 Q/K and accumulate in fp32, so the only difference is
+        # reduction order -- but the logits themselves come from a bf16 GEMM, so the tolerance
+        # tracks bf16's ~4e-3 relative epsilon rather than fp32's.
         torch.testing.assert_close(
-            lse_by_layer[layer_idx], expected.float(), rtol=2e-3, atol=2e-3
+            lse_by_layer[layer_idx], expected.float(), rtol=1e-2, atol=1e-2
         )
 
 
 @requires_flash_attn
-def test_model_output_is_unchanged_by_capture(unit_test_model):  # noqa: F811
-    """Capturing must be observationally transparent to the model's own output."""
-    model = unit_test_model
+def test_model_output_is_unchanged_by_capture(bf16_model):
+    """
+    Capturing must be observationally transparent to the model's own output.
+
+    Compared by *prediction*, not by raw logits. Capture swaps sdpa for flash-attention, and two
+    bf16 kernels with different reduction orders will not agree to any tight logit tolerance --
+    a comparison loose enough to pass would no longer be evidence of anything. Argmax agreement
+    plus a bounded relative difference is the property that actually matters: the capture must
+    not change what the model *says*.
+    """
+    model = bf16_model
     input_ids = torch.randint(0, 1024, (1, 32), device=model.device)
 
     with torch.no_grad():
-        reference = model(input_ids, use_cache=False).logits
+        reference = model(input_ids, use_cache=False).logits.float()
         with capture_teacher_lse(model):
-            captured = model(input_ids, use_cache=False).logits
+            captured = model(input_ids, use_cache=False).logits.float()
 
-    torch.testing.assert_close(captured, reference, rtol=2e-2, atol=2e-2)
+    assert captured.shape == reference.shape
+    assert torch.isfinite(captured).all()
+    assert torch.equal(captured.argmax(-1), reference.argmax(-1)), (
+        "capture changed the model's prediction, so it is not a drop-in replacement"
+    )
+    scale = reference.abs().amax().clamp_min(1e-6)
+    assert ((captured - reference).abs().amax() / scale) < 0.05
 
 
 @requires_flash_attn
-def test_captured_lse_feeds_the_fused_loss(unit_test_model):  # noqa: F811
+def test_captured_lse_feeds_the_fused_loss(bf16_model):
     """End-to-end: a captured lse must drive the fused loss to a finite, differentiable value."""
     from kvpress.presses.gqa_indexer import fused_indexer_loss, make_recompute_teacher
     from kvpress.utils import extract_keys_and_values
 
-    model = unit_test_model
+    model = bf16_model
     press = GQAIndexerPress(compression_ratio=0.5)
     press.post_init_from_model(model)
     module = get_attention_modules(model)[0]
@@ -260,3 +293,50 @@ def test_padding_guard_accepts_causal_only():
     assert_lse_mask_compatible(None, "flash-attn")
     assert_lse_mask_compatible(torch.ones(2, 8, dtype=torch.long), "flash-attn")
     assert_lse_mask_compatible(build_indexer_mask(8, 8, torch.device("cpu")), "flash-attn")
+
+
+# ----------------------------------------------------------------------
+# The dtype guard (no flash-attn required)
+# ----------------------------------------------------------------------
+def test_flash_dtype_guard_accepts_half_precision():
+    assert_flash_dtype_supported(torch.float16)
+    assert_flash_dtype_supported(torch.bfloat16)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_flash_dtype_guard_rejects_wider_dtypes(dtype):
+    """
+    fp32 must be refused with the fallback named, not cast behind the caller's back.
+
+    A cast would be wrong twice over: flash_attn_func also returns the attention *output*, which
+    the model consumes, so casting would change the model's own forward; and a reduced-precision
+    lse paired with a wider alpha leaves the teacher rows not summing to one.
+    """
+    with pytest.raises(TypeError, match="only fp16 and bf16"):
+        assert_flash_dtype_supported(dtype)
+    with pytest.raises(TypeError, match="teacher_lse_from_qk"):
+        assert_flash_dtype_supported(dtype)
+
+
+@requires_flash_attn
+def test_capture_refuses_an_fp32_model(unit_test_model):  # noqa: F811
+    """The guard must fire from inside the capture, naming the dtype rather than flash-attn's."""
+    model = unit_test_model
+    assert next(model.parameters()).dtype == torch.float32, "fixture is expected to be fp32"
+    input_ids = torch.randint(0, 1024, (1, 8), device=model.device)
+    with pytest.raises(TypeError, match="only fp16 and bf16"):
+        with capture_teacher_lse(model):
+            model(input_ids, use_cache=False)
+
+
+@requires_flash_attn
+def test_capture_cleans_up_after_a_dtype_failure(unit_test_model):  # noqa: F811
+    """A mid-forward raise must still restore the attention implementation."""
+    model = unit_test_model
+    before = model.config._attn_implementation
+    input_ids = torch.randint(0, 1024, (1, 8), device=model.device)
+    with pytest.raises(TypeError):
+        with capture_teacher_lse(model):
+            model(input_ids, use_cache=False)
+    assert model.config._attn_implementation == before
+    assert IMPL_NAME not in global_mapping()

@@ -50,6 +50,29 @@ from kvpress.presses.gqa_indexer.indexer import MASK_NEG
 
 logger = logging.getLogger(__name__)
 
+FLASH_DTYPES = (torch.float16, torch.bfloat16)
+
+
+def assert_flash_dtype_supported(dtype: torch.dtype) -> None:
+    """
+    Reject a dtype flash-attention cannot run, naming the fallback.
+
+    Casting internally would be worse than failing, on two counts. The kernel returns the
+    attention *output* as well as the ``lse``, and that output is what the model consumes -- so a
+    silent cast would change the model's own forward, which
+    ``test_model_output_is_unchanged_by_capture`` exists to rule out. And the loss evaluates
+    ``exp(alpha - lse)`` with ``alpha`` built from the caller's Q/K: pairing a reduced-precision
+    ``lse`` with a wider ``alpha`` leaves the teacher rows not summing to one -- the same class of
+    quiet mis-normalization :func:`assert_lse_mask_compatible` already refuses.
+    """
+    if dtype not in FLASH_DTYPES:
+        raise TypeError(
+            f"flash-attention supports only fp16 and bf16, got {dtype}. Load the model in bf16, "
+            "or compute the teacher logsumexp with "
+            "kvpress.presses.gqa_indexer.fused_loss.teacher_lse_from_qk, which is exact at any "
+            "dtype. Casting here would change the model's attention output, not merely the lse."
+        )
+
 
 def assert_lse_mask_compatible(attention_mask: torch.Tensor | None, source: str) -> None:
     """
@@ -153,6 +176,10 @@ def capture_teacher_lse(model: nn.Module):
     impl_name = "kvpress_teacher_lse_capture"
 
     def capture_attention(module, query, key, value, attention_mask, scaling=None, dropout=0.0, **kwargs):
+        # Checked here rather than once up front: a multimodal or partially-cast model can have
+        # layers of differing dtype, and flash-attn's own message names neither the layer nor
+        # the fallback.
+        assert_flash_dtype_supported(query.dtype)
         # flash-attn wants (B, Sq, H, D); the attention layer hands us (B, H, Sq, D).
         q, k, v = (t.transpose(1, 2) for t in (query, key, value))
         out, lse, _ = flash_attn_func(

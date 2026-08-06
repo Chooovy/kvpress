@@ -287,6 +287,13 @@ and `exp(alpha - lse)` would then not sum to one over the kept keys.
 `assert_lse_mask_compatible` raises on that combination rather than letting it train
 slightly wrong.
 
+**fp16/bf16 only.** flash-attention has no fp32 kernel, and `capture_teacher_lse` refuses rather
+than casting: `flash_attn_func` returns the attention *output* as well as the `lse`, so a cast
+would change the model's own forward, not just the value being captured. A reduced-precision
+`lse` paired with a wider `alpha` would also leave the teacher rows not summing to one — the same
+class of quiet mis-normalization as the padding case. Load the model in bf16, or use
+`teacher_lse_from_qk`, which is exact at any dtype.
+
 ## Stage 2: sparse
 
 Stage 1 is `O(L)` in *memory* but still `O(L²)` in *compute* — every key has to be visited

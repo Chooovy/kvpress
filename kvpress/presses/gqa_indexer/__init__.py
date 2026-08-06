@@ -81,6 +81,7 @@ from kvpress.presses.gqa_indexer.sparse_support import (
     streaming_topk_support,
 )
 from kvpress.presses.gqa_indexer.teacher_lse import (
+    assert_flash_dtype_supported,
     assert_lse_mask_compatible,
     capture_teacher_lse,
     normalize_captured_lse,
@@ -141,6 +142,7 @@ __all__ = [
     "make_recompute_teacher",
     "teacher_lse_from_qk",
     "teacher_probs_from_lse",
+    "assert_flash_dtype_supported",
     "assert_lse_mask_compatible",
     "capture_teacher_lse",
     "normalize_captured_lse",

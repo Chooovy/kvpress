@@ -729,9 +729,16 @@ def test_dense_loss_scores_the_post_layernorm_hidden_states(unit_test_model):  #
         )
 
 
-def test_compute_indexer_loss_warns_without_layernorms(unit_test_model, caplog):  # noqa: F811
-    """Omitting input_layernorms is a silent correctness bug, so it must at least warn."""
-    model = unit_test_model
+def test_compute_indexer_loss_warns_without_layernorms(  # noqa: F811
+    unit_test_model_output_attention, caplog
+):
+    """
+    Omitting input_layernorms is a silent correctness bug, so it must at least warn.
+
+    Uses the eager fixture: output_attentions=True returns None under SDPA, so the
+    non-eager model would trip the attentions guard before reaching the warning.
+    """
+    model = unit_test_model_output_attention
     press = GQAIndexerPress(compression_ratio=0.5)
     press.post_init_from_model(model)
     input_ids = torch.randint(0, 1024, (1, 12), device=model.device)

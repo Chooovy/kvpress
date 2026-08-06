@@ -760,3 +760,105 @@ def test_compute_indexer_loss_warns_without_layernorms(  # noqa: F811
     assert not torch.allclose(without, with_norms), (
         "the two students must differ, or the layernorm argument would be pointless"
     )
+
+
+# ----------------------------------------------------------------------
+# The capacity model (see bench_gqa_indexer_capacity.py)
+# ----------------------------------------------------------------------
+def test_capacity_model_is_self_consistent():
+    """
+    The itemized prediction must add up, and move the right way with each knob.
+
+    Pure arithmetic, no GPU: this pins the model the benchmark compares its measurements
+    against. If the model is wrong the benchmark cannot tell a real ceiling from a leak, which
+    is the only thing it is for.
+    """
+    from tests.presses.bench_gqa_indexer_capacity import (
+        predict_bytes_per_token,
+        predict_max_length,
+    )
+
+    geometry = dict(layers=36, n_heads=32, n_kv_heads=8, head_dim=128, indexer_dim=128)
+
+    dense = predict_bytes_per_token(**geometry, stage="dense")
+    assert sum(v for k, v in dense.items() if k != "total") == pytest.approx(dense["total"])
+
+    # More support costs more; sparse costs more than dense.
+    small = predict_bytes_per_token(**geometry, stage="sparse", topk=256)
+    large = predict_bytes_per_token(**geometry, stage="sparse", topk=512)
+    assert dense["total"] < small["total"] < large["total"]
+
+    # topk doubling must double exactly the support terms and nothing else.
+    assert large["support"] == 2 * small["support"]
+    assert large["valid"] == 2 * small["valid"]
+    assert large["kv_cache"] == small["kv_cache"]
+
+    # Halving the layers halves everything (all terms are per-layer except none).
+    half = predict_bytes_per_token(**{**geometry, "layers": 18}, stage="dense")
+    assert half["total"] == pytest.approx(dense["total"] / 2)
+
+    # Length prediction is a plain floor division, and degrades gracefully.
+    assert predict_max_length(dense["total"] * 1000, dense["total"]) == 1000
+    assert predict_max_length(0, dense["total"]) == 0
+
+
+def test_capacity_model_prices_the_retained_teacher():
+    """
+    Freeing the teacher closure must be worth ~3x on Qwen3-8B geometry.
+
+    ctx.teacher_alpha holds fp32 copies of the teacher's Q and K, and there is one autograd
+    node per layer -- so all 36 layers stay resident until backward(). This is the number the
+    benchmark exists to report, so it is pinned here rather than left as a claim in a docstring.
+    """
+    from tests.presses.bench_gqa_indexer_capacity import predict_bytes_per_token
+
+    geometry = dict(layers=36, n_heads=32, n_kv_heads=8, head_dim=128, indexer_dim=128)
+    retained = predict_bytes_per_token(**geometry, stage="dense", retain_teacher=True)
+    freed = predict_bytes_per_token(**geometry, stage="dense", retain_teacher=False)
+
+    assert "teacher_q_fp32" in retained and "teacher_q_fp32" not in freed
+    assert retained["total"] / freed["total"] == pytest.approx(3.0, abs=0.1)
+
+    # The fp32 teacher Q alone is the single largest term.
+    biggest = max((k for k in retained if k != "total"), key=lambda k: retained[k])
+    assert biggest == "teacher_q_fp32"
+
+
+def test_capacity_model_agrees_with_a_measured_slope(unit_test_model):  # noqa: F811
+    """
+    The analytic slope must match what the allocator actually reports.
+
+    Measured at two lengths on the small fixture, so it runs anywhere. A model that predicts
+    the wrong slope would mis-attribute the ceiling; tolerance is loose because tile scratch
+    and the LM head add a length-dependent term the model deliberately omits.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA to read peak allocation")
+
+    from tests.presses.bench_gqa_indexer_capacity import predict_bytes_per_token, try_length
+
+    model = unit_test_model
+    config = model.config
+    trainer = make_trainer(model, key_tile=128, query_tile=128)
+    indexer = trainer.press.get_indexer(get_attention_modules(model)[0])
+
+    predicted = predict_bytes_per_token(
+        layers=config.num_hidden_layers,
+        n_heads=config.num_attention_heads,
+        n_kv_heads=config.num_key_value_heads,
+        head_dim=indexer.head_dim,
+        indexer_dim=indexer.head_dim,
+        stage="dense",
+    )["total"]
+
+    short = try_length(model, trainer, 512, verbose=False)
+    long = try_length(model, trainer, 1536, verbose=False)
+    assert short["ok"] and long["ok"], "the fixture is far too small to OOM at these lengths"
+
+    measured = (long["peak_gib"] - short["peak_gib"]) * (1024**3) / (1536 - 512)
+    assert measured > 0, "peak memory must grow with sequence length"
+    # Within 3x: the model omits O(query_tile * key_tile) scratch and the LM head's logits,
+    # both of which inflate the measured slope on a model this small.
+    assert 0.33 < measured / predicted < 3.0, (
+        f"measured {measured / 1024:.1f} KiB/tok vs predicted {predicted / 1024:.1f}"
+    )

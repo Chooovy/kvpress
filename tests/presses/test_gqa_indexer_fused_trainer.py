@@ -15,6 +15,7 @@ from kvpress.presses.gqa_indexer import (
     freeze_all_but_indexer,
     fused_indexer_training_step,
     get_attention_modules,
+    build_position_embeddings,
     get_input_layernorms,
     teacher_query_states,
 )
@@ -158,7 +159,7 @@ def test_agrees_with_the_dense_loss_up_to_the_entropy_offset(unit_test_model_out
         outputs.hidden_states,
         outputs.attentions,
         IndexerTrainConfig(stage="dense"),
-        input_layernorms=get_input_layernorms(model),
+        model=model,
     )
 
     # CE >= KL always, since H(pbar) >= 0.
@@ -740,13 +741,14 @@ def test_compute_indexer_loss_warns_without_layernorms(unit_test_model, caplog):
         without, _ = compute_indexer_loss(
             press, get_attention_modules(model), outputs.hidden_states, outputs.attentions,
             IndexerTrainConfig(stage="dense"),
+            position_embeddings=build_position_embeddings(model, outputs.hidden_states[0]),
         )
     assert "post-layernorm" in caplog.text.lower()
 
     with_norms, _ = compute_indexer_loss(
         press, get_attention_modules(model), outputs.hidden_states, outputs.attentions,
         IndexerTrainConfig(stage="dense"),
-        input_layernorms=get_input_layernorms(model),
+        model=model,
     )
     assert not torch.allclose(without, with_norms), (
         "the two students must differ, or the layernorm argument would be pointless"

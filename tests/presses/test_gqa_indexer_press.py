@@ -22,6 +22,7 @@ from kvpress.presses.gqa_indexer import (
     compute_indexer_loss,
     freeze_all_but_indexer,
     get_attention_modules,
+    get_input_layernorms,
     indexer_layer_loss,
     indexer_state_dict,
     load_indexer_state_dict,
@@ -641,6 +642,7 @@ def test_compute_indexer_loss_over_all_layers(unit_test_model_output_attention):
         out.hidden_states,
         out.attentions,
         IndexerTrainConfig(stage="dense"),
+        model=model,
     )
     assert torch.isfinite(loss) and len(per_layer) == len(out.attentions)
 
@@ -650,9 +652,12 @@ def test_compute_indexer_loss_over_all_layers(unit_test_model_output_attention):
 
 def test_compute_indexer_loss_uses_layer_input_hidden_states(unit_test_model_output_attention):  # noqa: F811
     """
-    Layer i must be scored from hidden_states[i] (its input), not hidden_states[i+1].
+    Layer i must be scored from layernorm(hidden_states[i]), not hidden_states[i+1].
 
-    Feeding the layer's own output would leak information the real forward pass never has.
+    Two distinct mistakes are ruled out here. Using i+1 would leak the layer's own output,
+    which the real forward pass never has. And using hidden_states[i] *raw* would skip the
+    block's input_layernorm -- but kvpress hooks self_attn, which sits after it, so the press
+    scores the normalized tensor at inference.
     """
     model = unit_test_model_output_attention
     press = GQAIndexerPress()
@@ -661,6 +666,7 @@ def test_compute_indexer_loss_uses_layer_input_hidden_states(unit_test_model_out
     input_ids = torch.randint(0, 1024, (1, 12), device=model.device)
     out = model(input_ids, output_attentions=True, output_hidden_states=True, use_cache=False)
     modules = get_attention_modules(model)
+    norms = get_input_layernorms(model)
 
     seen = []
     original = press.indexer_logits
@@ -670,8 +676,95 @@ def test_compute_indexer_loss_uses_layer_input_hidden_states(unit_test_model_out
         return original(module, hidden_states, kwargs, k_len=k_len)
 
     press.indexer_logits = spy
-    compute_indexer_loss(press, modules, out.hidden_states, out.attentions, IndexerTrainConfig())
+    compute_indexer_loss(
+        press, modules, out.hidden_states, out.attentions, IndexerTrainConfig(), model=model
+    )
     press.indexer_logits = original
 
+    assert len(seen) == len(out.attentions)
     for layer_idx, hs in enumerate(seen):
-        assert hs is out.hidden_states[layer_idx]
+        torch.testing.assert_close(hs, norms[layer_idx](out.hidden_states[layer_idx]))
+        assert hs is not out.hidden_states[layer_idx + 1]
+
+
+def test_get_rope_tables_raises_when_rope_is_wanted_but_absent(unit_test_model):  # noqa: F811
+    """
+    A RoPE-aware indexer with no position_embeddings must fail, not silently score NoPE.
+
+    At inference the press is hooked onto self_attn and so always receives them; an absent
+    table means a caller is about to build a different student than the one that runs. The old
+    behaviour returned (None, None), which trained the indexer with no positional signal at all
+    while every shape and loss value stayed plausible.
+    """
+    press = GQAIndexerPress(compression_ratio=0.5)
+    press.post_init_from_model(unit_test_model)
+    indexer = press.get_indexer(get_attention_modules(unit_test_model)[0])
+    assert indexer.rope_dim > 0, "this fixture must want RoPE for the test to mean anything"
+
+    with pytest.raises(ValueError, match="no position_embeddings"):
+        press.get_rope_tables(indexer, {})
+
+
+def test_get_rope_tables_allows_deliberate_nope(unit_test_model):  # noqa: F811
+    """rope_dim=0 is an explicit opt-in, so it must stay silent."""
+    press = GQAIndexerPress(compression_ratio=0.5, rope_dim=0)
+    press.post_init_from_model(unit_test_model)
+    indexer = press.get_indexer(get_attention_modules(unit_test_model)[0])
+    assert indexer.rope_dim == 0
+    assert press.get_rope_tables(indexer, {}) == (None, None)
+
+
+def test_compute_indexer_loss_applies_rope(unit_test_model_output_attention):  # noqa: F811
+    """
+    The dense path must give the indexer positions, or it trains a NoPE student.
+
+    Checked by comparing against an explicit rope_dim=0 press: if the default path were also
+    running without positions the two losses would coincide.
+    """
+    model = unit_test_model_output_attention
+    input_ids = torch.randint(0, 1024, (1, 12), device=model.device)
+    out = model(input_ids, output_attentions=True, output_hidden_states=True, use_cache=False)
+    modules = get_attention_modules(model)
+
+    press = GQAIndexerPress(compression_ratio=0.5)
+    press.post_init_from_model(model)
+    indexer = press.get_indexer(modules[0])
+    assert indexer.rope_dim > 0, "this fixture must want RoPE for the test to mean anything"
+
+    rope_loss, _ = compute_indexer_loss(
+        press, modules, out.hidden_states, out.attentions,
+        IndexerTrainConfig(stage="dense"), model=model,
+    )
+
+    # Same weights, RoPE switched off in place: the only difference is the rotation.
+    original = {m: press.get_indexer(m).rope_dim for m in modules}
+    try:
+        for module in modules:
+            press.get_indexer(module).rope_dim = 0
+        nope_loss, _ = compute_indexer_loss(
+            press, modules, out.hidden_states, out.attentions,
+            IndexerTrainConfig(stage="dense"), model=model,
+        )
+    finally:
+        for module, rope_dim in original.items():
+            press.get_indexer(module).rope_dim = rope_dim
+
+    assert torch.isfinite(rope_loss) and torch.isfinite(nope_loss)
+    assert not torch.allclose(rope_loss, nope_loss), (
+        "identical to the NoPE student, so the default path is not applying RoPE"
+    )
+
+
+def test_compute_indexer_loss_rejects_missing_attentions(unit_test_model):  # noqa: F811
+    """output_attentions=True is required; None must say so rather than raise a TypeError."""
+    press = GQAIndexerPress(compression_ratio=0.5)
+    press.post_init_from_model(unit_test_model)
+    input_ids = torch.randint(0, 1024, (1, 8), device=unit_test_model.device)
+    out = unit_test_model(input_ids, output_hidden_states=True, use_cache=False)
+    assert getattr(out, "attentions", None) is None
+
+    with pytest.raises(ValueError, match="output_attentions=True"):
+        compute_indexer_loss(
+            press, get_attention_modules(unit_test_model), out.hidden_states, None,
+            IndexerTrainConfig(stage="dense"), model=unit_test_model,
+        )

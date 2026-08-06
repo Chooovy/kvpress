@@ -210,6 +210,25 @@ def indexer_layer_loss(
     )
 
 
+def build_position_embeddings(
+    model: nn.Module, hidden_states: torch.Tensor, position_ids: torch.Tensor | None = None
+) -> tuple:
+    """
+    Compute the model's own ``(cos, sin)`` for a batch, using its ``rotary_emb``.
+
+    :func:`compute_indexer_loss` needs these because the press requires them: the indexer is
+    RoPE-aware by default, and scoring it without positions would build a different student
+    than the one that runs at inference. The trainer gets them for free (the attention layer
+    is handed them), so this only exists for the ``output_hidden_states`` path.
+    """
+    language_model = get_language_model(model)
+    if position_ids is None:
+        position_ids = torch.arange(
+            hidden_states.shape[1], device=hidden_states.device
+        ).unsqueeze(0)
+    return language_model.rotary_emb(hidden_states, position_ids)
+
+
 def compute_indexer_loss(
     press: GQAIndexerPress,
     attn_modules: list[nn.Module],
@@ -221,6 +240,7 @@ def compute_indexer_loss(
     labels: torch.Tensor | None = None,
     position_embeddings: tuple | None = None,
     input_layernorms: list[nn.Module] | None = None,
+    model: nn.Module | None = None,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """
     Average the per-layer indexer loss over all layers.
@@ -231,12 +251,18 @@ def compute_indexer_loss(
     right starting point -- using ``i + 1`` would feed the indexer the layer's own output and
     quietly hand it information the real forward pass never has.
 
-    But the block applies ``input_layernorm`` before calling ``self_attn``, and kvpress hooks
-    ``self_attn`` -- so at inference the indexer sees the **post-layernorm** tensor.
-    ``input_layernorms`` must therefore be passed for the student here to match the student
-    the press actually runs; :func:`get_input_layernorms` extracts them. Omitting them trains
-    the indexer on a distribution it never sees, which does not fail loudly: the loss falls,
-    the gradients flow, and eval is simply worse than it should be.
+    Two further things are needed for the student here to match the student the press actually
+    runs, and getting either wrong is silent -- the loss falls, the gradients flow, and eval is
+    simply worse:
+
+    - ``input_layernorms``: the block normalizes before calling ``self_attn``, and kvpress
+      hooks ``self_attn``, so the indexer sees the **post-layernorm** tensor.
+    - ``position_embeddings``: the indexer is RoPE-aware unless ``rope_dim=0``.
+
+    Pass ``model`` and both are derived automatically, which is the recommended usage;
+    :func:`get_input_layernorms` and :func:`build_position_embeddings` are the pieces if you
+    would rather be explicit. Omitting ``input_layernorms`` warns; omitting the position
+    embeddings makes the press raise.
 
     Returns
     -------
@@ -245,11 +271,19 @@ def compute_indexer_loss(
     per_layer : list[torch.Tensor]
         Per-layer losses, for logging.
     """
+    if attentions is None:
+        raise ValueError(
+            "attentions is None: pass output_attentions=True (which forces eager attention). "
+            "To keep the fast kernel, use FusedIndexerTrainer instead -- it never needs the "
+            "dense attention matrix."
+        )
     if len(hidden_states) < len(attentions):
         raise ValueError(
             f"expected at least {len(attentions)} hidden_states, got {len(hidden_states)}; "
             "pass output_hidden_states=True"
         )
+    if input_layernorms is None and model is not None:
+        input_layernorms = get_input_layernorms(model)
     if input_layernorms is not None and len(input_layernorms) < len(attentions):
         raise ValueError(
             f"expected at least {len(attentions)} input_layernorms, got {len(input_layernorms)}"
@@ -258,8 +292,11 @@ def compute_indexer_loss(
         logger.warning(
             "compute_indexer_loss called without input_layernorms: the indexer will be trained "
             "on the pre-layernorm hidden states, but at inference kvpress hooks self_attn and "
-            "so feeds it the POST-layernorm tensor. Pass get_input_layernorms(model)."
+            "so feeds it the POST-layernorm tensor. Pass model=... or "
+            "input_layernorms=get_input_layernorms(model)."
         )
+    if position_embeddings is None and model is not None:
+        position_embeddings = build_position_embeddings(model, hidden_states[0])
 
     per_layer = []
     for layer_idx, attn in enumerate(attentions):

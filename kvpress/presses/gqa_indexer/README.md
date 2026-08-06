@@ -113,26 +113,31 @@ loss, per_layer = compute_indexer_loss(
     press, get_attention_modules(model), out.hidden_states, out.attentions,
     IndexerTrainConfig(stage="dense"),
     attention_mask=attention_mask, labels=labels,
-    input_layernorms=get_input_layernorms(model),   # required; see below
+    model=model,                     # derives the layernorms and RoPE tables; see below
 )
 loss.backward(); optimizer.step()
 torch.save(indexer_state_dict(model), "indexer.pt")
 ```
 
-**The student must be the one the press actually runs.** Two easy ways to get this wrong,
-neither of which fails loudly — the loss falls, gradients flow, and eval is just quietly worse:
+**The student must be the one the press actually runs.** Three ways to get this wrong, none of
+which fails loudly — the loss falls, gradients flow, and eval is just quietly worse:
 
 1. `compute_indexer_loss` scores layer `i` from `hidden_states[i]` (its **input**), not
    `hidden_states[i + 1]` — the latter would hand the indexer the layer's own output.
 2. The decoder block applies `input_layernorm` *before* calling `self_attn`, and kvpress hooks
    `self_attn`. So at inference the indexer sees the **post-layernorm** tensor, while
-   `output_hidden_states[i]` is the **pre**-layernorm one. Pass `input_layernorms` so the two
-   agree; omitting it warns.
+   `output_hidden_states[i]` is the **pre**-layernorm one.
+3. The indexer is RoPE-aware unless `rope_dim=0`, and `output_hidden_states` carries no
+   `position_embeddings` — so a caller who omits them trains a **NoPE** student.
 
-`FusedIndexerTrainer` has neither problem — it hooks `self_attn` itself, so it reads exactly
-what the press reads. This is why the fused and dense losses differ by more than `H(p̄)` if the
-layernorms are omitted, and it is what `test_dense_loss_scores_the_post_layernorm_hidden_states`
-pins.
+Passing `model=` derives (2) and (3) automatically. Omitting the layernorms warns; omitting the
+position embeddings now **raises** rather than silently dropping the positional signal, since at
+inference the press is hooked onto `self_attn` and always has them.
+
+`FusedIndexerTrainer` has none of these problems — it hooks `self_attn` itself, so it reads
+exactly what the press reads. That is why the fused and dense losses differ by more than `H(p̄)`
+whenever the dense path's student drifts, which is what
+`test_agrees_with_the_dense_loss_up_to_the_entropy_offset` detects.
 
 The teacher is grouped **per KV group**, not averaged over all heads — matching MiniMax M3
 Eq. 9. Averaging across groups would give every indexer head an identical target and waste

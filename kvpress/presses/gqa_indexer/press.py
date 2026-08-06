@@ -175,15 +175,26 @@ class GQAIndexerPress(ScorerPress):
         """
         Narrow the layer's RoPE tables to the indexer's rotary width.
 
-        Returns ``(None, None)`` when the indexer has RoPE disabled or the tables are
-        unavailable. The narrowing itself is subtle -- see
+        Returns ``(None, None)`` only when the indexer has RoPE *disabled*
+        (``rope_dim == 0``). If it wants RoPE and the tables are missing, this **raises**
+        rather than quietly scoring without positions: at inference the press is hooked onto
+        ``self_attn`` and so always receives ``position_embeddings``, so an absent table means
+        a caller (usually training code) is about to build a student that differs from the one
+        the press runs -- and nothing downstream would flag it.
+
+        The narrowing itself is subtle -- see
         :func:`~kvpress.presses.gqa_indexer.indexer.slice_rope_tables`.
         """
         if indexer.rope_dim == 0:
             return None, None
         position_embeddings = kwargs.get("position_embeddings")
         if position_embeddings is None:
-            return None, None
+            raise ValueError(
+                f"the indexer has rope_dim={indexer.rope_dim} but no position_embeddings were "
+                "supplied, so it would score without any positional signal -- a different "
+                "student than the one the press runs at inference. Pass position_embeddings, "
+                "or set rope_dim=0 to opt into NoPE deliberately."
+            )
         cos, sin = position_embeddings
         if cos.dim() == 4:  # some models emit (B, 1, S, D)
             cos, sin = cos.squeeze(1), sin.squeeze(1)

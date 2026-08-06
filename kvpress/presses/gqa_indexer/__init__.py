@@ -86,6 +86,7 @@ from kvpress.presses.gqa_indexer.teacher_lse import (
 )
 from kvpress.presses.gqa_indexer.train import (
     IndexerTrainConfig,
+    build_position_embeddings,
     compute_indexer_loss,
     freeze_all_but_indexer,
     get_attention_modules,
@@ -120,6 +121,7 @@ __all__ = [
     "masked_softmax",
     "normalize_indexer_target",
     "IndexerTrainConfig",
+    "build_position_embeddings",
     "compute_indexer_loss",
     "freeze_all_but_indexer",
     "get_attention_modules",

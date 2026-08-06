@@ -15,6 +15,7 @@ from kvpress.presses.gqa_indexer import (
     freeze_all_but_indexer,
     fused_indexer_training_step,
     get_attention_modules,
+    get_input_layernorms,
     teacher_query_states,
 )
 from kvpress.presses.gqa_indexer import HAS_TRITON, build_indexer_mask, decompose_mask
@@ -157,6 +158,7 @@ def test_agrees_with_the_dense_loss_up_to_the_entropy_offset(unit_test_model_out
         outputs.hidden_states,
         outputs.attentions,
         IndexerTrainConfig(stage="dense"),
+        input_layernorms=get_input_layernorms(model),
     )
 
     # CE >= KL always, since H(pbar) >= 0.
@@ -416,11 +418,16 @@ def test_support_teacher_mode_needs_no_dense_lse(unit_test_model):  # noqa: F811
     """
     teacher_mode='support' normalizes over the support, making stage 2 O(L * topk) end to end.
 
-    It is a different objective from 'global', not another way to compute it, so the two
-    losses must differ.
+    The two modes coincide when group_size == 1 -- and this fixture has
+    num_attention_heads == num_key_value_heads, so it does. With one head per group the group
+    mean is trivial, and renormalizing a full softmax onto the support IS the support softmax
+    (verified to 1.7e-16). So agreement is what gets asserted here; the *divergence* at
+    group_size > 1 is pinned in test_gqa_indexer_fused_sparse_loss.py, which controls the
+    geometry directly instead of inheriting it from a fixture.
     """
     model = unit_test_model
     input_ids = torch.randint(0, 1024, (1, 20), device=model.device)
+    group_size = model.config.num_attention_heads // model.config.num_key_value_heads
 
     glob = make_trainer(model, stage="sparse", key_tile=8, topk_tile=4, keep_ratio=0.4)
     global_loss, _ = fused_indexer_training_step(model, glob, input_ids=input_ids)
@@ -436,8 +443,11 @@ def test_support_teacher_mode_needs_no_dense_lse(unit_test_model):  # noqa: F811
     support_loss, _ = fused_indexer_training_step(model, sup, input_ids=input_ids)
 
     assert torch.isfinite(support_loss) and support_loss.item() >= -1e-5
-    assert not torch.allclose(global_loss, support_loss)
     assert sup.mean_recall() == pytest.approx(1.0, abs=1e-5), "support mode normalizes to Z=1"
+    if group_size == 1:
+        torch.testing.assert_close(support_loss, global_loss, rtol=1e-4, atol=1e-5)
+    else:
+        assert not torch.allclose(global_loss, support_loss)
 
 
 def test_sparse_force_local_changes_the_support(unit_test_model):  # noqa: F811
@@ -674,3 +684,70 @@ def test_backend_used_is_cleared_by_reset(unit_test_model):  # noqa: F811
     assert trainer.backend_used == "torch"
     trainer.reset()
     assert trainer.backend_used is None
+
+
+def test_dense_loss_scores_the_post_layernorm_hidden_states(unit_test_model):  # noqa: F811
+    """
+    The dense path's student must match the student the press actually runs.
+
+    The decoder block applies input_layernorm before calling self_attn, and kvpress hooks
+    self_attn -- so at inference the indexer sees the POST-layernorm tensor, while
+    output_hidden_states[i] is the PRE-layernorm one. Training on the wrong one does not fail
+    loudly: the loss falls, gradients flow, and eval is just quietly worse.
+    """
+    model = unit_test_model
+    press = GQAIndexerPress(compression_ratio=0.5)
+    press.post_init_from_model(model)
+    modules = get_attention_modules(model)
+    norms = get_input_layernorms(model)
+    assert len(norms) == len(modules)
+
+    input_ids = torch.randint(0, 1024, (1, 12), device=model.device)
+
+    seen = {}
+
+    def hook(module, args, kwargs, output):
+        seen[module] = kwargs["hidden_states"].detach()
+        return output
+
+    handles = [m.register_forward_hook(hook, with_kwargs=True) for m in modules]
+    try:
+        with torch.no_grad():
+            outputs = model(input_ids, output_hidden_states=True, use_cache=True)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    for layer_idx, module in enumerate(modules):
+        pre = outputs.hidden_states[layer_idx]
+        post = norms[layer_idx](pre)
+        actual = seen[module]
+        torch.testing.assert_close(actual, post, rtol=1e-4, atol=1e-5)
+        assert not torch.allclose(actual, pre, rtol=1e-3, atol=1e-4), (
+            "pre- and post-layernorm are indistinguishable here, so this test proves nothing"
+        )
+
+
+def test_compute_indexer_loss_warns_without_layernorms(unit_test_model, caplog):  # noqa: F811
+    """Omitting input_layernorms is a silent correctness bug, so it must at least warn."""
+    model = unit_test_model
+    press = GQAIndexerPress(compression_ratio=0.5)
+    press.post_init_from_model(model)
+    input_ids = torch.randint(0, 1024, (1, 12), device=model.device)
+    outputs = model(input_ids, output_attentions=True, output_hidden_states=True, use_cache=False)
+
+    with caplog.at_level("WARNING"):
+        without, _ = compute_indexer_loss(
+            press, get_attention_modules(model), outputs.hidden_states, outputs.attentions,
+            IndexerTrainConfig(stage="dense"),
+        )
+    assert "post-layernorm" in caplog.text.lower()
+
+    with_norms, _ = compute_indexer_loss(
+        press, get_attention_modules(model), outputs.hidden_states, outputs.attentions,
+        IndexerTrainConfig(stage="dense"),
+        input_layernorms=get_input_layernorms(model),
+    )
+    assert not torch.allclose(without, with_norms), (
+        "the two students must differ, or the layernorm argument would be pointless"
+    )

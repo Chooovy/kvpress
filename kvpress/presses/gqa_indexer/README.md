@@ -100,7 +100,7 @@ eval.
 from kvpress import GQAIndexerPress
 from kvpress.presses.gqa_indexer import (
     IndexerTrainConfig, compute_indexer_loss, freeze_all_but_indexer,
-    get_attention_modules, indexer_state_dict,
+    get_attention_modules, get_input_layernorms, indexer_state_dict,
 )
 
 press = GQAIndexerPress(compression_ratio=0.5)
@@ -113,13 +113,26 @@ loss, per_layer = compute_indexer_loss(
     press, get_attention_modules(model), out.hidden_states, out.attentions,
     IndexerTrainConfig(stage="dense"),
     attention_mask=attention_mask, labels=labels,
+    input_layernorms=get_input_layernorms(model),   # required; see below
 )
 loss.backward(); optimizer.step()
 torch.save(indexer_state_dict(model), "indexer.pt")
 ```
 
-Note `compute_indexer_loss` scores layer `i` from `hidden_states[i]` (its **input**), not
-`hidden_states[i + 1]`, which is what the attention layer actually consumes.
+**The student must be the one the press actually runs.** Two easy ways to get this wrong,
+neither of which fails loudly — the loss falls, gradients flow, and eval is just quietly worse:
+
+1. `compute_indexer_loss` scores layer `i` from `hidden_states[i]` (its **input**), not
+   `hidden_states[i + 1]` — the latter would hand the indexer the layer's own output.
+2. The decoder block applies `input_layernorm` *before* calling `self_attn`, and kvpress hooks
+   `self_attn`. So at inference the indexer sees the **post-layernorm** tensor, while
+   `output_hidden_states[i]` is the **pre**-layernorm one. Pass `input_layernorms` so the two
+   agree; omitting it warns.
+
+`FusedIndexerTrainer` has neither problem — it hooks `self_attn` itself, so it reads exactly
+what the press reads. This is why the fused and dense losses differ by more than `H(p̄)` if the
+layernorms are omitted, and it is what `test_dense_loss_scores_the_post_layernorm_hidden_states`
+pins.
 
 The teacher is grouped **per KV group**, not averaged over all heads — matching MiniMax M3
 Eq. 9. Averaging across groups would give every indexer head an identical target and waste
@@ -407,6 +420,12 @@ Rejection is the *correct* outcome, not a limitation: a wrong decomposition woul
 against a mask the student never sees, with nothing downstream to catch it. Verified by an
 exhaustive random sweep — every accepted mask rebuilds exactly from `(causal, keep)`, and every
 non-decomposable one is rejected.
+
+Pass `bsz` to `decompose_mask` whenever the result feeds a kernel. `build_indexer_mask` emits
+batch 1 when there is no `attention_mask`, and the kernel indexes `KEEP` with raw pointer
+arithmetic that **cannot broadcast** — a `(1, Sk)` vector is read out of bounds for every batch
+after the first, which shows up as batch 0 being perfectly correct and the rest being garbage.
+`triton_indexer_ce_rows` rejects a short keep batch rather than trusting the caller.
 
 **Causal early exit.** A query block starting at `m` sees keys only up to
 `m + BLOCK_M − 1 + query_offset`, so the key loop stops there rather than running to `Sk`.

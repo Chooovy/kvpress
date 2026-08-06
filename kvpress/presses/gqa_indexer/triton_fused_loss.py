@@ -558,6 +558,17 @@ def triton_indexer_ce_rows(
         )
     if block_m & (block_m - 1) or block_n & (block_n - 1):
         raise ValueError(f"block sizes must be powers of two, got {block_m}, {block_n}")
+    if keep is not None:
+        # The kernel reads KEEP[off_b * stride + n] with off_b up to bsz - 1, so a
+        # short batch axis is an out-of-bounds read, not a broadcast. Checked here rather
+        # than trusted, because the symptom is garbage values in the trailing batches
+        # while batch 0 stays perfectly correct.
+        expected = (q_idx.shape[0], k_idx.shape[1])
+        if tuple(keep.shape) != expected:
+            raise ValueError(
+                f"keep must be exactly (B, Sk) = {expected}, got {tuple(keep.shape)}; the "
+                "kernel indexes it per batch and cannot broadcast a size-1 axis"
+            )
 
     if query_offset is None:
         query_offset = k_idx.shape[1] - q_idx.shape[2]
@@ -577,7 +588,11 @@ def triton_indexer_ce_rows(
 
 
 def decompose_mask(
-    mask: torch.Tensor | None, q_len: int, k_len: int, query_offset: int
+    mask: torch.Tensor | None,
+    q_len: int,
+    k_len: int,
+    query_offset: int,
+    bsz: int | None = None,
 ) -> tuple[bool, torch.Tensor | None]:
     """
     Split an additive mask into "causal + per-key padding", if it is expressible that way.
@@ -594,6 +609,11 @@ def decompose_mask(
 
     ``keep`` is ``None`` when the mask is purely causal (no padding at all), which lets the
     kernel skip the keep-mask load entirely.
+
+    Pass ``bsz`` whenever the result will reach a kernel. ``build_indexer_mask`` emits batch 1
+    when there is no ``attention_mask``, and the kernels index ``KEEP`` with raw pointer
+    arithmetic that cannot broadcast -- a ``(1, Sk)`` vector would be read out of bounds for
+    every batch but the first.
 
     Verified by an exhaustive random sweep (3000 masks across causal / padded /
     random-per-pair / sliding-window shapes): every accepted mask rebuilds exactly from
@@ -625,9 +645,22 @@ def decompose_mask(
     if not bool((reconstructed == (allowed & visible)).all()):
         return False, None
 
-    keep = per_key.squeeze(1)  # (B, Sk)
+    keep = per_key.squeeze(1)  # (B_mask, Sk)
     if bool(keep.all()):
         return True, None
+
+    # build_indexer_mask emits batch 1 when there is no attention_mask, but the kernel
+    # indexes KEEP with off_b up to bsz - 1: handing back a (1, Sk) tensor would make it
+    # read past the end of the buffer for every batch but the first. Materialize the batch
+    # axis instead of relying on a broadcast the raw pointer arithmetic cannot see.
+    if bsz is not None:
+        if keep.shape[0] == 1:
+            keep = keep.expand(bsz, k_len)
+        elif keep.shape[0] != bsz:
+            raise ValueError(
+                f"mask batch {keep.shape[0]} is neither 1 nor bsz={bsz}; the kernels index "
+                "the keep vector per batch and cannot broadcast it"
+            )
     return True, keep.to(torch.int8).contiguous()
 
 

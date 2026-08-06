@@ -220,15 +220,23 @@ def compute_indexer_loss(
     attention_mask: torch.Tensor | None = None,
     labels: torch.Tensor | None = None,
     position_embeddings: tuple | None = None,
+    input_layernorms: list[nn.Module] | None = None,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """
     Average the per-layer indexer loss over all layers.
 
     ``hidden_states`` is the tuple from ``output_hidden_states=True``, which has
     ``num_layers + 1`` entries: index 0 is the embedding output and index ``i + 1`` is the
-    output of layer ``i``. Layer ``i``'s attention *consumes* ``hidden_states[i]``, so that
-    is the tensor the indexer must see -- using ``i + 1`` would feed it the layer's own
-    output and quietly hand it information the real forward pass never has.
+    output of layer ``i``. Layer ``i``'s *block* consumes ``hidden_states[i]``, so that is the
+    right starting point -- using ``i + 1`` would feed the indexer the layer's own output and
+    quietly hand it information the real forward pass never has.
+
+    But the block applies ``input_layernorm`` before calling ``self_attn``, and kvpress hooks
+    ``self_attn`` -- so at inference the indexer sees the **post-layernorm** tensor.
+    ``input_layernorms`` must therefore be passed for the student here to match the student
+    the press actually runs; :func:`get_input_layernorms` extracts them. Omitting them trains
+    the indexer on a distribution it never sees, which does not fail loudly: the loss falls,
+    the gradients flow, and eval is simply worse than it should be.
 
     Returns
     -------
@@ -242,11 +250,23 @@ def compute_indexer_loss(
             f"expected at least {len(attentions)} hidden_states, got {len(hidden_states)}; "
             "pass output_hidden_states=True"
         )
+    if input_layernorms is not None and len(input_layernorms) < len(attentions):
+        raise ValueError(
+            f"expected at least {len(attentions)} input_layernorms, got {len(input_layernorms)}"
+        )
+    if input_layernorms is None:
+        logger.warning(
+            "compute_indexer_loss called without input_layernorms: the indexer will be trained "
+            "on the pre-layernorm hidden states, but at inference kvpress hooks self_attn and "
+            "so feeds it the POST-layernorm tensor. Pass get_input_layernorms(model)."
+        )
 
     per_layer = []
     for layer_idx, attn in enumerate(attentions):
         module = attn_modules[layer_idx]
         layer_input = hidden_states[layer_idx]
+        if input_layernorms is not None:
+            layer_input = input_layernorms[layer_idx](layer_input)
 
         kwargs = {"attention_mask": attention_mask}
         if position_embeddings is not None:
@@ -260,6 +280,17 @@ def compute_indexer_loss(
         )
 
     return torch.stack(per_layer).mean(), per_layer
+
+
+def get_input_layernorms(model: nn.Module) -> list[nn.Module]:
+    """
+    Return each layer's ``input_layernorm``, in layer order.
+
+    Needed by :func:`compute_indexer_loss` so its student matches the one the press runs at
+    inference: the decoder block normalizes before calling ``self_attn``, and kvpress hooks
+    ``self_attn``.
+    """
+    return [layer.input_layernorm for layer in get_language_model(model).layers]
 
 
 def freeze_all_but_indexer(model: nn.Module, scorer_attr: str = "indexer") -> list[nn.Parameter]:

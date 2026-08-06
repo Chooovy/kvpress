@@ -283,7 +283,9 @@ class FusedIndexerTrainer:
             )
 
         if self.use_triton(indexer, hidden_states, query_states, key_states):
-            ok, keep = decompose_mask(mask, q_len, k_len, k_len - q_len)
+            ok, keep = decompose_mask(
+                mask, q_len, k_len, k_len - q_len, bsz=hidden_states.shape[0]
+            )
             if ok:
                 self.backend_used = "triton"
                 return triton_indexer_loss(

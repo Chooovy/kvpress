@@ -286,14 +286,23 @@ def test_forward_matches_the_torch_path(block_m, block_n):
 @requires_triton
 @pytest.mark.parametrize("q_len,k_len", [(16, 16), (8, 24), (24, 8), (17, 17), (1, 16)])
 def test_forward_handles_ragged_shapes(q_len, k_len):
-    """Shapes that are not multiples of the block size exercise the boundary masking."""
+    """
+    Shapes that are not multiples of the block size exercise the boundary masking.
+
+    ``Sq > Sk`` is the interesting one: ``query_offset = Sk - Sq`` goes negative, so the
+    leading ``Sq - Sk`` rows see no key at all -- 16 of 24 rows at (24, 8). Those are compared
+    only for finiteness, since the two paths deliberately disagree there (see
+    :func:`live_rows`).
+    """
     case = make_case(q_len=q_len, k_len=k_len)
     got = triton_indexer_ce_rows(
         case["q_idx"], case["k_idx"], case["q_tea"], case["k_tea"], case["lse"],
         scaling=case["scaling"], block_m=16, block_n=16,
     )
-    torch.testing.assert_close(got, torch_rows(case), rtol=2e-5, atol=2e-5)
     assert torch.isfinite(got).all()
+    live = live_rows(case["mask"], case["q_idx"].shape[0], case["h"])
+    torch.testing.assert_close(got[live], torch_rows(case)[live], rtol=2e-5, atol=2e-5)
+    assert live.any(), "every row was dead; this shape tests nothing"
 
 
 @requires_triton
@@ -308,7 +317,7 @@ def test_forward_handles_padding():
         case["q_tea"], case["k_tea"], case["scaling"], mask=mask, key_tile=8
     )
 
-    ok, keep = decompose_mask(mask, 16, 16, 0)
+    ok, keep = decompose_mask(mask, 16, 16, 0, bsz=case["q_idx"].shape[0])
     assert ok and keep is not None
 
     got = triton_indexer_ce_rows(
@@ -337,8 +346,12 @@ def test_fully_masked_rows_stay_finite():
     case["lse"] = teacher_lse_from_qk(
         case["q_tea"], case["k_tea"], case["scaling"], mask=mask, key_tile=8
     )
-    ok, keep = decompose_mask(mask, 16, 16, 0)
+    ok, keep = decompose_mask(mask, 16, 16, 0, bsz=case["q_idx"].shape[0])
     assert ok
+    assert keep.shape == (case["q_idx"].shape[0], 16), (
+        "a causal-only mask is batch-1; it must be materialized to (B, Sk) or the kernel "
+        "reads out of bounds for every batch after the first"
+    )
 
     got = triton_indexer_ce_rows(
         case["q_idx"], case["k_idx"], case["q_tea"], case["k_tea"], case["lse"],
@@ -384,7 +397,7 @@ def test_dead_rows_are_excluded_by_the_row_weighting():
     )
     lse = teacher_lse_from_qk(q_tea, k_tea, scaling, mask=mask, key_tile=8)
     row_valid = (mask > MASK_NEG / 2).any(dim=-1)  # (B, 1, Sq), drops the dead rows
-    ok, keep = decompose_mask(mask, q_len, q_len, 0)
+    ok, keep = decompose_mask(mask, q_len, q_len, 0, bsz=bsz)
     assert ok
 
     triton_loss = triton_indexer_loss(
@@ -549,4 +562,50 @@ def test_rejects_pre_expanded_teacher_keys():
         triton_indexer_ce_rows(
             case["q_idx"], case["k_idx"], case["q_tea"], expanded, case["lse"],
             scaling=case["scaling"],
+        )
+
+
+def test_causal_only_mask_is_materialized_to_the_full_batch():
+    """
+    A (1, Sk) keep vector would be read out of bounds for every batch after the first.
+
+    build_indexer_mask emits batch 1 when there is no attention_mask, and the kernel indexes
+    KEEP with raw pointer arithmetic that cannot broadcast. The symptom is the nastiest kind:
+    batch 0 comes out perfectly correct while the rest read whatever follows the buffer.
+    """
+    q_len = k_len = 8
+    mask = build_indexer_mask(q_len, k_len, torch.device("cpu")).clone()
+    mask[..., :3] = MASK_NEG  # per-key, so it decomposes -- and mask batch is 1
+    assert mask.shape[0] == 1
+
+    _, keep_broadcast = decompose_mask(mask, q_len, k_len, 0)
+    assert keep_broadcast.shape == (1, k_len), "precondition: the mask really is batch-1"
+
+    ok, keep = decompose_mask(mask, q_len, k_len, 0, bsz=4)
+    assert ok
+    assert keep.shape == (4, k_len)
+    assert keep.is_contiguous(), "the kernel indexes it with plain strides"
+    for b in range(4):
+        torch.testing.assert_close(keep[b], keep_broadcast[0])
+
+
+def test_decompose_mask_rejects_a_batch_it_cannot_expand():
+    q_len = k_len = 8
+    attention_mask = torch.ones(3, k_len, dtype=torch.long)
+    attention_mask[0, :2] = 0
+    mask = build_indexer_mask(q_len, k_len, torch.device("cpu"), attention_mask=attention_mask)
+    with pytest.raises(ValueError, match="neither 1 nor bsz"):
+        decompose_mask(mask, q_len, k_len, 0, bsz=2)
+
+
+def test_rows_rejects_a_short_keep_batch():
+    """The kernel entry point must refuse the shape rather than read past the buffer."""
+    if not HAS_TRITON:
+        pytest.skip("Triton not installed")
+    case = make_case()
+    short = torch.ones(1, case["k_len"], dtype=torch.int8, device=case["q_idx"].device)
+    with pytest.raises(ValueError, match=r"keep must be exactly"):
+        triton_indexer_ce_rows(
+            case["q_idx"], case["k_idx"], case["q_tea"], case["k_tea"], case["lse"],
+            scaling=case["scaling"], keep=short,
         )

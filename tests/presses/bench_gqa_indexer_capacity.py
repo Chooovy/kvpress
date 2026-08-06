@@ -148,30 +148,61 @@ def predict_max_length(budget_bytes: float, bytes_per_token: float) -> int:
 # Model construction
 # ----------------------------------------------------------------------
 def build_model(layers: int | None, pretrained: bool, device: str, dtype: torch.dtype):
-    """Qwen3-8B geometry. Untrained by default -- capacity depends on shape, not weights."""
-    from transformers import AutoConfig, AutoModelForCausalLM
+    """
+    Qwen3-8B geometry. Untrained by default -- capacity depends on shape, not weights.
+
+    Neither ``dtype`` nor ``attn_implementation`` is passed as a ``from_config`` kwarg:
+    whether that function consumes them or forwards them to ``Model.__init__`` (where they are
+    a ``TypeError``) varies by transformers version. They go on the config instead, which newer
+    versions honour and older ones ignore, and the explicit cast below covers the latter.
+    """
+    from transformers import AutoModelForCausalLM
 
     if pretrained:
-        model = AutoModelForCausalLM.from_pretrained(
-            "Qwen/Qwen3-8B", dtype=dtype, attn_implementation="sdpa"
-        )
+        # `dtype` replaced `torch_dtype` in the same release wave that changed _from_config,
+        # so accept either rather than guessing which era the installed version is from.
+        try:
+            model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", dtype=dtype)
+        except TypeError:
+            model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", torch_dtype=dtype)
+        if layers is not None:
+            # Keep the PREFIX: FusedIndexerTrainer reads the KV cache by module.layer_idx, so
+            # the surviving indices must stay 0..N-1 and contiguous. Slicing from the end
+            # would leave layer_idx values that no longer match their cache slots.
+            model.model.layers = model.model.layers[:layers]
+            model.config.num_hidden_layers = layers
     else:
-        config = AutoConfig.for_model("qwen3", **QWEN3_8B)
+        from transformers import Qwen3Config
+
+        # Qwen3Config directly rather than AutoConfig.for_model: same result, but it fails at
+        # import with a clear name if the installed transformers predates Qwen3, instead of
+        # raising "Unrecognized model identifier" from inside the registry.
+        config = Qwen3Config(**QWEN3_8B)
         if layers is not None:
             config.num_hidden_layers = layers
-        config.attn_implementation = "sdpa"
-        # from_config skips the (slow, irrelevant) weight download.
-        model = AutoModelForCausalLM.from_config(config, dtype=dtype)
+        # Newer transformers reads `dtype` off the config (`kwargs.pop("dtype", config.dtype)`),
+        # so this builds directly in bf16 and avoids a transient 33 GB fp32 model on CPU. Older
+        # versions ignore the field, and the cast below then fixes it up.
+        config.dtype = dtype
+        config.torch_dtype = dtype
+        model = AutoModelForCausalLM.from_config(config)
 
-    if layers is not None and pretrained:
-        # Keep the PREFIX: FusedIndexerTrainer reads the KV cache by module.layer_idx, so the
-        # surviving indices must stay 0..N-1 and contiguous. Slicing from the end would leave
-        # layer_idx values that no longer match their cache slots.
-        language_model = model.model
-        language_model.layers = language_model.layers[:layers]
-        model.config.num_hidden_layers = layers
+    model = model.to(device=device, dtype=dtype).eval()
+    set_attn_implementation(model, "sdpa")
+    return model
 
-    return model.to(device).eval()
+
+def set_attn_implementation(model, name: str) -> None:
+    """
+    Point the model at an attention kernel, on whichever config carries the flag.
+
+    Assigning ``config._attn_implementation`` directly is what
+    :func:`~kvpress.presses.gqa_indexer.teacher_lse.capture_teacher_lse` already does, and it
+    sidesteps the ``from_config`` kwarg incompatibility entirely.
+    """
+    for config in (model.config, getattr(model.config, "text_config", None)):
+        if config is not None:
+            config._attn_implementation = name
 
 
 def reset_peak() -> None:

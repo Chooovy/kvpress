@@ -805,11 +805,12 @@ def test_capacity_model_is_self_consistent():
 
 def test_capacity_model_prices_the_retained_teacher():
     """
-    Freeing the teacher closure must be worth ~3x on Qwen3-8B geometry.
+    The retained teacher must be the model's dtype, and the keys must not be counted twice.
 
-    ctx.teacher_alpha holds fp32 copies of the teacher's Q and K, and there is one autograd
-    node per layer -- so all 36 layers stay resident until backward(). This is the number the
-    benchmark exists to report, so it is pinned here rather than left as a claim in a docstring.
+    ctx.teacher_alpha holds the teacher query with one autograd node per layer, so all 36
+    layers stay resident until backward(). Two things keep that cheap: the upcast to fp32
+    happens per tile rather than up front, and the keys are held by reference to the KV cache,
+    which is resident anyway. Both are pinned here rather than left as docstring claims.
     """
     from tests.presses.bench_gqa_indexer_capacity import predict_bytes_per_token
 
@@ -817,17 +818,17 @@ def test_capacity_model_prices_the_retained_teacher():
     retained = predict_bytes_per_token(**geometry, stage="dense", retain_teacher=True)
     freed = predict_bytes_per_token(**geometry, stage="dense", retain_teacher=False)
 
-    assert "teacher_q_fp32" in retained and "teacher_q_fp32" not in freed
-    assert retained["total"] / freed["total"] == pytest.approx(3.0, abs=0.1)
+    assert "teacher_q" in retained and "teacher_q" not in freed
 
-    # The fp32 teacher Q alone is the single largest term.
-    biggest = max((k for k in retained if k != "total"), key=lambda k: retained[k])
-    assert biggest == "teacher_q_fp32"
+    # Stored at the model's width, not fp32: 32 heads x 128 dim x 2 bytes x 36 layers.
+    assert retained["teacher_q"] == 32 * 128 * 2 * 36
 
-    # The KEYS stay at n_kv_heads: make_recompute_teacher broadcasts over the group axis
-    # instead of calling repeat_interleave, which would make this term equal teacher_q_fp32
-    # and cost group_size times as much for identical arithmetic.
-    assert retained["teacher_k_fp32"] * 4 == retained["teacher_q_fp32"]
+    # No teacher_k term at all -- the closure aliases the cache rather than copying it, so
+    # counting it here would double-charge for kv_cache.
+    assert not any(key.startswith("teacher_k") for key in retained), sorted(retained)
+
+    # Recomputing the query in backward is the remaining opportunity, now well under 2x.
+    assert 1.5 < retained["total"] / freed["total"] < 2.0
 
 
 def test_capacity_model_agrees_with_a_measured_slope(unit_test_model):  # noqa: F811
@@ -937,5 +938,5 @@ def test_capacity_model_reproduces_the_measured_h20_run():
     )
 
     # The support is still the largest single term at this topk, just half what it was.
-    assert itemized["support"] > itemized["teacher_q_fp32"]
+    assert itemized["support"] > itemized["teacher_q"]
     assert itemized["support"] / itemized["total"] > 0.6

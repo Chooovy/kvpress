@@ -495,9 +495,33 @@ any real sequence. `gather`/`index_add_` require int64, so the cast happens per 
 full-size bool for zero information — 576 KiB/token at `topk=2048`. Backward recomputes it per
 tile.
 
+**No fp32 teacher copy.** `make_recompute_teacher` used to do `.to(float32)` on entry, so
+`ctx.teacher_alpha` retained an fp32 copy of the whole teacher **per layer** — 720 KiB/token
+across 36 layers, the largest single term. The upcast now happens per *tile*, so what the closure
+holds is the caller's own bf16 tensors. For the keys that means a reference to the **KV cache**,
+which is resident anyway — the copy disappears rather than merely shrinking.
+
+This is bit-identical, not approximately equal: bf16 and fp16 have no more mantissa bits and no
+more exponent bits than fp32, so widening is lossless, and `.to()` is elementwise so it commutes
+with slicing. `test_per_tile_upcast_is_bit_identical` asserts `torch.equal`, not a tolerance.
+
+| | before | after |
+|---|---|---|
+| teacher Q | 576 KiB/tok (fp32) | **288** (bf16) |
+| teacher K | 144 KiB/tok (fp32) | **0** (aliases the cache) |
+
+### Cumulative
+
+| config | original | after group-broadcast + int32 | after teacher retention | max L then → now |
+|---|---|---|---|---|
+| dense | 1518 KiB/tok | 1086 | **654** | 54.8K → **127.4K** (2.3×) |
+| sparse topk=512 | 2814 KiB/tok | 1662 | **1230** | 27.7K → **66.0K** (2.4×) |
+| sparse topk=2048 | 6702 KiB/tok | 3390 | **2958** | 11.6K → **27.4K** (2.4×) |
+
 ### Still on the table
 
-The fp32 teacher Q is now the largest dense-stage term (576 KiB/token, 53%). It is retained
-because `ctx.teacher_alpha` closes over it. Dropping that — recomputing Q in backward from the
-saved hidden states, or storing it in bf16 — would give another ~2× on top. `predict_bytes_per_token(retain_teacher=False)`
-prices it.
+`teacher_q` (288 KiB/token, 44% of the dense total) could go to zero: it is derivable from
+`hidden_states`, which the student already retains for its own `dQ`. Recomputing it in backward
+costs one `q_proj` GEMM plus RoPE per tile and would give another ~1.8×.
+`predict_bytes_per_token(retain_teacher=False)` prices it. The trade is compute for memory, so it
+is worth doing only once the length is the binding constraint rather than the step time.

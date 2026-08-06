@@ -34,6 +34,7 @@ from kvpress.presses.gqa_indexer.aggregate import (
 )
 from kvpress.presses.gqa_indexer.fused_loss import (
     accumulation_dtype,
+    group_view,
     fused_indexer_ce_rows,
     fused_indexer_loss,
     make_recompute_teacher,
@@ -132,6 +133,7 @@ __all__ = [
     "fused_indexer_ce_rows",
     "fused_indexer_loss",
     "accumulation_dtype",
+    "group_view",
     "FusedIndexerTrainer",
     "attention_scaling",
     "fused_indexer_training_step",

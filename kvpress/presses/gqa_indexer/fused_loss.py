@@ -344,10 +344,20 @@ def make_recompute_teacher(
 
     ``key_states`` may carry either ``H`` heads or ``H // group_size`` KV heads. The latter is
     **not** expanded: a ``repeat_interleave`` would materialize a real ``group_size``-fold copy
-    that then lives as long as this closure, which the autograd graph holds until ``backward()``
-    -- 576 vs 144 KiB/token/layer on Qwen3-8B, i.e. 432 KiB/token across 36 layers. Instead the
-    query is viewed as ``(B, h, group_size, Sq, d)`` and the einsum broadcasts over the group
-    axis, which is exact (verified to 0.0) and keeps the head mapping ``i -> i // group_size``.
+    that then lives as long as this closure, which the autograd graph holds until ``backward()``.
+    Instead the query is viewed as ``(B, h, group_size, Sq, d)`` and the einsum broadcasts over
+    the group axis, which is exact (verified to 0.0) and keeps the head mapping
+    ``i -> i // group_size``.
+
+    Nor is either tensor upcast here. ``.to(float32)`` on entry would retain an fp32 copy of the
+    whole teacher **per layer** -- 720 KiB/token across 36 layers on Qwen3-8B, the single largest
+    term in the dense stage. The upcast happens per *tile* instead, inside the closure, so what
+    is retained is the caller's own bf16 tensors: for the keys that is the KV cache, which is
+    resident anyway, making the copy free rather than merely smaller.
+
+    The per-tile upcast is bit-identical to upcasting once. bf16 and fp16 have no more mantissa
+    bits than fp32 and the same or fewer exponent bits, so widening is exact, and ``.to()`` is
+    elementwise -- slicing then widening equals widening then slicing.
 
     Parameters
     ----------
@@ -371,36 +381,33 @@ def make_recompute_teacher(
         raise ValueError(f"H={n_heads} is not divisible by key heads={n_kv}")
 
     acc = accumulation_dtype(query_states, key_states)
-    k_acc = key_states.to(acc)
-    if n_kv == n_heads:
-        q_acc = query_states.to(acc)
-
-        def teacher_alpha(q_start: int, q_stop: int, k_start: int, k_stop: int) -> torch.Tensor:
-            return (
-                torch.einsum(
-                    "bhqd,bhkd->bhqk",
-                    q_acc[:, :, q_start:q_stop],
-                    k_acc[:, :, k_start:k_stop],
-                )
-                * scaling
-            )
-
-        return teacher_alpha
-
-    # Group-broadcast form: q is (B, h, g, Sq, d) and k stays at h heads.
-    group = n_heads // n_kv
-    dim = query_states.shape[-1]
-    q_grp = query_states.to(acc).view(bsz, n_kv, group, -1, dim)
+    grouped = n_kv != n_heads
+    q_view = group_view(query_states, n_kv, n_heads) if grouped else query_states
 
     def teacher_alpha(q_start: int, q_stop: int, k_start: int, k_stop: int) -> torch.Tensor:
-        alpha = torch.einsum(
-            "bhgqd,bhkd->bhgqk",
-            q_grp[:, :, :, q_start:q_stop],
-            k_acc[:, :, k_start:k_stop],
-        )
+        k_tile = key_states[:, :, k_start:k_stop].to(acc)
+        if not grouped:
+            q_tile = q_view[:, :, q_start:q_stop].to(acc)
+            return torch.einsum("bhqd,bhkd->bhqk", q_tile, k_tile) * scaling
+        q_tile = q_view[:, :, :, q_start:q_stop].to(acc)
+        alpha = torch.einsum("bhgqd,bhkd->bhgqk", q_tile, k_tile)
         return alpha.reshape(bsz, n_heads, q_stop - q_start, k_stop - k_start) * scaling
 
     return teacher_alpha
+
+
+def group_view(query_states: torch.Tensor, n_kv: int, n_heads: int) -> torch.Tensor:
+    """
+    View ``(B, H, Sq, d)`` as ``(B, h, g, Sq, d)`` without copying when possible.
+
+    ``view`` needs compatible strides. A non-contiguous teacher query forces a copy, but in the
+    caller's own dtype rather than fp32 -- and :func:`~.fused_trainer.teacher_query_states`
+    produces a contiguous tensor, so the copy does not normally happen.
+    """
+    if not query_states.is_contiguous():
+        query_states = query_states.contiguous()
+    bsz, _, q_len, dim = query_states.shape
+    return query_states.view(bsz, n_kv, n_heads // n_kv, q_len, dim)
 
 
 def teacher_lse_from_qk(
@@ -430,20 +437,17 @@ def teacher_lse_from_qk(
     torch.Tensor
         (B, H, Sq) logsumexp over the key axis.
     """
-    bsz, n_heads, q_len, dim = query_states.shape
+    bsz, n_heads, q_len = query_states.shape[0], query_states.shape[1], query_states.shape[2]
     k_len = key_states.shape[2]
     n_kv = key_states.shape[1]
     if n_kv != n_heads and n_heads % n_kv != 0:
         raise ValueError(f"H={n_heads} is not divisible by key heads={n_kv}")
 
     acc = accumulation_dtype(query_states, key_states)
-    k_acc = key_states.to(acc)
     grouped = n_kv != n_heads
-    group = n_heads // n_kv
-    if grouped:
-        q_acc = query_states.to(acc).view(bsz, n_kv, group, q_len, dim)
-    else:
-        q_acc = query_states.to(acc)
+    # Upcast per tile, not up front: this runs under no_grad so an fp32 copy would be
+    # transient, but it is still O(L) of extra peak for the same arithmetic.
+    q_view = group_view(query_states, n_kv, n_heads) if grouped else query_states
 
     lse = torch.empty((bsz, n_heads, q_len), device=query_states.device, dtype=acc)
     for q_start in range(0, q_len, query_tile):
@@ -455,15 +459,16 @@ def teacher_lse_from_qk(
         run_sum = torch.zeros_like(run_max)
         for start in range(0, k_len, key_tile):
             stop = min(start + key_tile, k_len)
+            k_tile = key_states[:, :, start:stop].to(acc)
             if grouped:
                 logits = torch.einsum(
                     "bhgqd,bhkd->bhgqk",
-                    q_acc[:, :, :, q_start:q_stop],
-                    k_acc[:, :, start:stop],
+                    q_view[:, :, :, q_start:q_stop].to(acc),
+                    k_tile,
                 ).reshape(bsz, n_heads, tile_q, stop - start)
             else:
                 logits = torch.einsum(
-                    "bhqd,bhkd->bhqk", q_acc[:, :, q_start:q_stop], k_acc[:, :, start:stop]
+                    "bhqd,bhkd->bhqk", q_view[:, :, q_start:q_stop].to(acc), k_tile
                 )
             logits = logits * scaling
             if mask is not None:

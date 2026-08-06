@@ -163,8 +163,9 @@ def predict_bytes_per_token(
     independent of ``L`` and so belongs to the intercept, not the slope -- see
     :func:`predict_tile_scratch`, which is a multi-GiB term for stage 2.
 
-    ``retain_teacher=False`` reports the intended footprint -- what it would be if the teacher
-    closure were dropped after each layer's loss -- so the caller can price the leak.
+    ``retain_teacher=False`` reports what it would be if the teacher query were recomputed in
+    backward from the (already retained) hidden states rather than held by the closure, so the
+    caller can price the remaining opportunity.
     """
     fp32, bf16 = 4, 2
     per_layer: dict[str, float] = {
@@ -175,11 +176,11 @@ def predict_bytes_per_token(
         "teacher_lse": n_heads * fp32,
     }
     if retain_teacher:
-        # ctx.teacher_alpha closes over fp32 copies of the teacher's Q and K. The keys stay at
-        # n_kv_heads: make_recompute_teacher broadcasts over the group axis rather than calling
-        # repeat_interleave, which would otherwise make this n_heads and cost 4x on Qwen3.
-        per_layer["teacher_q_fp32"] = n_heads * head_dim * fp32
-        per_layer["teacher_k_fp32"] = n_kv_heads * head_dim * fp32
+        # ctx.teacher_alpha closes over the teacher's Q, in the MODEL's dtype -- the upcast to
+        # fp32 happens per tile, so no fp32 copy is retained. The keys are not counted at all:
+        # the closure holds a reference to the KV cache, which is already resident and priced
+        # below, so retaining it costs nothing beyond that.
+        per_layer["teacher_q"] = n_heads * head_dim * bf16
     if stage == "sparse":
         # support only, as int32. `valid` is not saved -- it is exactly `support >= 0`, so
         # backward recomputes it per tile instead of retaining a full-size bool.
@@ -214,7 +215,8 @@ def predict_tile_scratch(
     fp32 = 4
     # Both gathers run at n_kv_heads: a KV group shares one support, so the teacher gathers
     # once per KV head and broadcasts the query over the group axis. Before that change the
-    # teacher term was n_heads, i.e. group_size times larger.
+    # teacher term was n_heads, i.e. group_size times larger. Still fp32 because the gathered
+    # tile is upcast for the einsum -- it is the RESIDENT copy that the model dtype saves.
     student = n_kv_heads * query_tile * topk_tile * head_dim * fp32
     teacher = n_kv_heads * query_tile * topk_tile * head_dim * fp32
     return float(student + teacher)

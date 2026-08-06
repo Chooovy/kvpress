@@ -73,7 +73,7 @@ import logging
 
 import torch
 
-from kvpress.presses.gqa_indexer.fused_loss import EPS, accumulation_dtype
+from kvpress.presses.gqa_indexer.fused_loss import EPS, accumulation_dtype, group_view
 from kvpress.presses.gqa_indexer.indexer import GQAIndexer
 from kvpress.presses.gqa_indexer.sparse_support import gather_support_keys
 
@@ -414,34 +414,37 @@ def make_sparse_recompute_teacher(
     bsz = query_states.shape[0]
     dim = key_states.shape[-1]
     acc = accumulation_dtype(query_states, key_states)
-    k_acc = key_states.to(acc)
     kv_heads = n_heads // group_size
     grouped = n_kv != n_heads
+    # Neither tensor is upcast here. This closure is stored on the autograd ctx, so an fp32
+    # copy would be retained per layer -- 720 KiB/token across 36 layers on Qwen3-8B. The
+    # gather reads the caller's own dtype (for the keys, the resident KV cache) and only the
+    # gathered tile is widened, which is bit-identical since widening is exact and elementwise.
     if grouped:
         # View the query as (B, h, g, Sq, d) and leave the keys at h heads, so the gather
         # below runs once per KV head instead of once per attention head. No
         # repeat_interleave: that copy would be group_size times the size for identical
         # arithmetic, and it is the gathered tile -- the largest transient in stage 2.
-        q_acc = query_states.to(acc).view(bsz, n_kv, group_size, -1, dim)
+        q_view = group_view(query_states, n_kv, n_heads)
     else:
-        q_acc = query_states.to(acc)
+        q_view = query_states
 
     def alpha_at(q_start: int, q_stop: int, sup: torch.Tensor) -> torch.Tensor:
         tile_q, tile_k = q_stop - q_start, sup.shape[-1]
         if not grouped:
             sup_h = expand_to_heads(sup, n_heads, group_size)
             flat = sup_h.clamp_min(0).long().reshape(bsz, n_heads, -1, 1).expand(-1, -1, -1, dim)
-            k_gathered = k_acc.gather(2, flat).reshape(*sup_h.shape, dim)
-            return torch.einsum("bhqd,bhqtd->bhqt", q_acc[:, :, q_start:q_stop], k_gathered) * scaling
+            k_gathered = key_states.gather(2, flat).reshape(*sup_h.shape, dim).to(acc)
+            q_tile = q_view[:, :, q_start:q_stop].to(acc)
+            return torch.einsum("bhqd,bhqtd->bhqt", q_tile, k_gathered) * scaling
 
         # A whole KV group shares one support, so gather (B, h, dq, tk, d) -- group_size
         # times smaller than the (B, H, ...) tensor the expanded form would build.
         sup_kv = sup if sup.shape[1] == n_kv else sup[:, ::group_size]
         flat = sup_kv.clamp_min(0).long().reshape(bsz, n_kv, -1, 1).expand(-1, -1, -1, dim)
-        k_gathered = k_acc.gather(2, flat).reshape(bsz, n_kv, tile_q, tile_k, dim)
-        alpha = torch.einsum(
-            "bhgqd,bhqtd->bhgqt", q_acc[:, :, :, q_start:q_stop], k_gathered
-        )
+        k_gathered = key_states.gather(2, flat).reshape(bsz, n_kv, tile_q, tile_k, dim).to(acc)
+        q_tile = q_view[:, :, :, q_start:q_stop].to(acc)
+        alpha = torch.einsum("bhgqd,bhqtd->bhgqt", q_tile, k_gathered)
         return alpha.reshape(bsz, n_heads, tile_q, tile_k) * scaling
 
     if teacher_mode == "global":

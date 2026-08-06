@@ -11,6 +11,7 @@ from kvpress.presses.gqa_indexer import (
     GQAIndexerConfig,
     accumulation_dtype,
     build_indexer_mask,
+    group_view,
     fused_indexer_ce_rows,
     fused_indexer_loss,
     make_recompute_teacher,
@@ -586,3 +587,88 @@ def test_teacher_callable_receives_the_requested_tile_ranges():
         assert q_stop - q_start <= 2 and k_stop - k_start <= 4
     # every (query tile, key tile) pair is visited exactly once
     assert len(set(seen)) == len(seen) == 3 * 2
+
+
+# ----------------------------------------------------------------------
+# Teacher retention
+# ----------------------------------------------------------------------
+def test_teacher_closure_holds_no_upcast_copy():
+    """
+    The teacher closure must retain the caller's tensors, not fp32 copies of them.
+
+    ``ctx.teacher_alpha`` is stored on the autograd context, so anything the closure captures
+    stays resident for *every layer* until ``backward()``. An ``.to(float32)`` on entry made
+    that 720 KiB/token across 36 layers on Qwen3-8B -- the largest single term. Checked by
+    identity, since a value comparison would pass either way.
+    """
+    torch.manual_seed(0)
+    q_tea = torch.randn(1, 8, 6, 4, dtype=torch.bfloat16)
+    k_tea = torch.randn(1, 2, 6, 4, dtype=torch.bfloat16)
+    teacher = make_recompute_teacher(q_tea, k_tea, 0.5, 4)
+
+    captured = [cell.cell_contents for cell in (teacher.__closure__ or ())]
+    tensors = [obj for obj in captured if isinstance(obj, torch.Tensor)]
+    assert tensors, "the closure should capture the teacher tensors"
+    for tensor in tensors:
+        assert tensor.dtype == torch.bfloat16, (
+            f"the closure retains a {tensor.dtype} tensor; the upcast belongs inside the tile "
+            "loop, or an fp32 copy of the whole teacher is held per layer"
+        )
+    # The keys must be the caller's own tensor, so the KV cache is aliased rather than copied.
+    assert any(t.data_ptr() == k_tea.data_ptr() for t in tensors), "keys were copied, not aliased"
+
+
+@pytest.mark.parametrize("key_tile,query_tile", [(1, 1), (2, 3), (4, 9), (64, 64)])
+def test_per_tile_upcast_is_bit_identical(key_tile, query_tile):
+    """
+    Upcasting per tile must equal upcasting once -- exactly, not approximately.
+
+    Widening never loses bits (bf16/fp16 have no more mantissa and no more exponent than fp32)
+    and ``.to()`` is elementwise, so it commutes with slicing. Asserting exact equality rather
+    than a tolerance is the point: any difference would mean the tiling changed the arithmetic.
+    """
+    torch.manual_seed(0)
+    bsz, h, group, q_len, k_len, dim = 1, 2, 3, 9, 13, 4
+    q_tea = torch.randn(bsz, h * group, q_len, dim, dtype=torch.bfloat16)
+    k_tea = torch.randn(bsz, h, k_len, dim, dtype=torch.bfloat16)
+    scaling = dim**-0.5
+
+    tiled = make_recompute_teacher(q_tea, k_tea, scaling, group)
+    # Reference: expand and upcast everything up front, the way the old code did.
+    reference = make_recompute_teacher(
+        q_tea.float(), k_tea.float().repeat_interleave(group, dim=1), scaling, group
+    )
+
+    for q_start in range(0, q_len, query_tile):
+        q_stop = min(q_start + query_tile, q_len)
+        for k_start in range(0, k_len, key_tile):
+            k_stop = min(k_start + key_tile, k_len)
+            got = tiled(q_start, q_stop, k_start, k_stop)
+            want = reference(q_start, q_stop, k_start, k_stop)
+            assert torch.equal(got, want), (
+                f"tile ({q_start}:{q_stop}, {k_start}:{k_stop}) differs by "
+                f"{(got - want).abs().max().item()}"
+            )
+
+
+def test_group_view_preserves_the_head_mapping():
+    """
+    ``(B, H, Sq, d) -> (B, h, g, Sq, d)`` must put head ``i`` at ``(i // g, i % g)``.
+
+    Getting this wrong would silently pair each query head with the wrong KV head -- every
+    shape still valid, the loss still finite, the teacher simply wrong.
+    """
+    torch.manual_seed(0)
+    bsz, h, group, q_len, dim = 2, 3, 4, 5, 6
+    q = torch.randn(bsz, h * group, q_len, dim)
+    view = group_view(q, h, h * group)
+    assert view.shape == (bsz, h, group, q_len, dim)
+    for i in range(h * group):
+        torch.testing.assert_close(view[:, i // group, i % group], q[:, i])
+
+
+def test_group_view_avoids_a_copy_when_contiguous():
+    """A view, not a copy: otherwise it reintroduces the allocation it exists to remove."""
+    q = torch.randn(2, 8, 5, 4)
+    assert q.is_contiguous()
+    assert group_view(q, 2, 8).data_ptr() == q.data_ptr()

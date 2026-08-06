@@ -3,7 +3,7 @@
 set -euo pipefail
 
 
-export HF_TOKEN="${HF_TOKEN:-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}"
+export HF_TOKEN="${HF_TOKEN:-}"
 
 DATASET_ID="${DATASET_ID:-sagels/longmino_256k_filtered}"
 LOCAL_DIR="${LOCAL_DIR:-/apdcephfs_zw31/share_303843174/user/marcushaogu/datasets/longmino_256k_filtered}"

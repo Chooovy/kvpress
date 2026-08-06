@@ -463,3 +463,41 @@ two implementations only on live rows.**
 Stage 2 is torch-only for now; `backend="triton"` with `stage="sparse"` raises rather than
 pretending. Fusing it needs top-k inside the kernel, which is a different problem — the
 selection has to be complete before the loss pass can start.
+
+
+## Memory optimizations
+
+Three changes, all bit-exact (verified to 0.0 error), measured against the pre-optimization
+prediction on an H20 (95 GiB, 15.6 GiB weights, B=1, bf16):
+
+| config | before | after | max L before | max L after | |
+|---|---|---|---|---|---|
+| dense | 1518 KiB/tok | 1086 | 54.9K | **76.7K** | 1.4× |
+| sparse topk=512 | 2814 KiB/tok | 1662 | 27.7K | **48.8K** | 1.8× |
+| sparse topk=2048 | 6702 KiB/tok | 3390 | 11.6K | **23.9K** | 2.1× |
+
+**Group-broadcast instead of `repeat_interleave`.** `make_recompute_teacher` used to expand
+KV-head keys to `H` heads with `repeat_interleave`, which materializes a real `group_size`-fold
+copy — and because the autograd graph holds the closure until `backward()`, that copy lived for
+*every layer at once*. It now views the query as `(B, h, g, Sq, d)` and lets the einsum broadcast
+over the group axis: same arithmetic, `group_size`× less memory. 432 KiB/token on Qwen3-8B.
+
+The same change applies to stage 2's gather, where it matters more: a KV group shares one
+support, so the teacher gathers `(B, h, dq, tk, D)` instead of `(B, H, ...)`. That is the largest
+*transient* in stage 2, so the tile scratch drops 4× as well (5.0 → 2.5 GiB at 512×512×128).
+
+**`support` stored as int32.** It only has to address `Sk`, and int32 reaches 2.1e9 — far past
+any real sequence. `gather`/`index_add_` require int64, so the cast happens per *tile*
+(`O(query_tile · topk_tile)` transient) rather than on the resident `(B, h, L, topk)` tensor.
+`sort_support` raises rather than wrapping if `k_len` ever exceeds int32.
+
+**`valid` no longer saved for backward.** It is exactly `support >= 0`, so retaining it stored a
+full-size bool for zero information — 576 KiB/token at `topk=2048`. Backward recomputes it per
+tile.
+
+### Still on the table
+
+The fp32 teacher Q is now the largest dense-stage term (576 KiB/token, 53%). It is retained
+because `ctx.teacher_alpha` closes over it. Dropping that — recomputing Q in backward from the
+saved hidden states, or storing it in bf16 — would give another ~2× on top. `predict_bytes_per_token(retain_teacher=False)`
+prices it.

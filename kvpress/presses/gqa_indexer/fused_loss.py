@@ -342,8 +342,12 @@ def make_recompute_teacher(
     Slicing both axes is what keeps the teacher's contribution to peak memory at
     ``O(query_tile * key_tile)`` rather than ``O(L * key_tile)``.
 
-    ``key_states`` may carry either ``H`` heads or ``H // group_size`` KV heads; the latter
-    is repeated to match, as GQA attention does.
+    ``key_states`` may carry either ``H`` heads or ``H // group_size`` KV heads. The latter is
+    **not** expanded: a ``repeat_interleave`` would materialize a real ``group_size``-fold copy
+    that then lives as long as this closure, which the autograd graph holds until ``backward()``
+    -- 576 vs 144 KiB/token/layer on Qwen3-8B, i.e. 432 KiB/token across 36 layers. Instead the
+    query is viewed as ``(B, h, group_size, Sq, d)`` and the einsum broadcasts over the group
+    axis, which is exact (verified to 0.0) and keeps the head mapping ``i -> i // group_size``.
 
     Parameters
     ----------
@@ -361,26 +365,40 @@ def make_recompute_teacher(
     callable
         ``(q_start, q_stop, k_start, k_stop) -> (B, H, q_stop - q_start, k_stop - k_start)``.
     """
-    n_heads = query_states.shape[1]
+    bsz, n_heads = query_states.shape[0], query_states.shape[1]
     n_kv = key_states.shape[1]
-    if n_kv != n_heads:
-        if n_heads % n_kv != 0:
-            raise ValueError(f"H={n_heads} is not divisible by key heads={n_kv}")
-        key_states = key_states.repeat_interleave(n_heads // n_kv, dim=1)
+    if n_kv != n_heads and n_heads % n_kv != 0:
+        raise ValueError(f"H={n_heads} is not divisible by key heads={n_kv}")
 
     acc = accumulation_dtype(query_states, key_states)
-    q_acc = query_states.to(acc)
     k_acc = key_states.to(acc)
+    if n_kv == n_heads:
+        q_acc = query_states.to(acc)
+
+        def teacher_alpha(q_start: int, q_stop: int, k_start: int, k_stop: int) -> torch.Tensor:
+            return (
+                torch.einsum(
+                    "bhqd,bhkd->bhqk",
+                    q_acc[:, :, q_start:q_stop],
+                    k_acc[:, :, k_start:k_stop],
+                )
+                * scaling
+            )
+
+        return teacher_alpha
+
+    # Group-broadcast form: q is (B, h, g, Sq, d) and k stays at h heads.
+    group = n_heads // n_kv
+    dim = query_states.shape[-1]
+    q_grp = query_states.to(acc).view(bsz, n_kv, group, -1, dim)
 
     def teacher_alpha(q_start: int, q_stop: int, k_start: int, k_stop: int) -> torch.Tensor:
-        return (
-            torch.einsum(
-                "bhqd,bhkd->bhqk",
-                q_acc[:, :, q_start:q_stop],
-                k_acc[:, :, k_start:k_stop],
-            )
-            * scaling
+        alpha = torch.einsum(
+            "bhgqd,bhkd->bhgqk",
+            q_grp[:, :, :, q_start:q_stop],
+            k_acc[:, :, k_start:k_stop],
         )
+        return alpha.reshape(bsz, n_heads, q_stop - q_start, k_stop - k_start) * scaling
 
     return teacher_alpha
 
@@ -402,34 +420,52 @@ def teacher_lse_from_qk(
     second ``H * L^2 * d`` pass but never materializes more than
     ``O(query_tile * key_tile)``, and is exact.
 
+    Like :func:`make_recompute_teacher`, KV-head keys are broadcast over a group axis rather
+    than expanded with ``repeat_interleave``, so no ``group_size``-fold copy is made. This
+    function runs under ``no_grad`` so the copy would be transient, but it is still
+    ``group_size`` times the traffic for the same arithmetic.
+
     Returns
     -------
     torch.Tensor
         (B, H, Sq) logsumexp over the key axis.
     """
-    bsz, n_heads, q_len, _ = query_states.shape
+    bsz, n_heads, q_len, dim = query_states.shape
     k_len = key_states.shape[2]
-    if key_states.shape[1] != n_heads:
-        key_states = key_states.repeat_interleave(n_heads // key_states.shape[1], dim=1)
+    n_kv = key_states.shape[1]
+    if n_kv != n_heads and n_heads % n_kv != 0:
+        raise ValueError(f"H={n_heads} is not divisible by key heads={n_kv}")
 
     acc = accumulation_dtype(query_states, key_states)
-    q_acc = query_states.to(acc)
     k_acc = key_states.to(acc)
+    grouped = n_kv != n_heads
+    group = n_heads // n_kv
+    if grouped:
+        q_acc = query_states.to(acc).view(bsz, n_kv, group, q_len, dim)
+    else:
+        q_acc = query_states.to(acc)
 
     lse = torch.empty((bsz, n_heads, q_len), device=query_states.device, dtype=acc)
     for q_start in range(0, q_len, query_tile):
         q_stop = min(q_start + query_tile, q_len)
-        q_view = q_acc[:, :, q_start:q_stop]
+        tile_q = q_stop - q_start
         run_max = torch.full(
-            (bsz, n_heads, q_stop - q_start),
-            -float("inf"),
-            device=query_states.device,
-            dtype=acc,
+            (bsz, n_heads, tile_q), -float("inf"), device=query_states.device, dtype=acc
         )
         run_sum = torch.zeros_like(run_max)
         for start in range(0, k_len, key_tile):
             stop = min(start + key_tile, k_len)
-            logits = torch.einsum("bhqd,bhkd->bhqk", q_view, k_acc[:, :, start:stop]) * scaling
+            if grouped:
+                logits = torch.einsum(
+                    "bhgqd,bhkd->bhgqk",
+                    q_acc[:, :, :, q_start:q_stop],
+                    k_acc[:, :, start:stop],
+                ).reshape(bsz, n_heads, tile_q, stop - start)
+            else:
+                logits = torch.einsum(
+                    "bhqd,bhkd->bhqk", q_acc[:, :, q_start:q_stop], k_acc[:, :, start:stop]
+                )
+            logits = logits * scaling
             if mask is not None:
                 logits = logits + mask[..., q_start:q_stop, start:stop].to(logits.dtype)
             new_max = torch.maximum(run_max, logits.amax(dim=-1))

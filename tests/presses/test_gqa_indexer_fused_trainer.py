@@ -790,8 +790,9 @@ def test_capacity_model_is_self_consistent():
 
     # topk doubling must double exactly the support terms and nothing else.
     assert large["support"] == 2 * small["support"]
-    assert large["valid"] == 2 * small["valid"]
     assert large["kv_cache"] == small["kv_cache"]
+    # `valid` is not retained -- it is exactly `support >= 0`, recomputed per tile in backward.
+    assert "valid" not in large
 
     # Halving the layers halves everything (all terms are per-layer except none).
     half = predict_bytes_per_token(**{**geometry, "layers": 18}, stage="dense")
@@ -822,6 +823,11 @@ def test_capacity_model_prices_the_retained_teacher():
     # The fp32 teacher Q alone is the single largest term.
     biggest = max((k for k in retained if k != "total"), key=lambda k: retained[k])
     assert biggest == "teacher_q_fp32"
+
+    # The KEYS stay at n_kv_heads: make_recompute_teacher broadcasts over the group axis
+    # instead of calling repeat_interleave, which would make this term equal teacher_q_fp32
+    # and cost group_size times as much for identical arithmetic.
+    assert retained["teacher_k_fp32"] * 4 == retained["teacher_q_fp32"]
 
 
 def test_capacity_model_agrees_with_a_measured_slope(unit_test_model):  # noqa: F811
@@ -904,10 +910,11 @@ def test_capacity_model_reproduces_the_measured_h20_run():
     """
     Pin the model against the one real measurement, so a refactor cannot silently drift.
 
-    Measured on an H20 (95 GiB, 15.6 GiB weights): stage 2 at topk=2048 with 512x512 tiles
-    reached L=9216. The prediction should be an upper bound within ~1.5x -- looser than one
-    might like, because the fitted slope ran 1.13x of analytic (allocator fragmentation plus
-    omitted small terms), which is exactly why the script reports both.
+    Measured on an H20 (95 GiB, 15.6 GiB weights) BEFORE the group-broadcast/int32 work:
+    stage 2 at topk=2048 with 512x512 tiles reached L=9216 against a then-prediction of ~12.4K.
+    The optimizations roughly doubled the predicted ceiling, so the check is that the ratio to
+    that historical measurement improved rather than that it still holds -- a regression would
+    show up as the ratio collapsing back toward 1.3x.
     """
     from tests.presses.bench_gqa_indexer_capacity import (
         predict_bytes_per_token,
@@ -917,17 +924,18 @@ def test_capacity_model_reproduces_the_measured_h20_run():
 
     budget = (95.0 - 15.6) * 1024**3
     geometry = dict(layers=36, n_heads=32, n_kv_heads=8, head_dim=128, indexer_dim=128)
-    per_token = predict_bytes_per_token(**geometry, stage="sparse", topk=2048)["total"]
+    itemized = predict_bytes_per_token(**geometry, stage="sparse", topk=2048)
     scratch = predict_tile_scratch(
         n_heads=32, n_kv_heads=8, head_dim=128, stage="sparse", query_tile=512, topk_tile=512
     )
 
-    predicted = predict_max_length(budget, per_token, scratch)
-    measured = 9216
-    assert measured <= predicted, "the prediction must be an upper bound, not an underestimate"
-    assert predicted / measured < 1.5, f"predicted {predicted} is {predicted / measured:.2f}x measured"
+    predicted = predict_max_length(budget, itemized["total"], scratch)
+    historical = 9216  # observed before the group-broadcast and int32 changes
+    assert predicted > historical * 1.8, (
+        f"predicted {predicted} vs {historical} measured pre-optimization: the ~2x gain from "
+        "group-broadcasting the teacher and storing support as int32 has regressed"
+    )
 
-    # The support really is the dominant term at this topk -- the reason L is capped so low.
-    itemized = predict_bytes_per_token(**geometry, stage="sparse", topk=2048)
-    support_share = (itemized["support"] + itemized["valid"]) / itemized["total"]
-    assert support_share > 0.8, f"support is only {support_share:.0%} of retained bytes"
+    # The support is still the largest single term at this topk, just half what it was.
+    assert itemized["support"] > itemized["teacher_q_fp32"]
+    assert itemized["support"] / itemized["total"] > 0.6

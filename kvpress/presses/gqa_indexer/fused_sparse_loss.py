@@ -285,7 +285,10 @@ class _FusedSparseIndexerKL(torch.autograd.Function):
                 acc_q / run_sum.clamp_min(EPS).unsqueeze(-1) - tea_q / safe_mass.unsqueeze(-1)
             )
 
-        ctx.save_for_backward(q_idx, k_idx, support, valid, lse_student, teacher_mass, dq_unit)
+        # `valid` is deliberately NOT saved: it is exactly `support >= 0`, so storing it would
+        # retain a bool of the same shape as the largest tensor here for no information --
+        # 576 KiB/token across 36 layers at topk=2048. Backward recomputes it per tile.
+        ctx.save_for_backward(q_idx, k_idx, support, lse_student, teacher_mass, dq_unit)
         ctx.teacher_alpha = teacher_alpha
         ctx.group_size = group_size
         ctx.query_tile = query_tile
@@ -300,7 +303,7 @@ class _FusedSparseIndexerKL(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_rows):
-        q_idx, k_idx, support, valid, lse_student, teacher_mass, dq_unit = ctx.saved_tensors
+        q_idx, k_idx, support, lse_student, teacher_mass, dq_unit = ctx.saved_tensors
         query_tile, topk_tile, k_len = ctx.query_tile, ctx.topk_tile, ctx.k_len
         group_size = ctx.group_size
         acc_dtype = dq_unit.dtype
@@ -326,7 +329,7 @@ class _FusedSparseIndexerKL(torch.autograd.Function):
             for start in range(0, topk, topk_tile):
                 stop = min(start + topk_tile, topk)
                 sup_tile = support[:, :, q_start:q_stop, start:stop]
-                val_tile = valid[:, :, q_start:q_stop, start:stop]
+                val_tile = sup_tile >= 0  # cheaper than retaining it from the forward pass
 
                 k_tile = gather_support_keys(k_idx, sup_tile).to(acc_dtype)
                 logits = torch.einsum("bhqd,bhqtd->bhqt", q_acc, k_tile)
@@ -338,8 +341,11 @@ class _FusedSparseIndexerKL(torch.autograd.Function):
 
                 weighted = ((p_hat - p_bar) * tile_grad.unsqueeze(-1)).masked_fill(~val_tile, 0.0)
                 contrib = weighted.unsqueeze(-1) * q_acc.unsqueeze(-2)  # (B,h,dq,t,D)
+                # int64 both because index_add_ requires it and because batch_base + sup
+                # reaches bsz * k_len, which can exceed int32 even when k_len alone does not.
+                sup_long = sup_tile.long()
                 flat_index = torch.where(
-                    val_tile, batch_base + sup_tile, torch.full_like(sup_tile, bsz * k_len)
+                    val_tile, batch_base + sup_long, torch.full_like(sup_long, bsz * k_len)
                 )
                 flat_grad_k.index_add_(0, flat_index.reshape(-1), contrib.reshape(-1, dim))
 
@@ -402,23 +408,41 @@ def make_sparse_recompute_teacher(
 
     n_heads = query_states.shape[1]
     n_kv = key_states.shape[1]
-    if n_kv != n_heads:
-        if n_heads % n_kv != 0:
-            raise ValueError(f"H={n_heads} is not divisible by key heads={n_kv}")
-        key_states = key_states.repeat_interleave(n_heads // n_kv, dim=1)
+    if n_kv != n_heads and n_heads % n_kv != 0:
+        raise ValueError(f"H={n_heads} is not divisible by key heads={n_kv}")
 
+    bsz = query_states.shape[0]
+    dim = key_states.shape[-1]
     acc = accumulation_dtype(query_states, key_states)
-    q_acc = query_states.to(acc)
     k_acc = key_states.to(acc)
     kv_heads = n_heads // group_size
+    grouped = n_kv != n_heads
+    if grouped:
+        # View the query as (B, h, g, Sq, d) and leave the keys at h heads, so the gather
+        # below runs once per KV head instead of once per attention head. No
+        # repeat_interleave: that copy would be group_size times the size for identical
+        # arithmetic, and it is the gathered tile -- the largest transient in stage 2.
+        q_acc = query_states.to(acc).view(bsz, n_kv, group_size, -1, dim)
+    else:
+        q_acc = query_states.to(acc)
 
     def alpha_at(q_start: int, q_stop: int, sup: torch.Tensor) -> torch.Tensor:
-        sup_h = expand_to_heads(sup, n_heads, group_size)
-        dim = k_acc.shape[-1]
-        flat = sup_h.clamp_min(0).reshape(sup_h.shape[0], n_heads, -1, 1).expand(-1, -1, -1, dim)
-        k_gathered = k_acc.gather(2, flat).reshape(*sup_h.shape, dim)
-        q_view = q_acc[:, :, q_start:q_stop]
-        return torch.einsum("bhqd,bhqtd->bhqt", q_view, k_gathered) * scaling
+        tile_q, tile_k = q_stop - q_start, sup.shape[-1]
+        if not grouped:
+            sup_h = expand_to_heads(sup, n_heads, group_size)
+            flat = sup_h.clamp_min(0).long().reshape(bsz, n_heads, -1, 1).expand(-1, -1, -1, dim)
+            k_gathered = k_acc.gather(2, flat).reshape(*sup_h.shape, dim)
+            return torch.einsum("bhqd,bhqtd->bhqt", q_acc[:, :, q_start:q_stop], k_gathered) * scaling
+
+        # A whole KV group shares one support, so gather (B, h, dq, tk, d) -- group_size
+        # times smaller than the (B, H, ...) tensor the expanded form would build.
+        sup_kv = sup if sup.shape[1] == n_kv else sup[:, ::group_size]
+        flat = sup_kv.clamp_min(0).long().reshape(bsz, n_kv, -1, 1).expand(-1, -1, -1, dim)
+        k_gathered = k_acc.gather(2, flat).reshape(bsz, n_kv, tile_q, tile_k, dim)
+        alpha = torch.einsum(
+            "bhgqd,bhqtd->bhgqt", q_acc[:, :, :, q_start:q_stop], k_gathered
+        )
+        return alpha.reshape(bsz, n_heads, tile_q, tile_k) * scaling
 
     if teacher_mode == "global":
         if teacher_lse is None:

@@ -79,7 +79,7 @@ def dense_sparse_reference(case, support, valid):
     target = build_sparse_indexer_target(
         attn, support, n_kv_heads=case["h"], head_reduce="mean"
     )
-    student = logits.gather(-1, support.clamp_min(0))
+    student = logits.gather(-1, support.clamp_min(0).long())
     log_q = masked_log_softmax(student, valid)
     rows = torch.where(
         valid, target * (torch.log(target.clamp_min(1e-10)) - log_q), torch.zeros_like(target)
@@ -126,7 +126,7 @@ def test_streaming_topk_matches_dense_topk(key_tile):
     logits = logits.masked_fill(case["mask"] <= MASK_NEG / 2, -float("inf"))
     dense_v, _ = logits.topk(case["topk"], dim=-1)
 
-    got = logits.gather(-1, support.clamp_min(0))
+    got = logits.gather(-1, support.clamp_min(0).long())
     got = torch.where(valid, got, torch.full_like(got, -float("inf")))
     torch.testing.assert_close(got.sort(-1).values, dense_v.sort(-1).values)
 
@@ -148,7 +148,7 @@ def test_support_never_selects_a_masked_key():
     support, valid = pick_support(case, key_tile=3, query_tile=3)
     keep = case["mask"] > MASK_NEG / 2  # (1, 1, Sq, Sk)
     keep = keep.expand(support.shape[0], support.shape[1], *keep.shape[-2:])
-    picked_allowed = keep.gather(-1, support.clamp_min(0))
+    picked_allowed = keep.gather(-1, support.clamp_min(0).long())
     assert (picked_allowed | ~valid).all(), "a causally-masked key entered the support"
 
 
@@ -366,7 +366,7 @@ def test_recall_reports_the_captured_teacher_mass():
     attn = torch.softmax(alpha, -1)
     grouped = attn.view(*attn.shape[:1], case["h"], case["group_size"], *attn.shape[2:]).mean(2)
     expected = torch.where(
-        valid, grouped.gather(-1, support.clamp_min(0)), torch.zeros_like(target)
+        valid, grouped.gather(-1, support.clamp_min(0).long()), torch.zeros_like(target)
     ).sum(-1)
     torch.testing.assert_close(stats["recall"], expected)
     assert (stats["recall"] <= 1.0 + 1e-9).all(), "recall is a probability mass"
@@ -510,7 +510,7 @@ def test_support_mode_matches_an_explicit_sparse_softmax():
     dense_alpha = torch.einsum("bhqd,bhkd->bhqk", case["q_tea"], k_rep) * case["scaling"]
     sup_h = support.repeat_interleave(case["group_size"], dim=1)
     val_h = valid.repeat_interleave(case["group_size"], dim=1)
-    alpha = dense_alpha.gather(-1, sup_h.clamp_min(0))
+    alpha = dense_alpha.gather(-1, sup_h.clamp_min(0).long())
     probs = torch.softmax(alpha.masked_fill(~val_h, -float("inf")), dim=-1)
     probs = probs.masked_fill(~val_h, 0.0)
     target = probs.view(
@@ -518,7 +518,7 @@ def test_support_mode_matches_an_explicit_sparse_softmax():
     ).mean(2)
 
     logits = torch.einsum("bhqd,bkd->bhqk", case["q_idx"], case["k_idx"])
-    log_q = masked_log_softmax(logits.gather(-1, support.clamp_min(0)), valid)
+    log_q = masked_log_softmax(logits.gather(-1, support.clamp_min(0).long()), valid)
     expected = torch.where(
         valid, target * (torch.log(target.clamp_min(1e-10)) - log_q), torch.zeros_like(target)
     ).sum(-1)
@@ -800,3 +800,64 @@ def test_output_dtype_follows_input(dtype):
     rows.sum().backward()
     assert q_idx.grad.dtype == dtype
     assert k_idx.grad.dtype == dtype
+
+
+# ----------------------------------------------------------------------
+# Storage width
+# ----------------------------------------------------------------------
+def test_support_is_stored_as_int32():
+    """
+    The support is the largest retained tensor in stage 2, so int64 doubles the dominant term.
+
+    int32 addresses 2.1e9 keys, far past any real sequence, and gather/index_add cast to int64
+    per tile -- an O(query_tile * topk_tile) transient rather than an O(L * topk) resident.
+    """
+    case = make_case(q_len=8, k_len=8, topk=3)
+    support, valid = pick_support(case, key_tile=4)
+    assert support.dtype == torch.int32
+    assert valid.dtype == torch.bool
+
+    # The values must survive the narrowing, sentinel included.
+    logits = torch.einsum("bhqd,bkd->bhqk", case["q_idx"], case["k_idx"]).detach()
+    logits = logits.masked_fill(case["mask"] <= MASK_NEG / 2, -float("inf"))
+    gathered = logits.gather(-1, support.clamp_min(0).long())
+    assert torch.isfinite(gathered[valid]).all(), "a narrowed index pointed at a masked key"
+    assert (support[~valid] == -1).all(), "the -1 sentinel must survive the cast"
+
+
+def test_sort_support_rejects_sequences_beyond_int32():
+    """Silently wrapping would corrupt the support with no error anywhere downstream."""
+    with pytest.raises(ValueError, match="exceeds int32"):
+        sort_support(torch.zeros(1, 1, 1, 1, dtype=torch.long), k_len=2**31)
+
+
+def test_gather_support_keys_accepts_both_index_widths():
+    """Callers holding int64 support (e.g. a hand-built one) must keep working."""
+    case = make_case(q_len=6, k_len=6, topk=3)
+    support, _ = pick_support(case, key_tile=3)
+    keys = case["k_idx"].detach()
+    from_int32 = gather_support_keys(keys, support)
+    from_int64 = gather_support_keys(keys, support.long())
+    torch.testing.assert_close(from_int32, from_int64)
+
+
+def test_teacher_gathers_once_per_kv_head():
+    """
+    A KV group shares one support, so the teacher must gather at h heads, not H.
+
+    Gathering at H would build a group_size-times larger tile for identical arithmetic -- and
+    the gathered tile is stage 2's dominant transient. Verified by value: the result must equal
+    an explicit repeat_interleave reference.
+    """
+    case = make_case(q_len=7, k_len=7, topk=3)
+    support, valid = pick_support(case, key_tile=4)
+    teacher = build_teacher(case, support, valid)
+    alpha, _ = teacher(0, case["q_len"], support, valid)
+
+    # Reference: expand the keys to H heads first, then gather per attention head.
+    k_rep = case["k_tea"].repeat_interleave(case["group_size"], dim=1)
+    sup_h = support.repeat_interleave(case["group_size"], dim=1)
+    expected = torch.einsum(
+        "bhqd,bhqtd->bhqt", case["q_tea"], gather_support_keys(k_rep, sup_h)
+    ) * case["scaling"]
+    torch.testing.assert_close(alpha, expected)

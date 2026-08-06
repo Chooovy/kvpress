@@ -133,12 +133,22 @@ def sort_support(support: torch.Tensor, k_len: int) -> tuple[torch.Tensor, torch
     independent of the order top-k happened to emit -- the same determinism argument
     AngelPTM makes for sorting ``topk_indices`` before its sparse kernel.
 
-    Returns ``(support, valid)`` with ``-1`` in the empty slots.
+    Returns ``(support, valid)`` with ``-1`` in the empty slots. ``support`` is **int32**:
+    it only has to address ``Sk``, and it is the single largest retained tensor in stage 2
+    (83% of retained bytes at ``topk=2048``), so int64 doubles the dominant term for no reach.
+    ``valid`` is exactly ``support >= 0`` and is returned for convenience -- callers that
+    keep tensors alive across ``backward()`` should recompute it instead of storing it.
     """
+    if k_len > torch.iinfo(torch.int32).max:
+        raise ValueError(
+            f"k_len={k_len} exceeds int32; the support tensor would silently wrap. "
+            "Widen sort_support to int64 if sequences this long are real."
+        )
     filled = torch.where(support >= 0, support, torch.full_like(support, k_len))
     filled, _ = filled.sort(dim=-1)
     valid = filled < k_len
-    return torch.where(valid, filled, torch.full_like(filled, -1)), valid
+    support = torch.where(valid, filled, torch.full_like(filled, -1))
+    return support.to(torch.int32), valid
 
 
 @torch.no_grad()
@@ -279,12 +289,16 @@ def gather_support_keys(keys: torch.Tensor, support: torch.Tensor) -> torch.Tens
     Gather per-row support keys.
 
     ``keys`` is ``(B, Sk, D)`` (the indexer's single MQA key) or ``(B, h, Sk, D)`` (teacher
-    keys); ``support`` is ``(B, h, dq, tk)``. Returns ``(B, h, dq, tk, D)``.
+    keys); ``support`` is ``(B, h, dq, tk)``, int32 or int64. Returns ``(B, h, dq, tk, D)``.
 
     The ``keys`` tensor is ``expand``-ed rather than repeated, so only the gathered output
-    is materialized -- ``O(query_tile * topk_tile)`` per tile. A real kernel does this gather
-    into shared memory; here it is the dominant term in stage 2's footprint, which is why
-    stage 2 wants smaller tiles than stage 1.
+    is materialized. That output is ``O(query_tile * topk_tile * D)`` -- note the ``D``, which
+    makes it multi-GiB at 512x512x128 and is stage 2's dominant transient. A real kernel does
+    this gather into shared memory; here shrinking ``topk_tile`` is the lever.
+
+    ``support`` is stored as int32 to halve the largest *retained* tensor, but ``gather``
+    requires int64, so the cast happens here -- once, on a tile-sized slice, rather than on the
+    full ``(B, h, L, topk)`` tensor.
     """
     bsz, n_heads, dq, tk = support.shape
     if keys.dim() == 3:
@@ -294,5 +308,5 @@ def gather_support_keys(keys: torch.Tensor, support: torch.Tensor) -> torch.Tens
     elif keys.shape[1] != n_heads:
         raise ValueError(f"keys has {keys.shape[1]} heads, support has {n_heads}")
     dim = keys.shape[-1]
-    flat = support.clamp_min(0).reshape(bsz, n_heads, dq * tk, 1).expand(-1, -1, -1, dim)
+    flat = support.clamp_min(0).long().reshape(bsz, n_heads, dq * tk, 1).expand(-1, -1, -1, dim)
     return keys.gather(2, flat).reshape(bsz, n_heads, dq, tk, dim)

@@ -212,8 +212,8 @@ def build_sparse_indexer_target(
     attentions : torch.Tensor
         Attention probabilities, (B, H, Sq, Sk).
     topk_indices : torch.Tensor
-        Indices selected by the indexer, (B, n_kv_heads, Sq, topk). Negative entries mark
-        empty slots and receive zero target mass.
+        Indices selected by the indexer, (B, n_kv_heads, Sq, topk), int32 or int64.
+        Negative entries mark empty slots and receive zero target mass.
     n_kv_heads : int
         Number of KV heads / indexer heads.
     head_reduce : str
@@ -226,6 +226,7 @@ def build_sparse_indexer_target(
     """
     grouped = group_attention_by_kv_head(to_accum(attentions), n_kv_heads, head_reduce)
     valid = topk_indices >= 0
-    gathered = grouped.gather(-1, topk_indices.clamp_min(0))
+    # .long(): gather requires int64, and the support is stored as int32.
+    gathered = grouped.gather(-1, topk_indices.clamp_min(0).long())
     gathered = gathered.masked_fill(~valid, 0.0)
     return normalize_indexer_target(gathered)

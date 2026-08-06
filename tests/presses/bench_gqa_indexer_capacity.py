@@ -175,13 +175,15 @@ def predict_bytes_per_token(
         "teacher_lse": n_heads * fp32,
     }
     if retain_teacher:
-        # ctx.teacher_alpha closes over fp32 copies of the teacher's Q and K.
+        # ctx.teacher_alpha closes over fp32 copies of the teacher's Q and K. The keys stay at
+        # n_kv_heads: make_recompute_teacher broadcasts over the group axis rather than calling
+        # repeat_interleave, which would otherwise make this n_heads and cost 4x on Qwen3.
         per_layer["teacher_q_fp32"] = n_heads * head_dim * fp32
         per_layer["teacher_k_fp32"] = n_kv_heads * head_dim * fp32
     if stage == "sparse":
-        # support (int64) + valid (bool), both saved_for_backward.
-        per_layer["support"] = n_kv_heads * topk * 8
-        per_layer["valid"] = n_kv_heads * topk * 1
+        # support only, as int32. `valid` is not saved -- it is exactly `support >= 0`, so
+        # backward recomputes it per tile instead of retaining a full-size bool.
+        per_layer["support"] = n_kv_heads * topk * 4
 
     itemized = {name: value * layers for name, value in per_layer.items()}
     # The model's own KV cache; use_cache=True is required to read the teacher's keys.
@@ -210,8 +212,11 @@ def predict_tile_scratch(
     if stage != "sparse":
         return 0.0
     fp32 = 4
+    # Both gathers run at n_kv_heads: a KV group shares one support, so the teacher gathers
+    # once per KV head and broadcasts the query over the group axis. Before that change the
+    # teacher term was n_heads, i.e. group_size times larger.
     student = n_kv_heads * query_tile * topk_tile * head_dim * fp32
-    teacher = n_heads * query_tile * topk_tile * head_dim * fp32
+    teacher = n_kv_heads * query_tile * topk_tile * head_dim * fp32
     return float(student + teacher)
 
 

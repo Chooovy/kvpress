@@ -862,3 +862,72 @@ def test_capacity_model_agrees_with_a_measured_slope(unit_test_model):  # noqa: 
     assert 0.33 < measured / predicted < 3.0, (
         f"measured {measured / 1024:.1f} KiB/tok vs predicted {predicted / 1024:.1f}"
     )
+
+
+def test_capacity_model_prices_the_stage2_tile_gather():
+    """
+    Stage 2's per-tile scratch is O(query_tile * topk_tile * D), not O(query_tile * topk_tile).
+
+    gather_support_keys materializes (B, h, query_tile, topk_tile, D) and the teacher gathers
+    (B, H, ...) on top, so the head_dim factor makes it 5 GiB at 512x512x128 -- large enough to
+    move the predicted ceiling, which is why the first version of the model (which omitted it
+    entirely) came in at 0.69x of the measured length.
+    """
+    from tests.presses.bench_gqa_indexer_capacity import predict_max_length, predict_tile_scratch
+
+    shape = dict(n_heads=32, n_kv_heads=8, head_dim=128)
+
+    # Stage 1's keys are contiguous -- it never gathers, so it has no scratch term.
+    assert predict_tile_scratch(**shape, stage="dense", query_tile=512, topk_tile=512) == 0.0
+
+    scratch = predict_tile_scratch(**shape, stage="sparse", query_tile=512, topk_tile=512)
+    assert scratch / (1024**3) == pytest.approx(5.0, abs=0.1)
+
+    # Linear in each tile axis and in head_dim: all three are the levers.
+    half_topk = predict_tile_scratch(**shape, stage="sparse", query_tile=512, topk_tile=256)
+    assert half_topk == pytest.approx(scratch / 2)
+    half_query = predict_tile_scratch(**shape, stage="sparse", query_tile=256, topk_tile=512)
+    assert half_query == pytest.approx(scratch / 2)
+    narrow = predict_tile_scratch(
+        n_heads=32, n_kv_heads=8, head_dim=64, stage="sparse", query_tile=512, topk_tile=512
+    )
+    assert narrow == pytest.approx(scratch / 2)
+
+    # Scratch is subtracted from the budget, so it lowers the ceiling.
+    budget, per_token = 80 * 1024**3, 6269.6 * 1024
+    assert predict_max_length(budget, per_token, scratch) < predict_max_length(budget, per_token)
+    # And a budget entirely consumed by scratch leaves no room at all.
+    assert predict_max_length(scratch, per_token, scratch) == 0
+
+
+def test_capacity_model_reproduces_the_measured_h20_run():
+    """
+    Pin the model against the one real measurement, so a refactor cannot silently drift.
+
+    Measured on an H20 (95 GiB, 15.6 GiB weights): stage 2 at topk=2048 with 512x512 tiles
+    reached L=9216. The prediction should be an upper bound within ~1.5x -- looser than one
+    might like, because the fitted slope ran 1.13x of analytic (allocator fragmentation plus
+    omitted small terms), which is exactly why the script reports both.
+    """
+    from tests.presses.bench_gqa_indexer_capacity import (
+        predict_bytes_per_token,
+        predict_max_length,
+        predict_tile_scratch,
+    )
+
+    budget = (95.0 - 15.6) * 1024**3
+    geometry = dict(layers=36, n_heads=32, n_kv_heads=8, head_dim=128, indexer_dim=128)
+    per_token = predict_bytes_per_token(**geometry, stage="sparse", topk=2048)["total"]
+    scratch = predict_tile_scratch(
+        n_heads=32, n_kv_heads=8, head_dim=128, stage="sparse", query_tile=512, topk_tile=512
+    )
+
+    predicted = predict_max_length(budget, per_token, scratch)
+    measured = 9216
+    assert measured <= predicted, "the prediction must be an upper bound, not an underestimate"
+    assert predicted / measured < 1.5, f"predicted {predicted} is {predicted / measured:.2f}x measured"
+
+    # The support really is the dominant term at this topk -- the reason L is capped so low.
+    itemized = predict_bytes_per_token(**geometry, stage="sparse", topk=2048)
+    support_share = (itemized["support"] + itemized["valid"]) / itemized["total"]
+    assert support_share > 0.8, f"support is only {support_share:.0%} of retained bytes"

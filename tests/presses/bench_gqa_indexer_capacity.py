@@ -28,10 +28,38 @@ The predicted ceiling
 ---------------------
 :func:`predict_bytes_per_token` models the retained state analytically, and the script prints
 prediction next to measurement. That comparison is the actual product here -- a benchmark that
-cannot predict its own answer cannot distinguish a genuine ceiling from a leak, and the first
-thing it turned up was a leak (see below).
+cannot predict its own answer cannot distinguish a genuine ceiling from a leak.
 
-Two things dominate, and neither is the tiled algorithm:
+Measured on an H20 (95 GiB, 15.6 GiB of weights, B=1, bf16, 36 layers):
+
+===============================  ==========  ============  ===========
+run                              measured L  fitted slope  analytic
+===============================  ==========  ============  ===========
+stage 1 dense                    32K-64K     1406 KiB/tok  1086
+stage 2 topk=2048                9216        7070 KiB/tok  6270
+===============================  ==========  ============  ===========
+
+The slope is the part worth trusting: 1.13-1.30x of analytic, the excess being allocator
+fragmentation plus small terms deliberately omitted. Treat the predicted ``L`` as an upper
+bound and expect roughly 0.7-0.8x of it in practice.
+
+Timing, same machine. Stage 2 is *faster* at equal length, and scales better:
+
+=======  ===========  =========  =============
+``L``    stage 1      stage 2    stage 2 speed
+=======  ===========  =========  =============
+2048     16.1 s       18.8 s     0.9x
+4096     37.8 s       36.4 s     1.0x
+8192     105.6 s      75.7 s     **1.4x**
+16384    384.0 s      --         --
+32768    1506.0 s     --         --
+=======  ===========  =========  =============
+
+Stage 1's time grows 3.9x per doubling (clean ``O(L^2)``); stage 2's grows ~2.0x
+(``O(L * topk)``, linear). Stage 2 stopping at a shorter ``L`` is a *memory* limit, not a speed
+one -- see the support term below.
+
+Three things dominate, and none is the tiled algorithm:
 
 **The fp32 teacher is retained for every layer.** ``_FusedIndexerCE.forward`` stores
 ``ctx.teacher_alpha``, which is the closure from ``make_recompute_teacher`` holding fp32 copies
@@ -43,12 +71,34 @@ the autograd graph.
 
 On an 80 GiB card that is the difference between L≈62K and L≈183K for stage 1.
 
-**Stage 2's support tensor is quadratic under ``keep_ratio``.** ``support`` is
+**Stage 2's support tensor dominates, and is quadratic under ``keep_ratio``.** ``support`` is
 ``(B, h, Sq, topk)`` int64 plus a bool ``valid``, saved for backward. With ``topk = r * L`` that
 is ``O(L^2)``: at ``L=32K, r=0.25`` it is 696 GB across 36 layers. A *fixed* ``topk`` keeps it
-linear, so the sparse probe requires one and refuses a ratio. At ``topk=512`` the support is
-1296 KiB/token, which then dominates everything else -- ``int32`` indices would halve it, since
-they only need to address ``Sk < 2^31``.
+linear, so the sparse probe requires one and refuses a ratio.
+
+Even fixed, it is the single largest term -- 83% of retained bytes at ``topk=2048``, which is
+what capped the measured run at ``L=9216``:
+
+========  =====================  ============  ==============
+``topk``  support+valid/token    total/token   predicted max L
+========  =====================  ============  ==============
+256       648 KiB                1590 KiB      ~52K
+512       1296 KiB               2238 KiB      ~37K
+1024      2592 KiB               3534 KiB      ~24K
+2048      5184 KiB               6126 KiB      ~13K
+========  =====================  ============  ==============
+
+``int32`` indices would halve it -- they only need to address ``Sk < 2^31`` -- and packing
+``valid`` into ``support`` as a sentinel (which ``-1`` already is) would remove another 11%.
+Note ``topk=2048`` at ``L=9216`` means the support covers 22% of the sequence, which is barely a
+sparse regime; ``topk=512`` is both the cheaper and the more representative setting.
+
+**Stage 2's per-tile gather is a multi-GB fixed cost.**
+:func:`~kvpress.presses.gqa_indexer.sparse_support.gather_support_keys` materializes
+``(B, h, query_tile, topk_tile, D)`` and the teacher gathers ``(B, H, ...)`` on top -- so the
+scratch is ``O(query_tile * topk_tile * D)``, and the ``D`` factor makes it 5.0 GiB at
+``512 x 512 x 128``. Stage 1 never gathers (its keys are contiguous) and its tile is 8 MB, which
+is why only stage 2 carries an intercept worth modelling. ``--topk-tile 128`` recovers ~4 GiB.
 """
 
 from __future__ import annotations
@@ -109,9 +159,9 @@ def predict_bytes_per_token(
     """
     Bytes of *retained* state per token, itemized.
 
-    Only tensors that survive until ``backward()`` are counted; tile scratch is
-    ``O(query_tile * key_tile)`` and independent of ``L``, so it shifts the intercept rather
-    than the slope.
+    Only tensors that survive until ``backward()`` are counted. Per-tile scratch is
+    independent of ``L`` and so belongs to the intercept, not the slope -- see
+    :func:`predict_tile_scratch`, which is a multi-GiB term for stage 2.
 
     ``retain_teacher=False`` reports the intended footprint -- what it would be if the teacher
     closure were dropped after each layer's loss -- so the caller can price the leak.
@@ -140,8 +190,36 @@ def predict_bytes_per_token(
     return itemized
 
 
-def predict_max_length(budget_bytes: float, bytes_per_token: float) -> int:
-    return max(0, int(budget_bytes // bytes_per_token))
+def predict_tile_scratch(
+    *, n_heads: int, n_kv_heads: int, head_dim: int, stage: str, query_tile: int, topk_tile: int
+) -> float:
+    """
+    Bytes of per-tile scratch: the length-independent term, i.e. the intercept.
+
+    Zero for stage 1, whose tile intermediates are ``(B, h, query_tile, key_tile)`` -- 8 MB, not
+    worth modelling. Stage 2 is different in kind, because it must **gather** its keys per query
+    row: :func:`~kvpress.presses.gqa_indexer.sparse_support.gather_support_keys` materializes
+    ``(B, h, query_tile, topk_tile, D)``, and the teacher gathers ``(B, H, ...)`` on top. That is
+    ``O(query_tile * topk_tile * D)``, not ``O(query_tile * topk_tile)`` -- the ``D`` factor makes
+    it 5.4 GB at ``query_tile=topk_tile=512, D=128`` on Qwen3-8B, which is why measurement came
+    in at 0.69x of a prediction that ignored it.
+
+    It is a fixed cost, so it does not change the slope; it just removes that much of the budget
+    before the slope starts. Shrinking ``topk_tile`` is the direct lever.
+    """
+    if stage != "sparse":
+        return 0.0
+    fp32 = 4
+    student = n_kv_heads * query_tile * topk_tile * head_dim * fp32
+    teacher = n_heads * query_tile * topk_tile * head_dim * fp32
+    return float(student + teacher)
+
+
+def predict_max_length(
+    budget_bytes: float, bytes_per_token: float, scratch_bytes: float = 0.0
+) -> int:
+    """Longest ``L`` that fits, after the fixed per-tile scratch is set aside."""
+    return max(0, int((budget_bytes - scratch_bytes) // bytes_per_token))
 
 
 # ----------------------------------------------------------------------
@@ -336,7 +414,7 @@ def find_max_length(model, trainer, *, start: int, ceiling: int, verbose: bool =
 # ----------------------------------------------------------------------
 # Reporting
 # ----------------------------------------------------------------------
-def report(args, model, result: dict, prediction: dict, ideal: dict) -> None:
+def report(args, model, result: dict, prediction: dict, ideal: dict, scratch: float) -> None:
     layers = model.config.num_hidden_layers
     measured = result["max_length"]
     successes = [r for r in result["history"] if r["ok"]]
@@ -364,12 +442,13 @@ def report(args, model, result: dict, prediction: dict, ideal: dict) -> None:
         total_gib = torch.cuda.get_device_properties(0).total_memory / GIB
         weights_gib = sum(p.numel() * p.element_size() for p in model.parameters()) / GIB
         budget = (total_gib - weights_gib) * GIB
-        predicted = predict_max_length(budget, prediction["total"])
-        predicted_ideal = predict_max_length(budget, ideal["total"])
+        predicted = predict_max_length(budget, prediction["total"], scratch)
+        predicted_ideal = predict_max_length(budget, ideal["total"], scratch)
 
         print(f"\ndevice {torch.cuda.get_device_name(0)}  {total_gib:.1f} GiB")
         print(f"  weights            {weights_gib:6.1f} GiB")
-        print(f"  activation budget  {budget / GIB:6.1f} GiB")
+        print(f"  tile scratch       {scratch / GIB:6.1f} GiB   (fixed; O(query_tile*topk_tile*D))")
+        print(f"  activation budget  {(budget - scratch) / GIB:6.1f} GiB")
         print(f"\n  predicted max L    {predicted:>8}")
         print(f"  MEASURED max L     {measured:>8}", end="")
         if predicted:
@@ -406,6 +485,7 @@ def report(args, model, result: dict, prediction: dict, ideal: dict) -> None:
             "max_length": measured,
             "bytes_per_token": prediction,
             "bytes_per_token_if_teacher_freed": ideal,
+            "tile_scratch_bytes": scratch,
             "history": result["history"],
         }
         with open(args.json, "w") as handle:
@@ -487,12 +567,20 @@ def main() -> int:
     )
     prediction = predict_bytes_per_token(**shared, retain_teacher=True)
     ideal = predict_bytes_per_token(**shared, retain_teacher=False)
+    scratch = predict_tile_scratch(
+        n_heads=model.config.num_attention_heads,
+        n_kv_heads=model.config.num_key_value_heads,
+        head_dim=indexer.head_dim,
+        stage=args.stage,
+        query_tile=args.query_tile,
+        topk_tile=args.topk_tile,
+    )
 
     print(f"searching from L={args.start} (doubling, then bisecting)...", flush=True)
     result = find_max_length(
         model, trainer, start=args.start, ceiling=args.ceiling, verbose=True
     )
-    report(args, model, result, prediction, ideal)
+    report(args, model, result, prediction, ideal, scratch)
     return 0
 
 

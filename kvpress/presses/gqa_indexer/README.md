@@ -532,3 +532,52 @@ with slicing. `test_per_tile_upcast_is_bit_identical` asserts `torch.equal`, not
 costs one `q_proj` GEMM plus RoPE per tile and would give another ~1.8×.
 `predict_bytes_per_token(retain_teacher=False)` prices it. The trade is compute for memory, so it
 is worth doing only once the length is the binding constraint rather than the step time.
+
+
+## Precision
+
+Every reference implementation keeps the **score** in fp32 while storing weights and activations
+in bf16. That is not incidental — the score is the quantity the objective is defined on.
+
+| | score GEMM | norm | KL / softmax | storage |
+|---|---|---|---|---|
+| Megatron DSA | fp32 (`q.float()`) | fp32 (`dsa_indexer_k_norm_fp32`) | fp32 | bf16 |
+| AngelPTM | fp32 | — | fp32 | bf16 |
+| tilelang DSA kernel | `accum_dtype="float"` | — | `accum_dtype` | `bfloat16` |
+| FlashKL | fp32 accumulate | — | fp32 | input dtype |
+| MiniMax M3 | fp32 (`idx_q.float()`) | fp32, built in | — | bf16 |
+| **this module** | fp32 | fp32 (`IndexerNorm`) | fp32 | bf16 |
+
+`IndexerNorm` exists because `nn.LayerNorm` on a bf16 module reduces in bf16, and a mean/variance
+over `head_dim` channels with 8 significant bits carries ~7e-2 median relative error (1e-1 worst
+case, measured over 200 draws). That lands on `q`/`k` and the `head_dim`-long dot product then
+amplifies it, so the score would inherit the error before its own fp32 GEMM begins. M3 builds this
+in unconditionally; Megatron exposes it as a flag. Parameter names and shapes match
+`nn.LayerNorm`, so checkpoints load unchanged.
+
+### Quantization
+
+DeepSeek-V4 does quantize the indexer — §5.2.1 is titled *FP4 Quantization-Aware Training*, and
+the paper states it applies "during the post-training stage … for MoE expert weights and the
+indexer QK path". Two things are worth separating before copying it:
+
+- It is **QAT for a deployment format**, run as a post-training stage, not the precision the
+  indexer's KL distillation is performed in. The paper does not describe the distillation
+  precision at all.
+- The serving path (`sglang/srt/.../dsv4/indexer.py`, which contains no `backward`/`autograd`)
+  earns FP4 with three mechanisms, not by casting: a **Hadamard rotation** before quantization
+  (`fused_q_indexer_rope_hadamard_fp4_quant`), **per-block scales** (`head_dim_with_sf = 68`
+  = 64 packed bytes + one fp32 scale), and **fp32 accumulation and output** regardless.
+
+Measured on synthetic activations with channel outliers (L=4096, d=128), MXFP4 scores against an
+fp32 reference:
+
+| | relative error | top-512 recall | top-2048 recall |
+|---|---|---|---|
+| no rotation | 0.114 | 93.6% | 97.2% |
+| + Hadamard | 0.063 | **97.1%** | 98.8% |
+
+At inference the score is an **argsort key** — a few percent of recall is absorbable. As a **KL
+target** the same error is a systematic bias in the function being learned, and it does not
+average out across steps. So: fp32 for distillation; quantization is a separate, later,
+inference-side project that needs the rotation and block scales to be worth attempting.

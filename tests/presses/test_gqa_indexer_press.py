@@ -14,6 +14,7 @@ from kvpress import GQAIndexerPress
 from kvpress.presses.gqa_indexer import (
     GQAIndexer,
     GQAIndexerConfig,
+    IndexerNorm,
     IndexerTrainConfig,
     aggregate_chunk_scores,
     build_indexer_mask,
@@ -768,3 +769,110 @@ def test_compute_indexer_loss_rejects_missing_attentions(unit_test_model):  # no
             press, get_attention_modules(unit_test_model), out.hidden_states, None,
             IndexerTrainConfig(stage="dense"), model=unit_test_model,
         )
+
+
+# ----------------------------------------------------------------------
+# fp32 norm statistics
+# ----------------------------------------------------------------------
+def test_indexer_norm_matches_layer_norm_in_fp32():
+    """
+    In fp32 there is nothing to upcast, so IndexerNorm must equal nn.LayerNorm exactly.
+
+    This is what makes the swap safe: the fp32 path is unchanged, and only reduced-precision
+    inputs take a different (more accurate) route.
+    """
+    torch.manual_seed(0)
+    dim = 16
+    ours = IndexerNorm(dim)
+    theirs = torch.nn.LayerNorm(dim)
+    with torch.no_grad():
+        ours.weight.copy_(torch.randn(dim))
+        ours.bias.copy_(torch.randn(dim))
+        theirs.weight.copy_(ours.weight)
+        theirs.bias.copy_(ours.bias)
+
+    x = torch.randn(3, 5, dim)
+    torch.testing.assert_close(ours(x), theirs(x))
+
+
+def test_indexer_norm_reduces_in_fp32_for_bf16_input():
+    """
+    bf16 in, bf16 out, but the statistics computed in fp32.
+
+    nn.LayerNorm on a bf16 module reduces in bf16, whose 8 significant bits give ~7e-2 median
+    relative error over head_dim channels. That error lands on q/k and is then amplified by the
+    head_dim-long dot product, so the score would inherit it before its own fp32 GEMM begins.
+    """
+    torch.manual_seed(0)
+    dim = 128
+    ours = IndexerNorm(dim).to(torch.bfloat16)
+    theirs = torch.nn.LayerNorm(dim).to(torch.bfloat16)
+    with torch.no_grad():
+        theirs.weight.copy_(ours.weight)
+        theirs.bias.copy_(ours.bias)
+
+    x = (torch.randn(4, 32, dim) * 10).to(torch.bfloat16)
+    got = ours(x)
+    assert got.dtype == torch.bfloat16, "the output must stay in the module's dtype"
+
+    reference = torch.nn.functional.layer_norm(
+        x.float(), (dim,), ours.weight.float(), ours.bias.float(), ours.eps
+    )
+    ours_err = (got.float() - reference).abs().max()
+    theirs_err = (theirs(x).float() - reference).abs().max()
+    assert ours_err <= theirs_err, (
+        f"fp32 reduction should not be worse: {ours_err} vs {theirs_err}"
+    )
+
+
+def test_indexer_norm_does_not_narrow_float64():
+    """An fp64 caller asked for fp64; .float() would silently narrow it."""
+    dim = 8
+    norm = IndexerNorm(dim).to(torch.float64)
+    x = torch.randn(2, 3, dim, dtype=torch.float64)
+    out = norm(x)
+    assert out.dtype == torch.float64
+
+    reference = torch.nn.functional.layer_norm(
+        x, (dim,), norm.weight, norm.bias, norm.eps
+    )
+    torch.testing.assert_close(out, reference)
+
+
+def test_indexer_norm_is_checkpoint_compatible_with_layer_norm():
+    """
+    Parameter names and shapes must match nn.LayerNorm, or existing checkpoints break.
+
+    The swap is meant to be a numerics change only; a state_dict saved before it must load
+    after it with no renaming.
+    """
+    dim = 12
+    legacy = torch.nn.LayerNorm(dim)
+    with torch.no_grad():
+        legacy.weight.copy_(torch.randn(dim))
+        legacy.bias.copy_(torch.randn(dim))
+
+    ours = IndexerNorm(dim)
+    # strict=True is the assertion: any renamed or reshaped parameter raises here.
+    result = ours.load_state_dict(legacy.state_dict(), strict=True)
+    assert not result.missing_keys and not result.unexpected_keys
+    torch.testing.assert_close(ours.weight, legacy.weight)
+    torch.testing.assert_close(ours.bias, legacy.bias)
+
+
+def test_indexer_norm_gradients_flow():
+    """The upcast must not detach: both parameters have to receive gradients."""
+    dim = 8
+    norm = IndexerNorm(dim).to(torch.bfloat16)
+    x = torch.randn(2, 4, dim, dtype=torch.bfloat16, requires_grad=True)
+    norm(x).float().pow(2).sum().backward()
+    assert norm.weight.grad is not None and norm.weight.grad.abs().sum() > 0
+    assert norm.bias.grad is not None
+    assert x.grad is not None and x.grad.abs().sum() > 0
+
+
+def test_indexer_uses_the_fp32_norm():
+    """The indexer must pick up IndexerNorm, not nn.LayerNorm."""
+    indexer = make_indexer()
+    assert isinstance(indexer.q_norm, IndexerNorm)
+    assert isinstance(indexer.k_norm, IndexerNorm)

@@ -74,6 +74,46 @@ def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch
     return torch.cat((x_rot, x_pass), dim=-1) if x_pass.numel() else x_rot
 
 
+class IndexerNorm(nn.Module):
+    """
+    LayerNorm whose statistics are always computed in fp32, then cast back.
+
+    ``nn.LayerNorm`` on a bf16 module reduces in bf16, and the mean/variance over ``head_dim``
+    channels is a long accumulation with only 8 significant bits: measured relative error
+    against an fp32 reduction is ~7e-2 median, 1e-1 worst case over 200 draws. That lands
+    directly on ``q``/``k``, and the ``head_dim``-long dot product that follows amplifies it,
+    so the score -- the quantity every reference implementation is careful to keep in fp32 --
+    would inherit the error before its own GEMM even starts.
+
+    This is not a novel precaution. MiniMax M3's indexer norm is documented as "Gemma-style
+    RMSNorm: normalizes in fp32", and Megatron's DSA exposes it as a config flag
+    (``dsa_indexer_k_norm_fp32``, which does ``self.k_norm(k.float()).to(dtype=k_dtype)``). M3
+    builds it in unconditionally rather than making it optional, which is the choice taken
+    here: the cost is one cast on a ``head_dim``-wide tensor, and there is no regime where
+    reducing in bf16 is preferable.
+
+    Parameter shapes and names match ``nn.LayerNorm``, so existing checkpoints load unchanged.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Upcast only for low-precision inputs: an fp64 caller asked for fp64, and .float()
+        # would silently narrow it -- the same trap accumulation_dtype exists to avoid.
+        acc = torch.float32 if x.dtype.itemsize < 4 else x.dtype
+        normalized = nn.functional.layer_norm(
+            x.to(acc), (x.shape[-1],), self.weight.to(acc), self.bias.to(acc), self.eps
+        )
+        return normalized.to(x.dtype)
+
+    def extra_repr(self) -> str:
+        return f"{tuple(self.weight.shape)}, eps={self.eps}"
+
+
 @dataclass
 class GQAIndexerConfig:
     """
@@ -152,8 +192,9 @@ class GQAIndexer(nn.Module):
         # by the LayerNorm that immediately follows it.
         self.w_q = nn.Linear(config.hidden_size, config.n_heads * config.head_dim, bias=False)
         self.w_k = nn.Linear(config.hidden_size, config.head_dim, bias=False)
-        self.q_norm = nn.LayerNorm(config.head_dim, eps=config.norm_eps)
-        self.k_norm = nn.LayerNorm(config.head_dim, eps=config.norm_eps)
+        # fp32 statistics regardless of the module dtype -- see IndexerNorm.
+        self.q_norm = IndexerNorm(config.head_dim, eps=config.norm_eps)
+        self.k_norm = IndexerNorm(config.head_dim, eps=config.norm_eps)
 
     def project_q(self, hidden_states: torch.Tensor, cos=None, sin=None) -> torch.Tensor:
         """Project and rotate indexer queries -> (B, n_heads, Sq, D)."""

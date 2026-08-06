@@ -58,6 +58,7 @@ from kvpress.presses.gqa_indexer.fused_trainer import (
 from kvpress.presses.gqa_indexer.indexer import (
     GQAIndexer,
     GQAIndexerConfig,
+    IndexerNorm,
     build_indexer_mask,
     slice_rope_tables,
 )
@@ -109,6 +110,7 @@ from kvpress.presses.gqa_indexer.triton_fused_loss import (
 __all__ = [
     "GQAIndexer",
     "GQAIndexerConfig",
+    "IndexerNorm",
     "GQAIndexerPress",
     "build_indexer_mask",
     "slice_rope_tables",

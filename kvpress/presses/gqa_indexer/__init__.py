@@ -32,6 +32,15 @@ from kvpress.presses.gqa_indexer.aggregate import (
     expand_chunk_indices,
     reduce_queries,
 )
+from kvpress.presses.gqa_indexer.data import (
+    SUBSETS,
+    LengthSchedule,
+    LongminoConfig,
+    LongminoDataset,
+    build_dataloader,
+    describe_subsets,
+    shard_paths,
+)
 from kvpress.presses.gqa_indexer.fused_loss import (
     accumulation_dtype,
     group_view,
@@ -108,6 +117,14 @@ from kvpress.presses.gqa_indexer.triton_fused_loss import (
 )
 
 __all__ = [
+    # Data loading
+    "SUBSETS",
+    "LengthSchedule",
+    "LongminoConfig",
+    "LongminoDataset",
+    "build_dataloader",
+    "describe_subsets",
+    "shard_paths",
     "GQAIndexer",
     "GQAIndexerConfig",
     "IndexerNorm",

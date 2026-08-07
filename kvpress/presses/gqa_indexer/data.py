@@ -58,6 +58,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
@@ -553,3 +554,279 @@ def env_rank_and_world_size() -> tuple[int, int]:
     exercised without initializing a process group.
     """
     return int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
+
+
+# ======================================================================
+# Pre-tokenized corpus
+# ======================================================================
+@dataclass
+class TokenizedConfig:
+    """
+    Read a corpus produced by ``scripts/pretokenize_longmino.py``.
+
+    Attributes
+    ----------
+    root : str
+        Directory holding ``index.json`` and per-subset ``.npy`` shards.
+    seq_len : int
+        Tokens per sample. May be **below** the stored width -- a shorter stage takes a
+        prefix, which is exactly what a shorter sequence means -- but never above it, because
+        the missing tokens do not exist and padding them would train the indexer on positions
+        the loss masks out.
+    subsets : tuple of str, optional
+        Restrict to these subsets. ``None`` uses everything in the index.
+    shuffle_buffer, seed, max_documents, take_from
+        As :class:`LongminoConfig`. ``take_from="random"`` picks a random window *within the
+        stored tokens*, so its reach is bounded by the pretokenized width rather than by the
+        original document.
+    """
+
+    root: str
+    seq_len: int = 32768
+    subsets: tuple[str, ...] | None = None
+    take_from: str = "head"
+    shuffle_buffer: int = 64
+    seed: int = 0
+    max_documents: int | None = None
+
+    def __post_init__(self):
+        if self.seq_len <= 0:
+            raise ValueError(f"seq_len must be positive, got {self.seq_len}")
+        if self.take_from not in ("head", "random"):
+            raise ValueError(f"take_from must be 'head' or 'random', got {self.take_from!r}")
+
+
+def read_index(root: str | Path) -> dict:
+    """
+    Load ``index.json``, with a message that names the fix when it is missing.
+
+    A missing index means either the path is wrong or pretokenization did not finish; both are
+    worth distinguishing from "empty corpus", which is what a bare glob would report.
+    """
+    path = Path(root) / "index.json"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"no index.json under {root}; run scripts/pretokenize_longmino.py first, or point "
+            "--data-root at the raw shards and drop --tokenized"
+        )
+    with open(path) as handle:
+        return json.load(handle)
+
+
+class TokenizedDataset(IterableDataset):
+    """
+    Streams pre-tokenized documents, memory-mapped.
+
+    Same contract as :class:`LongminoDataset` -- one sample is one document window -- but with
+    no tokenizer in the loop. Measured tokenization cost was ~0.45 s per 64K sample, which is
+    serial work on the data path; here a sample is a memory-mapped row read, so the loader
+    stops being a factor at all.
+
+    Arrays are opened with ``mmap_mode="r"``, so a 26 GB corpus costs no resident memory: the
+    page cache serves rows and the kernel evicts them. That also makes worker startup free,
+    since nothing is read at open time.
+    """
+
+    def __init__(self, config: TokenizedConfig, rank: int = 0, world_size: int = 1):
+        super().__init__()
+        self.config = config
+        self.rank = rank
+        self.world_size = world_size
+        self.index = read_index(config.root)
+
+        stored = int(self.index["seq_len"])
+        if config.seq_len > stored:
+            raise ValueError(
+                f"seq_len={config.seq_len} exceeds the pretokenized width {stored}. Those "
+                f"tokens were never stored, so they cannot be recovered here -- re-run "
+                f"scripts/pretokenize_longmino.py with --seq-len {config.seq_len}."
+            )
+        self.stored_seq_len = stored
+
+        subsets = config.subsets or tuple(sorted(self.index["subsets"]))
+        missing = [s for s in subsets if s not in self.index["subsets"]]
+        if missing:
+            raise ValueError(
+                f"subsets {missing} are not in the pretokenized corpus "
+                f"(have {sorted(self.index['subsets'])})"
+            )
+        self.paths: list[Path] = []
+        for subset in subsets:
+            found = sorted((Path(config.root) / subset).glob("*.npy"))
+            if not found:
+                raise FileNotFoundError(f"no .npy shards under {Path(config.root) / subset}")
+            self.paths.extend(found)
+        if len(self.paths) < world_size:
+            raise ValueError(
+                f"{len(self.paths)} shards cannot be split across world_size={world_size}"
+            )
+        self.stats: dict[str, int] = {}
+
+    def assigned_paths(self) -> list[Path]:
+        """This ``(rank, worker)``'s shards, shuffled so each reader sees mixed subsets."""
+        paths = list(self.paths)
+        random.Random(self.config.seed).shuffle(paths)
+        worker = get_worker_info()
+        num_workers = worker.num_workers if worker else 1
+        worker_id = worker.id if worker else 0
+        return paths[self.rank * num_workers + worker_id :: self.world_size * num_workers]
+
+    def __iter__(self) -> Iterator[dict]:
+        config = self.config
+        worker = get_worker_info()
+        worker_id = worker.id if worker else 0
+        rng = random.Random((config.seed, self.rank, worker_id).__hash__())
+
+        buffer: list[dict] = []
+        emitted = 0
+        seq_len = config.seq_len
+
+        for path in self.assigned_paths():
+            try:
+                array = np.load(path, mmap_mode="r")
+            except (OSError, ValueError) as exc:
+                logger.error("cannot open %s: %s", path.name, exc)
+                self.stats["shard_errors"] = self.stats.get("shard_errors", 0) + 1
+                continue
+
+            sidecar = path.with_suffix(".json")
+            doc_ids: list[str] = []
+            if sidecar.is_file():
+                with open(sidecar) as handle:
+                    doc_ids = json.load(handle).get("doc_ids", [])
+
+            order = list(range(array.shape[0]))
+            rng.shuffle(order)
+            for row in order:
+                # np.array() forces a copy out of the mmap: without it the tensor would alias
+                # a page the kernel may evict, and torch would read freed memory.
+                if config.take_from == "random" and self.stored_seq_len > seq_len:
+                    start = rng.randrange(0, self.stored_seq_len - seq_len + 1)
+                else:
+                    start = 0
+                tokens = np.array(array[row, start : start + seq_len], dtype=np.int64)
+                sample = {
+                    "input_ids": torch.from_numpy(tokens),
+                    "num_tokens": seq_len,
+                    "available_tokens": self.stored_seq_len,
+                    "doc_id": doc_ids[row] if row < len(doc_ids) else f"{path.stem}:{row}",
+                }
+
+                if config.shuffle_buffer > 1:
+                    buffer.append(sample)
+                    if len(buffer) < config.shuffle_buffer:
+                        continue
+                    pick = rng.randrange(len(buffer))
+                    buffer[pick], buffer[-1] = buffer[-1], buffer[pick]
+                    sample = buffer.pop()
+
+                yield sample
+                emitted += 1
+                if config.max_documents is not None and emitted >= config.max_documents:
+                    self.stats["emitted"] = emitted
+                    return
+
+        rng.shuffle(buffer)
+        for sample in buffer:
+            yield sample
+            emitted += 1
+            if config.max_documents is not None and emitted >= config.max_documents:
+                break
+        self.stats["emitted"] = emitted
+
+
+def build_tokenized_dataloader(
+    config: TokenizedConfig,
+    *,
+    batch_size: int = 1,
+    num_workers: int = 2,
+    rank: int = 0,
+    world_size: int = 1,
+    prefetch_factor: int | None = 4,
+) -> DataLoader:
+    """
+    A ``DataLoader`` over :class:`TokenizedDataset`.
+
+    ``num_workers`` can be lower here than for the text loader: a worker only reads memory-
+    mapped rows, so one or two are enough to stay ahead of a multi-second training step.
+    """
+    dataset = TokenizedDataset(config, rank=rank, world_size=world_size)
+    shards_per_rank = len(dataset.paths) // max(world_size, 1)
+    if num_workers > shards_per_rank:
+        logger.warning(
+            "num_workers=%d exceeds %d shards per rank; lowering to avoid idle workers",
+            num_workers,
+            shards_per_rank,
+        )
+        num_workers = max(shards_per_rank, 0)
+
+    kwargs: dict = {}
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = prefetch_factor
+        kwargs["persistent_workers"] = True
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        collate_fn=collate,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=True,
+        **kwargs,
+    )
+
+
+def wsd_lr_lambda(
+    total_steps: int,
+    *,
+    warmup_frac: float = 0.10,
+    stable_frac: float = 0.60,
+    peak_lr: float = 1e-3,
+    final_lr: float = 5e-6,
+):
+    """
+    Warmup-Stable-Decay learning-rate multiplier, as a factor of ``peak_lr``.
+
+    WSD holds the peak for most of training and decays only at the end, which suits a run
+    whose length may change: the stable phase can be extended without redesigning the
+    schedule, unlike cosine where every step's value depends on the total.
+
+    Returns a function of ``step`` suitable for ``LambdaLR``, so the optimizer must be
+    constructed with ``lr=peak_lr`` and this returns a *multiplier* in ``(0, 1]``.
+
+    The first step's multiplier is ``1 / warmup_steps``, not ``0``: a literal zero wastes a
+    step and, with Adam's bias correction, contributes an all-zero first moment.
+
+    Decay is **linear** to ``final_lr``, and reaches it exactly on the *last* step. The
+    denominator is ``total_steps - 1 - stable_end`` rather than ``total_steps - stable_end``
+    because ``LambdaLR`` is called with ``0 .. total_steps - 1``; using the latter leaves the
+    final step above the requested floor (measured 7.2e-6 instead of 5e-6 on a 1500-step run),
+    which quietly means the schedule never delivers the value that was asked for. Linear is
+    also the form the WSD papers use, and unlike an exponential it spends the phase descending
+    rather than sitting near the floor.
+    """
+    if not 0 < warmup_frac < 1:
+        raise ValueError(f"warmup_frac must be in (0, 1), got {warmup_frac}")
+    if not 0 <= stable_frac < 1:
+        raise ValueError(f"stable_frac must be in [0, 1), got {stable_frac}")
+    if warmup_frac + stable_frac >= 1:
+        raise ValueError(
+            f"warmup_frac + stable_frac = {warmup_frac + stable_frac} leaves no decay phase"
+        )
+    if peak_lr <= 0 or final_lr <= 0:
+        raise ValueError("peak_lr and final_lr must be positive")
+    if final_lr > peak_lr:
+        raise ValueError(f"final_lr {final_lr} exceeds peak_lr {peak_lr}")
+
+    warmup_steps = max(1, int(total_steps * warmup_frac))
+    stable_end = max(warmup_steps, int(total_steps * (warmup_frac + stable_frac)))
+    floor = final_lr / peak_lr
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return (step + 1) / warmup_steps
+        if step < stable_end:
+            return 1.0
+        progress = (step - stable_end) / max(1, total_steps - 1 - stable_end)
+        return 1.0 + (floor - 1.0) * min(progress, 1.0)
+
+    return lr_lambda

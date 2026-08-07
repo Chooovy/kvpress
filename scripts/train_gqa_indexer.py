@@ -4,21 +4,28 @@
 """
 Train a GQA lightning indexer by attention distillation on the longmino corpus.
 
-    python -m scripts.train_gqa_indexer \\
-        --data-root /path/to/longmino_256k_filtered \\
-        --model Qwen/Qwen3-8B --stage dense --schedule 8192:200,32768:800
+    # once: remove tokenization from the training loop
+    python -m scripts.pretokenize_longmino --data-root RAW --out TOK --seq-len 65536
+
+    # stage 1 at 32K, stage 2 at 64K
+    python -m scripts.train_gqa_indexer --data-root RAW --tokenized TOK \\
+        --stage dense --schedule 32768:1500
 
 Only the indexer is trained; the backbone is frozen, which is what makes the teacher a fixed
 reference. ``freeze_all_but_indexer`` enforces that and raises if it matches nothing, so a
 typo in ``--scorer-attr`` cannot silently train the whole model.
 
-Two things this script does that a generic training loop would not:
+Three things this script does that a generic training loop would not:
 
-**The length curriculum rebuilds the loader.** Stage 1 is ``O(L^2)`` in compute -- measured
-3.9x per doubling on an H20 -- so 200 steps at 8K cost roughly what 13 steps at 32K do, while
-still teaching the indexer the shape of attention. Changing ``seq_len`` changes which
-documents are even eligible, so the dataloader is rebuilt at each stage boundary rather than
-reused.
+**WSD, not cosine.** Warmup 10% to ``--peak-lr``, hold 60%, then decay linearly to
+``--final-lr`` on the last step. The stable phase can be lengthened without changing any other
+step's value; with cosine, extending a run rescales the whole curve, so a resumed or extended
+run is not comparable with the original.
+
+**The length curriculum rebuilds the loader.** Changing ``seq_len`` changes which documents
+are even eligible -- and, with ``--tokenized``, which slice of the stored array is read -- so
+the loader is rebuilt at each stage boundary rather than reused. Reusing it would silently
+keep the previous length.
 
 **It checkpoints only the indexer.** ``indexer_state_dict`` filters to the scorer parameters,
 a few MB against a 16 GB backbone, and ``load_indexer_state_dict`` refuses a checkpoint whose
@@ -27,6 +34,10 @@ keys do not match the current geometry instead of silently loading nothing.
 Stage 2 (``--stage sparse``) needs a fixed ``--topk``: deriving it from a keep-ratio makes the
 retained support tensor ``O(L^2)``, which would cap length far below what the loss itself
 allows. ``FusedIndexerTrainer`` refuses a ratio in that mode for the same reason.
+
+At 64K only ``2e16`` and ``2e17`` have documents long enough to qualify (measured: 100% of
+each, versus 0% for ``2e15``/``synth_*``, whose medians sit near 43K). So the stage-2 subset
+list is not a preference -- it is the only choice that yields any data at that length.
 """
 
 from __future__ import annotations
@@ -34,7 +45,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
 import os
 import sys
 import time
@@ -58,9 +68,13 @@ from kvpress.presses.gqa_indexer.data import (  # noqa: E402
     SUBSETS,
     LengthSchedule,
     LongminoConfig,
+    TokenizedConfig,
     build_dataloader,
+    build_tokenized_dataloader,
     describe_subsets,
     env_rank_and_world_size,
+    read_index,
+    wsd_lr_lambda,
 )
 
 logger = logging.getLogger("train_gqa_indexer")
@@ -93,26 +107,50 @@ def build_model(name: str, dtype: torch.dtype, attn: str):
 
 
 def build_optimizer(params, args):
-    """AdamW plus a linear-warmup/cosine-decay schedule over the whole curriculum."""
+    """
+    AdamW with a Warmup-Stable-Decay schedule.
+
+    The optimizer is constructed at ``--peak-lr`` and ``wsd_lr_lambda`` returns a multiplier,
+    so the peak is reached exactly rather than approached. WSD rather than cosine because the
+    stable phase can be lengthened without changing any other step's value -- with cosine,
+    extending a run rescales the entire curve.
+    """
     optimizer = torch.optim.AdamW(
-        params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95)
+        params, lr=args.peak_lr, weight_decay=args.weight_decay, betas=(0.9, 0.95)
     )
-    total = args.total_steps
-    warmup = max(1, int(total * args.warmup_frac))
-
-    def lr_lambda(step: int) -> float:
-        if step < warmup:
-            return (step + 1) / warmup
-        progress = (step - warmup) / max(1, total - warmup)
-        return args.min_lr_frac + (1 - args.min_lr_frac) * 0.5 * (
-            1 + math.cos(math.pi * min(progress, 1.0))
-        )
-
+    lr_lambda = wsd_lr_lambda(
+        args.total_steps,
+        warmup_frac=args.warmup_frac,
+        stable_frac=args.stable_frac,
+        peak_lr=args.peak_lr,
+        final_lr=args.final_lr,
+    )
     return optimizer, torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def loader_for(seq_len: int, args, tokenizer, rank: int, world_size: int):
-    """A loader for one stage of the curriculum."""
+    """
+    A loader for one stage of the curriculum.
+
+    With ``--tokenized`` this reads pre-tokenized ``.npy`` shards, which removes the ~0.45 s
+    per 64K sample that tokenization costs on the data path. Otherwise it tokenizes text on
+    the fly, which is fine for short runs but throttles the GPU at long sequence lengths.
+    """
+    if args.tokenized:
+        return build_tokenized_dataloader(
+            TokenizedConfig(
+                root=args.tokenized,
+                seq_len=seq_len,
+                subsets=tuple(args.subsets) if args.subsets else None,
+                take_from=args.take_from,
+                shuffle_buffer=args.shuffle_buffer,
+                seed=args.seed + seq_len,
+            ),
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            rank=rank,
+            world_size=world_size,
+        )
     config = LongminoConfig(
         root=args.data_root,
         subsets=tuple(args.subsets),
@@ -145,7 +183,8 @@ def save(path: Path, model, args, step: int, extra: dict | None = None) -> None:
             "subsets": list(args.subsets),
             "topk": args.topk,
             "teacher_mode": args.teacher_mode,
-            "lr": args.lr,
+            "peak_lr": args.peak_lr,
+            "final_lr": args.final_lr,
             "seed": args.seed,
         },
     }
@@ -159,6 +198,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     data = parser.add_argument_group("data")
     data.add_argument("--data-root", required=True, help="longmino_256k_filtered root")
+    data.add_argument(
+        "--tokenized",
+        default=None,
+        help="read pre-tokenized .npy shards from here (scripts/pretokenize_longmino.py). "
+        "Removes tokenization from the training loop entirely.",
+    )
     data.add_argument(
         "--subsets",
         nargs="+",
@@ -202,10 +247,11 @@ def main() -> int:
     loss.add_argument("--backend", choices=("auto", "torch", "triton"), default="auto")
 
     optim = parser.add_argument_group("optimization")
-    optim.add_argument("--schedule", default="8192:200,32768:800", help="SEQ_LEN:STEPS,...")
-    optim.add_argument("--lr", type=float, default=1e-4)
-    optim.add_argument("--min-lr-frac", type=float, default=0.1)
-    optim.add_argument("--warmup-frac", type=float, default=0.03)
+    optim.add_argument("--schedule", default="32768:1500", help="SEQ_LEN:STEPS,...")
+    optim.add_argument("--peak-lr", type=float, default=1e-3, help="WSD plateau")
+    optim.add_argument("--final-lr", type=float, default=5e-6, help="WSD floor, hit on the last step")
+    optim.add_argument("--warmup-frac", type=float, default=0.10)
+    optim.add_argument("--stable-frac", type=float, default=0.60)
     optim.add_argument("--weight-decay", type=float, default=0.0)
     optim.add_argument("--grad-clip", type=float, default=1.0)
     optim.add_argument("--accum-steps", type=int, default=1)
@@ -239,11 +285,32 @@ def main() -> int:
     torch.manual_seed(args.seed + rank)
     out_dir = Path(args.out)
 
-    logger.info("subsets under %s:\n%s", args.data_root, describe_subsets(args.data_root))
+    if args.tokenized:
+        index = read_index(args.tokenized)
+        if not index.get("complete", True):
+            logger.warning(
+                "%s/index.json is marked incomplete: some shards failed to pretokenize, so "
+                "this run will see less data than the index claims",
+                args.tokenized,
+            )
+        logger.info(
+            "pre-tokenized corpus: %d docs at seq_len<=%d, subsets %s",
+            index["total_docs"],
+            index["seq_len"],
+            index["subsets"],
+        )
+    else:
+        logger.info("subsets under %s:\n%s", args.data_root, describe_subsets(args.data_root))
+    total = schedule.total_steps
     logger.info(
-        "schedule: %s (%d steps total)",
+        "schedule: %s (%d steps); WSD warmup %d -> peak %.1e, stable %d, decay %d -> %.1e",
         ", ".join(f"{n}x{s}" for s, n in schedule.stages),
-        schedule.total_steps,
+        total,
+        int(total * args.warmup_frac),
+        args.peak_lr,
+        int(total * args.stable_frac),
+        total - int(total * (args.warmup_frac + args.stable_frac)),
+        args.final_lr,
     )
 
     model, tokenizer = build_model(args.model, getattr(torch, args.dtype), args.attn)

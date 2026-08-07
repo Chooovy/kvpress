@@ -17,6 +17,11 @@ import torch
 
 from kvpress.presses.gqa_indexer.data import (
     CHARS_PER_TOKEN,
+    TokenizedConfig,
+    TokenizedDataset,
+    build_tokenized_dataloader,
+    read_index,
+    wsd_lr_lambda,
     SUBSETS,
     LengthSchedule,
     LongminoConfig,
@@ -413,3 +418,203 @@ def test_length_schedule_rejects_nonpositive_stages():
 
 def test_subsets_constant_matches_the_documented_set():
     assert set(SUBSETS) == {"2e15", "2e16", "2e17", "8k_32k", "synth_cwe", "synth_rex"}
+
+
+# ----------------------------------------------------------------------
+# WSD learning-rate schedule
+# ----------------------------------------------------------------------
+def test_wsd_phases():
+    """
+    Warmup ramps, stable is exactly flat at the peak, decay lands on the floor.
+
+    The peak must be reached exactly (multiplier 1.0), not approached: the optimizer is built
+    at ``peak_lr`` and this returns a factor, so a peak of 0.99 would silently train 1% below
+    the requested rate for 60% of the run.
+    """
+    total = 1000
+    lr = wsd_lr_lambda(total, warmup_frac=0.1, stable_frac=0.6, peak_lr=1e-3, final_lr=5e-6)
+
+    assert lr(0) == pytest.approx(1 / 100), "first step must be peak/warmup, not zero"
+    assert lr(99) == pytest.approx(1.0), "peak reached at the end of warmup"
+    assert lr(100) == 1.0 and lr(500) == 1.0 and lr(699) == 1.0, "stable must be flat"
+    assert lr(total - 1) == pytest.approx(5e-6 / 1e-3), "floor hit on the LAST step"
+
+
+def test_wsd_decay_reaches_the_requested_floor_on_the_last_step():
+    """
+    LambdaLR is called with 0..total-1, so the denominator must exclude the final index.
+
+    Using ``total - stable_end`` leaves the last step above the floor -- measured 7.2e-6
+    instead of the requested 5e-6 on a 1500-step run -- which means the schedule never
+    delivers the value that was configured.
+    """
+    total, peak, final = 1500, 1e-3, 5e-6
+    lr = wsd_lr_lambda(total, peak_lr=peak, final_lr=final)
+    assert peak * lr(total - 1) == pytest.approx(final, rel=1e-9)
+
+
+def test_wsd_decay_is_monotone():
+    lr = wsd_lr_lambda(1000, peak_lr=1e-3, final_lr=5e-6)
+    values = [lr(s) for s in range(700, 1000)]
+    assert all(a >= b for a, b in zip(values, values[1:])), "decay must not increase"
+
+
+def test_wsd_is_never_zero_or_negative():
+    """A zero multiplier wastes a step; a negative one would ascend the gradient."""
+    lr = wsd_lr_lambda(50, peak_lr=1e-3, final_lr=5e-6)
+    assert all(lr(s) > 0 for s in range(60)), "including past the end, where LambdaLR may call"
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"warmup_frac": 0.0}, "warmup_frac"),
+        ({"warmup_frac": 1.0}, "warmup_frac"),
+        ({"stable_frac": -0.1}, "stable_frac"),
+        ({"warmup_frac": 0.5, "stable_frac": 0.5}, "no decay phase"),
+        ({"final_lr": 1e-2}, "exceeds peak_lr"),
+        ({"peak_lr": 0.0}, "must be positive"),
+    ],
+)
+def test_wsd_validation(kwargs, match):
+    base = {"peak_lr": 1e-3, "final_lr": 5e-6}
+    base.update(kwargs)
+    with pytest.raises(ValueError, match=match):
+        wsd_lr_lambda(100, **base)
+
+
+# ----------------------------------------------------------------------
+# Pre-tokenized corpus
+# ----------------------------------------------------------------------
+def write_tokenized(root, subset, shard, num_docs, seq_len):
+    import numpy as np
+
+    directory = root / subset
+    directory.mkdir(parents=True, exist_ok=True)
+    array = np.arange(num_docs * seq_len, dtype=np.uint32).reshape(num_docs, seq_len)
+    np.save(directory / f"{shard}.npy", array)
+    with open(directory / f"{shard}.json", "w") as handle:
+        json.dump(
+            {
+                "shard": shard,
+                "num_docs": num_docs,
+                "seq_len": seq_len,
+                "doc_ids": [f"{subset}_{i}" for i in range(num_docs)],
+                "available_tokens": [seq_len] * num_docs,
+            },
+            handle,
+        )
+    return array
+
+
+@pytest.fixture
+def tokenized(tmp_path):
+    """A two-subset pretokenized corpus with 8 documents of 64 tokens each."""
+    write_tokenized(tmp_path, "2e16", "longmino_2e16-0000", 5, 64)
+    write_tokenized(tmp_path, "2e17", "longmino_2e17-0000", 3, 64)
+    with open(tmp_path / "index.json", "w") as handle:
+        json.dump(
+            {
+                "seq_len": 64,
+                "min_tokens": 64,
+                "model": "test",
+                "dtype": "uint32",
+                "subsets": {"2e16": 5, "2e17": 3},
+                "total_docs": 8,
+                "complete": True,
+            },
+            handle,
+        )
+    return tmp_path
+
+
+def test_tokenized_reads_every_document(tokenized):
+    config = TokenizedConfig(root=str(tokenized), seq_len=64, shuffle_buffer=0)
+    samples = list(TokenizedDataset(config))
+    assert len(samples) == 8
+    assert {s["input_ids"].shape for s in samples} == {(64,)}
+    assert samples[0]["input_ids"].dtype == torch.long, "the model needs int64 ids"
+
+
+def test_tokenized_slices_a_shorter_seq_len(tokenized):
+    """
+    A shorter stage takes a prefix -- that is exactly what a shorter sequence means.
+
+    This is what lets one 64K file serve both a 32K and a 64K stage, instead of pretokenizing
+    the corpus twice.
+    """
+    config = TokenizedConfig(root=str(tokenized), seq_len=16, shuffle_buffer=0, take_from="head")
+    samples = list(TokenizedDataset(config))
+    assert all(s["input_ids"].shape == (16,) for s in samples)
+    # Row 0 of the first shard starts at 0 by construction, so a head slice is 0..15.
+    first = min(samples, key=lambda s: int(s["input_ids"][0]))
+    assert first["input_ids"].tolist() == list(range(16))
+
+
+def test_tokenized_refuses_a_longer_seq_len_than_stored(tokenized):
+    """
+    Those tokens were never written, so they cannot be recovered.
+
+    Padding instead would train the indexer on positions the loss masks out, and silently at
+    that -- the sample count and shapes would all look right.
+    """
+    with pytest.raises(ValueError, match="exceeds the pretokenized width"):
+        TokenizedDataset(TokenizedConfig(root=str(tokenized), seq_len=128))
+
+
+def test_tokenized_missing_index_names_the_fix(tmp_path):
+    with pytest.raises(FileNotFoundError, match="pretokenize_longmino"):
+        read_index(tmp_path)
+
+
+def test_tokenized_rejects_an_unknown_subset(tokenized):
+    with pytest.raises(ValueError, match="not in the pretokenized corpus"):
+        TokenizedDataset(TokenizedConfig(root=str(tokenized), seq_len=64, subsets=("8k_32k",)))
+
+
+def test_tokenized_subset_selection(tokenized):
+    config = TokenizedConfig(root=str(tokenized), seq_len=64, subsets=("2e17",), shuffle_buffer=0)
+    samples = list(TokenizedDataset(config))
+    assert len(samples) == 3
+    assert all(s["doc_id"].startswith("2e17") for s in samples)
+
+
+def test_tokenized_partitions_shards_across_ranks(tokenized):
+    config = TokenizedConfig(root=str(tokenized), seq_len=64)
+    assigned = [
+        set(TokenizedDataset(config, rank=r, world_size=2).assigned_paths()) for r in range(2)
+    ]
+    assert sum(len(a) for a in assigned) == len(set().union(*assigned)), "ranks overlap"
+
+
+def test_tokenized_random_window_stays_in_bounds(tokenized):
+    """A random window must not run past the stored width."""
+    config = TokenizedConfig(
+        root=str(tokenized), seq_len=16, take_from="random", shuffle_buffer=0, seed=3
+    )
+    for sample in TokenizedDataset(config):
+        assert sample["input_ids"].shape == (16,)
+        assert int(sample["input_ids"].max()) < 8 * 64, "index escaped the array"
+
+
+def test_tokenized_dataloader_end_to_end(tokenized):
+    config = TokenizedConfig(root=str(tokenized), seq_len=32, shuffle_buffer=0)
+    loader = build_tokenized_dataloader(config, batch_size=2, num_workers=0)
+    batches = list(loader)
+    assert batches and all(b["input_ids"].shape == (2, 32) for b in batches)
+
+
+def test_tokenized_samples_do_not_alias_the_mmap(tokenized):
+    """
+    Each sample must own its memory.
+
+    A tensor built directly on a memory-mapped page would read freed memory once the kernel
+    evicts it -- an intermittent, data-dependent corruption rather than a clean failure.
+    """
+    config = TokenizedConfig(root=str(tokenized), seq_len=32, shuffle_buffer=0)
+    samples = list(TokenizedDataset(config))
+    tensor = samples[0]["input_ids"]
+    assert tensor.is_contiguous()
+    before = int(tensor[0])
+    tensor[0] = 12345  # writable, so it is a copy rather than a read-only mmap view
+    assert int(tensor[0]) == 12345 and before != 12345

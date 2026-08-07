@@ -32,6 +32,18 @@ from kvpress.presses.gqa_indexer.aggregate import (
     expand_chunk_indices,
     reduce_queries,
 )
+from kvpress.presses.gqa_indexer.autotune import (
+    Candidate,
+    Measurement,
+    Profile,
+    autotune,
+    autotune_cached,
+    batch_for_length,
+    candidate_grid,
+    default_token_budget,
+    pick_best,
+    profile_key,
+)
 from kvpress.presses.gqa_indexer.data import (
     SUBSETS,
     LengthSchedule,
@@ -196,4 +208,15 @@ __all__ = [
     "decompose_mask",
     "triton_indexer_ce_rows",
     "triton_indexer_loss",
+    # Per-length batch/tile autotuning
+    "Candidate",
+    "Measurement",
+    "Profile",
+    "autotune",
+    "autotune_cached",
+    "batch_for_length",
+    "candidate_grid",
+    "default_token_budget",
+    "pick_best",
+    "profile_key",
 ]

@@ -6,23 +6,25 @@
 #
 #   scripts/train_gqa_indexer.sh tokenize   # once: pre-tokenize to 64K (serves both stages)
 #   scripts/train_gqa_indexer.sh smoke      # 2 steps, verifies the whole path
-#   scripts/train_gqa_indexer.sh stage1     # dense  @ 32K
+#   scripts/train_gqa_indexer.sh profile    # once per machine: measure batch/tile per length
+#   scripts/train_gqa_indexer.sh stage1     # dense, 8K -> 16K -> 32K curriculum
 #   scripts/train_gqa_indexer.sh stage2     # sparse @ 64K, from stage 1's checkpoint
 #
 # Run tokenize first, then stage1, then stage2 (stage 2 loads stage 1's final.pt). Override
 # anything with env vars, e.g.  STEPS=200 scripts/train_gqa_indexer.sh stage1
 #
-# Runs on NGPU GPUs of one node via torchrun. Per-GPU batch size is 1, so the effective batch
-# is NGPU sequences: at these lengths the sequence axis already saturates a GPU, and raising
-# per-GPU batch size would halve the usable length instead of adding throughput.
+# Runs on NGPU GPUs of one node via torchrun. Per-GPU batch size is autotuned per curriculum
+# length rather than fixed at 1: a token budget is held constant across the curriculum, so 8K
+# runs a larger batch than 32K and the short stages stop leaving three quarters of the card
+# idle. Set AUTOTUNE=0 to go back to a flat --batch-size.
 #
 # LR is WSD throughout: warmup 10% to PEAK_LR, hold 60%, decay linearly to FINAL_LR on the
 # last step. The LR is NOT scaled by NGPU -- the gradient is averaged across ranks, not summed,
 # so its magnitude is unchanged and the peak that works on one GPU works on eight.
 #
-# STEPS counts OPTIMIZER steps, not samples, so on 8 GPUs the same count sees 8x the data
-# (1500 x 8 x 32K = 393M tokens rather than 49M). That is the intent -- 170M trainable
-# parameters on 49M tokens is thin. To hold tokens fixed instead, divide: STEPS=188.
+# STEPS counts OPTIMIZER steps, not samples. With autotune the tokens per step also vary by
+# stage (batch x seq_len is held roughly constant), so read the "autotuned token count" line
+# the script logs rather than deriving it from STEPS.
 set -euo pipefail
 
 MODE="${1:-smoke}"
@@ -39,6 +41,12 @@ PEAK_LR="${PEAK_LR:-1e-3}"
 FINAL_LR="${FINAL_LR:-5e-6}"
 WARMUP_FRAC="${WARMUP_FRAC:-0.10}"
 STABLE_FRAC="${STABLE_FRAC:-0.60}"
+
+# Autotune batch size and tile shape per curriculum length. On by default: with a flat batch
+# of 1 the 8K stage uses a quarter of the memory the 32K stage does, so it runs a fraction of
+# the card for no reason. TOKEN_BUDGET=0 derives the budget from free VRAM after weights.
+AUTOTUNE="${AUTOTUNE:-1}"
+TOKEN_BUDGET="${TOKEN_BUDGET:-0}"
 
 cd "$(dirname "$0")/.."
 
@@ -106,6 +114,24 @@ case "$MODE" in
     # EXPECTED: the reported loss JUMPS by ~0.69 = log 2 at each boundary. That is arithmetic,
     # not a regression -- loss(L) ~ log(L) + const, measured +0.7076/+0.7057/+0.6990 per
     # doubling. Nothing needs to react to it.
+    #
+    # Batch size is autotuned per length, holding batch x seq_len roughly constant (so roughly
+    # 4 / 2 / 1 across 8K / 16K / 32K). Peak memory tracks batch x seq_len -- every retained
+    # term is per-token-per-sequence -- so a constant token count means constant PEAK MEMORY
+    # and constant tokens/step, and the boundaries stay pure length changes. That last part is
+    # what keeps ONE lr schedule defensible: tokens/step is the quantity a schedule is
+    # implicitly tuned against, so varying it at a boundary would confound the very thing the
+    # comment above claims is unconfounded.
+    #
+    # Step TIME is not constant and is not meant to be: the loss is O(B * L^2), which at
+    # constant B*L is still linear in L, so a 32K step costs ~4x an 8K one. Batching changes no
+    # FLOPs (work per token is L regardless of B) -- it fills the device better, which is the
+    # actual underutilization being fixed here.
+    #
+    # Note --key-tile/--query-tile are NOT passed here any more. They do not reach the Triton
+    # kernels at all (those take block_m/block_n, default 64), and backend=auto selects Triton
+    # for every mask stage 1 builds -- so the only thing they affected was teacher_lse_from_qk.
+    # The profiler sweeps both and records which backend actually ran.
     EXTRA=()
     if [[ -f "$TOKENIZED/index.json" ]]; then
       # No retokenization needed for the curriculum: every stage length is <= the stored
@@ -116,16 +142,40 @@ case "$MODE" in
       EXTRA+=(--subsets 2e15 2e16 synth_cwe synth_rex)
       echo "no $TOKENIZED/index.json; tokenizing on the fly (run '$0 tokenize' to avoid this)"
     fi
+    if [[ "$AUTOTUNE" != "0" ]]; then
+      # The cache is keyed on GPU, model geometry, stage and backend, so it is safe to share
+      # and safe to keep: a different machine misses rather than silently reusing.
+      EXTRA+=(--autotune --token-budget "$TOKEN_BUDGET"
+              --autotune-cache "$OUT/autotune.json")
+    fi
     exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer \
       --data-root "$DATA_ROOT" --model "$MODEL" "${EXTRA[@]}" \
       --schedule "${SCHEDULE:-8192:300,16384:300,32768:900}" \
       --stage dense \
       --peak-lr "$PEAK_LR" --final-lr "$FINAL_LR" \
       --warmup-frac "$WARMUP_FRAC" --stable-frac "$STABLE_FRAC" \
-      --batch-size 1 --take-from random --shuffle-buffer 64 \
-      --num-workers "${WORKERS:-2}" --key-tile 2048 --query-tile 2048 \
+      --batch-size "${BATCH_SIZE:-1}" --take-from random --shuffle-buffer 64 \
+      --num-workers "${WORKERS:-2}" \
       --out "$OUT/stage1" --metrics-file "$OUT/stage1/metrics.jsonl" \
       --save-every "${SAVE_EVERY:-200}" --log-every "${LOG_EVERY:-10}"
+    ;;
+
+  profile)
+    # Measure batch/tile per curriculum length and write the cache, without training.
+    #
+    # Single-process on purpose: only rank 0 measures during training anyway (the ranks must
+    # agree on batch size, since a differing batch would desynchronize the gradient allreduce),
+    # so eight processes here would be eight times the work for one answer. --dry-run stops
+    # after 2 steps; the profiling itself happens before the loop, so the cache is complete.
+    exec python -m scripts.train_gqa_indexer \
+      --data-root "$DATA_ROOT" --model "$MODEL" \
+      --tokenized "$TOKENIZED" --subsets 2e16 2e17 \
+      --schedule "${SCHEDULE:-8192:1,16384:1,32768:1}" \
+      --stage dense \
+      --autotune --autotune-force --token-budget "$TOKEN_BUDGET" \
+      --autotune-cache "$OUT/autotune.json" \
+      --num-workers 0 --log-every 1 --save-every 0 \
+      --out "$OUT/profile" --dry-run
     ;;
 
   stage2)
@@ -158,7 +208,7 @@ case "$MODE" in
     ;;
 
   *)
-    echo "usage: $0 {tokenize|smoke|stage1|stage2}" >&2
+    echo "usage: $0 {tokenize|smoke|profile|stage1|stage2}" >&2
     exit 1
     ;;
 esac

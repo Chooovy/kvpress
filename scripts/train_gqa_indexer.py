@@ -49,6 +49,7 @@ import math
 import os
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -65,6 +66,12 @@ from kvpress.presses.gqa_indexer import (  # noqa: E402
     fused_indexer_training_step,
     indexer_state_dict,
     load_indexer_state_dict,
+)
+from kvpress.presses.gqa_indexer.autotune import (  # noqa: E402
+    Profile,
+    autotune_cached,
+    default_token_budget,
+    profile_key,
 )
 from kvpress.presses.gqa_indexer.data import (  # noqa: E402
     SUBSETS,
@@ -196,14 +203,22 @@ def build_optimizer(params, args):
     return optimizer, torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def loader_for(seq_len: int, args, tokenizer, rank: int, world_size: int):
+def loader_for(
+    seq_len: int, args, tokenizer, rank: int, world_size: int, batch_size: int | None = None
+):
     """
     A loader for one stage of the curriculum.
 
     With ``--tokenized`` this reads pre-tokenized ``.npy`` shards, which removes the ~0.45 s
     per 64K sample that tokenization costs on the data path. Otherwise it tokenizes text on
     the fly, which is fine for short runs but throttles the GPU at long sequence lengths.
+
+    ``batch_size`` overrides ``--batch-size`` for this stage, which is how ``--autotune``
+    raises the batch at short lengths. It is a parameter rather than a mutation of ``args``
+    because the two differ per stage and a mutated ``args`` would make the logged
+    configuration disagree with what actually ran.
     """
+    batch_size = args.batch_size if batch_size is None else batch_size
     if args.tokenized:
         return build_tokenized_dataloader(
             TokenizedConfig(
@@ -214,7 +229,7 @@ def loader_for(seq_len: int, args, tokenizer, rank: int, world_size: int):
                 shuffle_buffer=args.shuffle_buffer,
                 seed=args.seed + seq_len,
             ),
-            batch_size=args.batch_size,
+            batch_size=batch_size,
             num_workers=args.num_workers,
             rank=rank,
             world_size=world_size,
@@ -231,7 +246,7 @@ def loader_for(seq_len: int, args, tokenizer, rank: int, world_size: int):
     return build_dataloader(
         config,
         tokenizer,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         num_workers=args.num_workers,
         rank=rank,
         world_size=world_size,
@@ -260,6 +275,111 @@ def save(path: Path, model, args, step: int, extra: dict | None = None) -> None:
         payload["metrics"] = extra
     torch.save(payload, path)
     logger.info("saved %s (step %d)", path, step)
+
+
+def run_autotune(
+    args, model, trainer, schedule, rank: int, world_size: int, device: str
+) -> dict[int, Profile]:
+    """
+    Measure batch size and tile shape for every length in the curriculum.
+
+    Only **rank 0** measures, and the result is broadcast. Two reasons, and the second is the
+    load-bearing one:
+
+    1. Eight ranks profiling the same grid on identical GPUs is eight times the work for one
+       answer.
+    2. Ranks must agree on batch size. The gradient allreduce is a collective, so a rank that
+       picked a different batch would contribute a differently-weighted gradient at best, and
+       at worst the ranks would desynchronize on the number of loader pulls per step. Timing
+       is noisy enough that independent measurement *would* sometimes disagree, so agreement
+       has to be imposed rather than hoped for.
+
+    Profiling uses random token ids rather than the real loader: the goal is to measure the
+    loss kernels at a given shape, and the shape is all they see. That also keeps the profile
+    independent of where the data loader happens to be.
+    """
+    if not torch.cuda.is_available():
+        logger.warning("autotune needs CUDA to measure anything; using token-budget defaults")
+        budget = args.token_budget or max(sl for sl, _ in schedule.stages)
+        return {
+            sl: Profile.fallback(sl, budget, max_batch=args.max_batch)
+            for sl, _ in schedule.stages
+        }
+
+    budget = args.token_budget
+    if budget <= 0:
+        total = torch.cuda.get_device_properties(device).total_memory
+        weights = sum(p.numel() * p.element_size() for p in model.parameters())
+        budget = default_token_budget(total, weights)
+        logger.info(
+            "token budget %d derived from %.0f GiB total minus %.1f GiB of weights "
+            "(override with --token-budget)",
+            budget,
+            total / 1024**3,
+            weights / 1024**3,
+        )
+
+    seq_lens = list(dict.fromkeys(sl for sl, _ in schedule.stages))
+    cache_path = args.autotune_cache or str(Path(args.out) / "autotune.json")
+    key = profile_key(
+        model_name=args.model,
+        stage=args.stage,
+        backend=args.backend,
+        dtype=args.dtype,
+        layers=int(model.config.num_hidden_layers),
+        topk=args.topk or None,
+    )
+
+    profiles: dict[int, Profile] = {}
+    if rank == 0:
+
+        def step_fn(batch_size: int, seq_len: int) -> None:
+            ids = torch.randint(0, 1000, (batch_size, seq_len), device=device)
+            loss, _ = fused_indexer_training_step(model, trainer, input_ids=ids)
+            loss.backward()
+            model.zero_grad(set_to_none=True)
+            del ids, loss
+
+        profiles = autotune_cached(
+            step_fn,
+            trainer,
+            seq_lens,
+            cache_path=cache_path,
+            key=key,
+            token_budget=budget,
+            force=args.autotune_force,
+            max_batch=args.max_batch,
+        )
+        for profile in profiles.values():
+            logger.info("autotune chose %s", profile.describe())
+
+    if world_size > 1:
+        # Broadcast rank 0's choice through a plain object list; these are a handful of ints
+        # once per run, so the simplest correct primitive is the right one.
+        payload = [{sl: asdict(p) for sl, p in profiles.items()}] if rank == 0 else [None]
+        dist.broadcast_object_list(payload, src=0)
+        profiles = {int(sl): Profile(**fields) for sl, fields in payload[0].items()}
+        logger.info(
+            "rank %d using rank 0's profile: %s",
+            rank,
+            ", ".join(f"L={sl}:B={p.batch_size}" for sl, p in sorted(profiles.items())),
+        )
+    return profiles
+
+
+def apply_profile(trainer, profile: Profile, args) -> int:
+    """
+    Push a profile onto the trainer and return the batch size to use.
+
+    Returns rather than sets, because batch size belongs to the loader, which is rebuilt at
+    the boundary anyway -- so the caller threads it through instead of having two places that
+    each believe they own it.
+    """
+    trainer.key_tile = profile.key_tile
+    trainer.query_tile = profile.query_tile
+    trainer.block_m = profile.block_m
+    trainer.block_n = profile.block_n
+    return profile.batch_size
 
 
 def main() -> int:
@@ -313,6 +433,51 @@ def main() -> int:
     loss.add_argument("--query-tile", type=int, default=512)
     loss.add_argument("--topk-tile", type=int, default=128)
     loss.add_argument("--backend", choices=("auto", "torch", "triton"), default="auto")
+    loss.add_argument(
+        "--block-m", type=int, default=64, help="Triton query-block size (power of two)"
+    )
+    loss.add_argument(
+        "--block-n",
+        type=int,
+        default=64,
+        help="Triton key-block size. Note --key-tile/--query-tile do NOT reach the Triton "
+        "kernels; on backend=auto (the default for stage 1) these blocks are what matters.",
+    )
+
+    tune = parser.add_argument_group("autotune")
+    tune.add_argument(
+        "--autotune",
+        action="store_true",
+        help="before training, measure batch size and tile shape per curriculum length and "
+        "reuse the result. Keeps B*seq_len roughly constant, so a short stage fills the GPU "
+        "instead of running at a quarter of it.",
+    )
+    tune.add_argument(
+        "--autotune-cache",
+        default=None,
+        help="JSON file of profiling results; defaults to <out>/autotune.json. Keyed on GPU, "
+        "model geometry, stage and backend, so a stale entry cannot mis-tune another machine.",
+    )
+    tune.add_argument(
+        "--autotune-force",
+        action="store_true",
+        help="re-measure even when the cache has an entry",
+    )
+    tune.add_argument(
+        "--token-budget",
+        type=int,
+        default=0,
+        help="tokens per sequence-batch (B*seq_len) to hold constant across the curriculum. "
+        "0 derives it from free VRAM after weights. This is the knob to lower if autotune "
+        "reports OOM at every candidate.",
+    )
+    tune.add_argument(
+        "--max-batch",
+        type=int,
+        default=0,
+        help="cap on autotuned batch size (0 = uncapped); use when the data loader, not "
+        "memory, is the limit",
+    )
 
     optim = parser.add_argument_group("optimization")
     optim.add_argument("--schedule", default="32768:1500", help="SEQ_LEN:STEPS,...")
@@ -456,8 +621,29 @@ def main() -> int:
         skip_sink_in_loss=args.skip_sink_in_loss,
         loss_coeff=args.loss_coeff,
         backend=args.backend,
+        block_m=args.block_m,
+        block_n=args.block_n,
     )
     optimizer, lr_schedule = build_optimizer(params, args)
+
+    # Profile before the loop, not lazily at each boundary: a mid-run measurement would charge
+    # its OOM probes to a step that also has to succeed, and the whole point of measuring is
+    # that some candidates are expected to fail.
+    profiles: dict[int, Profile] = {}
+    if args.autotune:
+        profiles = run_autotune(args, model, trainer, schedule, rank, world_size, device)
+        planned = sum(
+            sl * st * profiles[sl].batch_size for sl, st in schedule.stages
+        ) * world_size
+        logger.info(
+            "autotuned token count: %.0fM over %d steps (batch %s per stage) -- with "
+            "--batch-size %d it would have been %.0fM",
+            planned / 1e6,
+            schedule.total_steps,
+            "/".join(str(profiles[sl].batch_size) for sl, _ in schedule.stages),
+            args.batch_size,
+            sum(sl * st for sl, st in schedule.stages) * world_size * args.batch_size / 1e6,
+        )
 
     # Only rank 0 writes metrics: eight ranks appending to one file interleave partial lines,
     # and the logged values are already cross-rank means, so the other seven would duplicate
@@ -469,6 +655,10 @@ def main() -> int:
         metrics_path.parent.mkdir(parents=True, exist_ok=True)
         metrics_handle = open(metrics_path, "a")
     current_len, loader, iterator = None, None, None
+    # Initialized here, not only inside the boundary branch: the metrics payload reads it on
+    # every step, and relying on the first iteration always being a boundary to define it
+    # would break the moment the loop grew a resume path.
+    stage_batch = args.batch_size
     window: list[float] = []
     started = time.time()
     step = 0
@@ -496,7 +686,17 @@ def main() -> int:
                     )
                 else:
                     logger.info("step %d: starting at seq_len=%d", step, seq_len)
-                loader = loader_for(seq_len, args, tokenizer, rank, world_size)
+                # Tiles and batch come from the profile for this length, if there is one.
+                # Applied at the boundary rather than once up front because they differ per
+                # stage -- that is the entire point of profiling per length.
+                stage_batch = args.batch_size
+                profile = profiles.get(seq_len)
+                if profile is not None:
+                    stage_batch = apply_profile(trainer, profile, args)
+                    logger.info("step %d: %s", step, profile.describe())
+                loader = loader_for(
+                    seq_len, args, tokenizer, rank, world_size, batch_size=stage_batch
+                )
                 iterator = iter(loader)
                 current_len = seq_len
 
@@ -571,6 +771,11 @@ def main() -> int:
                                 "recall": recall,
                                 "peak_gib": peak,
                                 "backend": trainer.backend_used,
+                                # Recorded per step because --autotune varies it per stage: a
+                                # tokens/step figure reconstructed from --batch-size would be
+                                # wrong for every stage but the last.
+                                "batch_size": stage_batch,
+                                "tokens": stage_batch * seq_len * world_size,
                                 "per_layer": {str(k): float(v) for k, v in per_layer.items()},
                             }
                         )

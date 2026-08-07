@@ -12,9 +12,17 @@
 # Run tokenize first, then stage1, then stage2 (stage 2 loads stage 1's final.pt). Override
 # anything with env vars, e.g.  STEPS=200 scripts/train_gqa_indexer.sh stage1
 #
+# Runs on NGPU GPUs of one node via torchrun. Per-GPU batch size is 1, so the effective batch
+# is NGPU sequences: at these lengths the sequence axis already saturates a GPU, and raising
+# per-GPU batch size would halve the usable length instead of adding throughput.
+#
 # LR is WSD throughout: warmup 10% to PEAK_LR, hold 60%, decay linearly to FINAL_LR on the
-# last step. Batch size is 1 -- at these lengths the sequence axis already saturates the GPU,
-# so a larger batch would just halve the usable length.
+# last step. The LR is NOT scaled by NGPU -- the gradient is averaged across ranks, not summed,
+# so its magnitude is unchanged and the peak that works on one GPU works on eight.
+#
+# STEPS counts OPTIMIZER steps, not samples, so on 8 GPUs the same count sees 8x the data
+# (1500 x 8 x 32K = 393M tokens rather than 49M). That is the intent -- 170M trainable
+# parameters on 49M tokens is thin. To hold tokens fixed instead, divide: STEPS=188.
 set -euo pipefail
 
 MODE="${1:-smoke}"
@@ -22,6 +30,10 @@ DATA_ROOT="${DATA_ROOT:-/apdcephfs_zw31/share_303843174/user/marcushaogu/dataset
 TOKENIZED="${TOKENIZED:-/apdcephfs_zw31/share_303843174/user/marcushaogu/datasets/longmino_tokenized_64k}"
 MODEL="${MODEL:-/apdcephfs_zw31/share_303843174/user/marcushaogu/models/Qwen3-8B}"
 OUT="${OUT:-/apdcephfs_zw31/share_303843174/user/marcushaogu/models/Qwen-3-8B-gqa_indexer}"
+
+NNODES="${NNODES:-1}"
+NGPU="${NGPU:-8}"
+MASTER_PORT="${MASTER_PORT:-29511}"
 
 PEAK_LR="${PEAK_LR:-1e-3}"
 FINAL_LR="${FINAL_LR:-5e-6}"
@@ -37,6 +49,16 @@ export TOKENIZERS_PARALLELISM=false
 # segment instead of failing on a large contiguous request, which is exactly the shape of
 # request the tiled loss makes.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# Surface the rank that actually failed instead of a generic "one worker died".
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+
+# torchrun only when there is more than one GPU: a single-process run skips the process group
+# entirely, which keeps the smoke test debuggable (real traceback, no rank multiplexing).
+if [[ "$NGPU" -gt 1 ]]; then
+  LAUNCH=(torchrun --nnodes "$NNODES" --nproc_per_node "$NGPU" --master_port "$MASTER_PORT")
+else
+  LAUNCH=(python)
+fi
 
 case "$MODE" in
   tokenize)
@@ -55,7 +77,8 @@ case "$MODE" in
     ;;
 
   smoke)
-    # Shortest path that still exercises the loader, hooks, loss, backward and checkpointing.
+    # Deliberately single-process: a real traceback beats eight interleaved ones when the
+    # thing being verified is whether the path works at all.
     exec python -m scripts.train_gqa_indexer \
       --data-root "$DATA_ROOT" --model "$MODEL" \
       --subsets 8k_32k --schedule "${SCHEDULE:-8192:2}" \
@@ -75,7 +98,7 @@ case "$MODE" in
       EXTRA+=(--subsets 2e15 2e16 synth_cwe synth_rex)
       echo "no $TOKENIZED/index.json; tokenizing on the fly (run '$0 tokenize' to avoid this)"
     fi
-    exec python -m scripts.train_gqa_indexer \
+    exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer \
       --data-root "$DATA_ROOT" --model "$MODEL" "${EXTRA[@]}" \
       --schedule "32768:${STEPS:-1500}" \
       --stage dense \
@@ -101,7 +124,7 @@ case "$MODE" in
       EXTRA+=(--tokenized "$TOKENIZED")
     fi
     # At 64K only these two subsets have qualifying documents at all.
-    exec python -m scripts.train_gqa_indexer \
+    exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer \
       --data-root "$DATA_ROOT" --model "$MODEL" "${EXTRA[@]}" \
       --subsets 2e16 2e17 \
       --schedule "65536:${STEPS:-600}" \

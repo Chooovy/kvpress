@@ -51,6 +51,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -80,7 +81,41 @@ from kvpress.presses.gqa_indexer.data import (  # noqa: E402
 logger = logging.getLogger("train_gqa_indexer")
 
 
-def build_model(name: str, dtype: torch.dtype, attn: str):
+def setup_distributed() -> tuple[int, int, int]:
+    """
+    Join the process group if ``torchrun`` launched us, and bind this rank to its GPU.
+
+    Returns ``(rank, world_size, local_rank)``. Single-process runs get ``(0, 1, 0)`` and no
+    process group, so the same script runs both ways without a flag.
+
+    ``set_device`` must happen before any CUDA allocation: NCCL binds the current device at
+    init, and every rank defaulting to ``cuda:0`` is the classic way to get eight processes
+    fighting over one GPU while the other seven idle.
+    """
+    rank, world_size = env_rank_and_world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    if world_size > 1:
+        if not dist.is_available():
+            raise RuntimeError(f"WORLD_SIZE={world_size} but torch.distributed is unavailable")
+        torch.cuda.set_device(local_rank)
+        if not dist.is_initialized():
+            # NCCL for gradients; the 680 MB fp32 allreduce per step costs ~3 ms on NVLink,
+            # against a step that is seconds long at these sequence lengths.
+            dist.init_process_group(backend="nccl")
+        logger.info(
+            "rank %d/%d on cuda:%d (%s)",
+            rank,
+            world_size,
+            local_rank,
+            torch.cuda.get_device_name(local_rank),
+        )
+    elif torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    return rank, world_size, local_rank
+
+
+def build_model(name: str, dtype: torch.dtype, attn: str, device: str):
     """
     Load the frozen backbone.
 
@@ -101,9 +136,41 @@ def build_model(name: str, dtype: torch.dtype, attn: str):
         if config is not None:
             config._attn_implementation = attn
 
-    model = model.to("cuda").eval()
+    model = model.to(device).eval()
     model.requires_grad_(False)
     return model, tokenizer
+
+
+def average_gradients(params, world_size: int) -> None:
+    """
+    All-reduce the indexer gradients to their mean across ranks.
+
+    Done explicitly rather than via ``DistributedDataParallel``: DDP hooks a module's forward
+    to know when to reduce, but the indexers are invoked from ``FusedIndexerTrainer``'s loss
+    hook, not from the wrapped model's forward -- so DDP's autograd hooks would never fire for
+    them. The reduction itself is what DDP would do anyway, and at 170M parameters (680 MB
+    fp32, ~3 ms on NVLink) it is under 1% of a multi-second step.
+
+    Gradients are flattened into one buffer for a single collective; eight separate small
+    allreduces per layer would be latency-bound rather than bandwidth-bound.
+    """
+    grads = [p.grad for p in params if p.grad is not None]
+    if not grads:
+        # Every rank must call this the same number of times or the collective deadlocks, so
+        # an empty gradient list is a hard error rather than a silent skip.
+        raise RuntimeError("no gradients to average; ranks would desynchronize")
+    flat = torch._utils._flatten_dense_tensors(grads)
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+    flat /= world_size
+    for grad, synced in zip(grads, torch._utils._unflatten_dense_tensors(flat, grads)):
+        grad.copy_(synced)
+
+
+def all_reduce_mean(value: float, device: str) -> float:
+    """Mean of a scalar across ranks, for logging."""
+    tensor = torch.tensor([value], device=device, dtype=torch.float32)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return float(tensor.item()) / dist.get_world_size()
 
 
 def build_optimizer(params, args):
@@ -280,8 +347,15 @@ def main() -> int:
 
     schedule = LengthSchedule.parse(args.schedule)
     args.total_steps = schedule.total_steps
-    rank, world_size = env_rank_and_world_size()
+    rank, world_size, local_rank = setup_distributed()
+    device = f"cuda:{local_rank}"
 
+    # Only rank 0 logs at INFO; the rest would interleave eight copies of every line.
+    # Warnings and errors stay visible everywhere, since a fault on rank 5 must not be silent.
+    logging.getLogger().setLevel(logging.INFO if rank == 0 else logging.WARNING)
+
+    # Distinct seeds so the ranks draw different windows -- an identical seed would make all
+    # eight see the same documents, turning an 8x batch into an 8x-redundant one.
     torch.manual_seed(args.seed + rank)
     out_dir = Path(args.out)
 
@@ -303,6 +377,15 @@ def main() -> int:
         logger.info("subsets under %s:\n%s", args.data_root, describe_subsets(args.data_root))
     total = schedule.total_steps
     logger.info(
+        "world_size %d x batch_size %d = %d sequences/step; STEPS counts optimizer steps, so "
+        "this run sees %.0fM tokens at seq_len=%d",
+        world_size,
+        args.batch_size,
+        world_size * args.batch_size,
+        total * world_size * args.batch_size * schedule.stages[0][0] / 1e6,
+        schedule.stages[0][0],
+    )
+    logger.info(
         "schedule: %s (%d steps); WSD warmup %d -> peak %.1e, stable %d, decay %d -> %.1e",
         ", ".join(f"{n}x{s}" for s, n in schedule.stages),
         total,
@@ -313,7 +396,7 @@ def main() -> int:
         args.final_lr,
     )
 
-    model, tokenizer = build_model(args.model, getattr(torch, args.dtype), args.attn)
+    model, tokenizer = build_model(args.model, getattr(torch, args.dtype), args.attn, device)
 
     press_kwargs = {"compression_ratio": args.compression_ratio, "scorer_attr": args.scorer_attr}
     for name in ("rope_dim", "head_dim", "n_heads"):
@@ -337,6 +420,22 @@ def main() -> int:
         total / 1e9,
         100 * trainable / total,
     )
+
+    if world_size > 1:
+        # DDP wraps the *indexer modules*, not the backbone: the backbone is frozen, so
+        # wrapping the whole model would register 8B parameters with the reducer and allreduce
+        # nothing. Each indexer is wrapped separately because they are invoked from the loss
+        # hook rather than from a single forward, so there is no one module DDP could hook.
+        #
+        # A plain allreduce of the gradients after backward is used instead, which is exactly
+        # what DDP would do here (170M params, 680 MB fp32, ~3 ms on NVLink) without needing
+        # DDP's forward-hook machinery to fire on a module it never sees called.
+        logger.info(
+            "distributed: averaging %.1fM gradients across %d ranks each step (%.0f MB fp32)",
+            trainable / 1e6,
+            world_size,
+            trainable * 4 / 1e6,
+        )
 
     trainer = FusedIndexerTrainer(
         press=press,
@@ -381,16 +480,29 @@ def main() -> int:
                     iterator = iter(loader)
                     batch = next(iterator)
 
-                input_ids = batch["input_ids"].to("cuda", non_blocking=True)
+                input_ids = batch["input_ids"].to(device, non_blocking=True)
                 loss, per_layer = fused_indexer_training_step(
                     model, trainer, input_ids=input_ids
                 )
                 (loss / args.accum_steps).backward()
                 accumulated += float(loss) / args.accum_steps
 
+            if world_size > 1:
+                # Average gradients BEFORE clipping, so every rank clips the same vector and
+                # therefore takes an identical step. Clipping first would let each rank scale
+                # by its own local norm, and the averaged result would not equal the clipped
+                # average -- the ranks would silently diverge.
+                average_gradients(params, world_size)
+
             grad_norm = torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
             optimizer.step()
             lr_schedule.step()
+
+            if world_size > 1 and step % args.log_every == 0:
+                # Report the mean across ranks: rank 0's own loss is one sequence out of the
+                # eight the step actually consumed, so on its own it is a noisier curve than
+                # the thing being optimized.
+                accumulated = all_reduce_mean(accumulated, device)
 
             window.append(accumulated)
             if step % args.log_every == 0 or step == args.total_steps - 1:
@@ -443,6 +555,11 @@ def main() -> int:
 
     if rank == 0:
         save(out_dir / "final.pt", model, args, step + 1)
+    if world_size > 1:
+        # Barrier before teardown: rank 0 is still writing the checkpoint, and destroying the
+        # group underneath it can abort the write.
+        dist.barrier()
+        dist.destroy_process_group()
     logger.info("done in %.1f min", (time.time() - started) / 60)
     return 0
 

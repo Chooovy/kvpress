@@ -618,3 +618,66 @@ def test_tokenized_samples_do_not_alias_the_mmap(tokenized):
     before = int(tensor[0])
     tensor[0] = 12345  # writable, so it is a copy rather than a read-only mmap view
     assert int(tensor[0]) == 12345 and before != 12345
+
+
+# ----------------------------------------------------------------------
+# Multi-rank partitioning (8-GPU shape)
+# ----------------------------------------------------------------------
+def test_eight_ranks_leave_no_reader_idle(tokenized, tmp_path):
+    """
+    At 8 ranks x N workers, every reader must get shards and none may overlap.
+
+    An idle reader looks like a slow run rather than a bug, and an overlap trains on duplicated
+    data while reporting the full corpus -- both silent. Shaped like the real corpus (58 shards
+    from 2e16 + 2e17) rather than the 2-shard fixture, since the failure only appears when the
+    reader count approaches the shard count.
+    """
+    import unittest.mock as mock
+
+    import numpy as np
+
+    root = tmp_path / "many"
+    counts = {"2e16": 23, "2e17": 35}
+    for subset, num in counts.items():
+        directory = root / subset
+        directory.mkdir(parents=True)
+        for i in range(num):
+            np.save(directory / f"longmino_{subset}-{i:04d}.npy", np.zeros((2, 64), np.uint32))
+    with open(root / "index.json", "w") as handle:
+        json.dump(
+            {"seq_len": 64, "min_tokens": 64, "model": "t", "dtype": "uint32",
+             "subsets": counts, "total_docs": 116, "complete": True},
+            handle,
+        )
+
+    config = TokenizedConfig(root=str(root), seq_len=64)
+    total_shards = sum(counts.values())
+    for num_workers in (1, 2, 4):
+        sizes, union = [], set()
+        for rank in range(8):
+            dataset = TokenizedDataset(config, rank=rank, world_size=8)
+            for worker_id in range(num_workers):
+                info = mock.Mock(num_workers=num_workers, id=worker_id)
+                with mock.patch(
+                    "kvpress.presses.gqa_indexer.data.get_worker_info", return_value=info
+                ):
+                    assigned = set(dataset.assigned_paths())
+                sizes.append(len(assigned))
+                union |= assigned
+        assert min(sizes) > 0, f"num_workers={num_workers} left {sizes.count(0)} readers idle"
+        assert sum(sizes) == len(union), f"num_workers={num_workers}: readers overlap"
+        assert len(union) == total_shards, f"num_workers={num_workers}: shards missed"
+
+
+def test_ranks_draw_different_documents(tokenized):
+    """
+    Two ranks must not see the same documents, or an 8x batch is 8x redundant.
+
+    Guaranteed by shard partitioning rather than by seeding, so it holds even when the ranks
+    share a seed.
+    """
+    config = TokenizedConfig(root=str(tokenized), seq_len=64, shuffle_buffer=0)
+    first = {s["doc_id"] for s in TokenizedDataset(config, rank=0, world_size=2)}
+    second = {s["doc_id"] for s in TokenizedDataset(config, rank=1, world_size=2)}
+    assert first and second
+    assert not (first & second), "ranks saw overlapping documents"

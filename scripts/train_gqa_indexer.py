@@ -453,7 +453,15 @@ def main() -> int:
     )
     optimizer, lr_schedule = build_optimizer(params, args)
 
-    metrics_handle = open(args.metrics_file, "a") if args.metrics_file else None
+    # Only rank 0 writes metrics: eight ranks appending to one file interleave partial lines,
+    # and the logged values are already cross-rank means, so the other seven would duplicate
+    # them. The parent directory is created here because --metrics-file normally points inside
+    # --out, which otherwise does not exist until the first checkpoint is written.
+    metrics_handle = None
+    if args.metrics_file and rank == 0:
+        metrics_path = Path(args.metrics_file)
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_handle = open(metrics_path, "a")
     current_len, loader, iterator = None, None, None
     window: list[float] = []
     started = time.time()

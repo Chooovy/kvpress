@@ -88,10 +88,28 @@ case "$MODE" in
     ;;
 
   stage1)
-    # Dense distillation at 32K. Uses the pre-tokenized corpus if it exists, since tokenizing
-    # a 32K sample costs ~0.2 s of serial work on the data path.
+    # Dense distillation on a length curriculum: 8K -> 16K -> 32K, in ONE lr schedule.
+    #
+    # One schedule, not three. Measured on this loss: |grad| grows only 1.018x over an 8x
+    # length change, so the optimal lr does not move with seq_len and there is nothing for a
+    # per-stage schedule to adapt to. Three schedules would instead anneal to FINAL_LR and
+    # reheat to PEAK_LR twice over -- paying for the decay three times and keeping the benefit
+    # once, since reheating discards most of what annealing consolidates.
+    #
+    # The step split puts both boundaries inside the stable phase (at 10%/60% they fall at
+    # steps 300 and 600 of 1500, where lr is flat at PEAK_LR), so a length change is never
+    # confounded with an lr change. The decay then happens entirely at 32K, so the model
+    # anneals at the length it will be evaluated at.
+    #
+    # Cheap, too: the stage-1 loss is O(L^2), so 300 steps at 8K cost about 19 steps at 32K.
+    #
+    # EXPECTED: the reported loss JUMPS by ~0.69 = log 2 at each boundary. That is arithmetic,
+    # not a regression -- loss(L) ~ log(L) + const, measured +0.7076/+0.7057/+0.6990 per
+    # doubling. Nothing needs to react to it.
     EXTRA=()
     if [[ -f "$TOKENIZED/index.json" ]]; then
+      # No retokenization needed for the curriculum: every stage length is <= the stored
+      # width, and a shorter stage slices a window out of it.
       EXTRA+=(--tokenized "$TOKENIZED" --subsets 2e16 2e17)
       echo "using pre-tokenized corpus at $TOKENIZED"
     else
@@ -100,12 +118,12 @@ case "$MODE" in
     fi
     exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer \
       --data-root "$DATA_ROOT" --model "$MODEL" "${EXTRA[@]}" \
-      --schedule "32768:${STEPS:-1500}" \
+      --schedule "${SCHEDULE:-8192:300,16384:300,32768:900}" \
       --stage dense \
       --peak-lr "$PEAK_LR" --final-lr "$FINAL_LR" \
       --warmup-frac "$WARMUP_FRAC" --stable-frac "$STABLE_FRAC" \
       --batch-size 1 --take-from random --shuffle-buffer 64 \
-      --num-workers "${WORKERS:-2}" --key-tile 512 --query-tile 512 \
+      --num-workers "${WORKERS:-2}" --key-tile 2048 --query-tile 2048 \
       --out "$OUT/stage1" --metrics-file "$OUT/stage1/metrics.jsonl" \
       --save-every "${SAVE_EVERY:-200}" --log-every "${LOG_EVERY:-10}"
     ;;

@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -376,14 +377,19 @@ def main() -> int:
     else:
         logger.info("subsets under %s:\n%s", args.data_root, describe_subsets(args.data_root))
     total = schedule.total_steps
+    # Sum over stages, not stages[0] x total: with a length curriculum the stages have
+    # different seq_len, so extrapolating from the first one overstates a short warmup stage
+    # and understates the long final one.
+    tokens = sum(sl * st for sl, st in schedule.stages) * world_size * args.batch_size
     logger.info(
-        "world_size %d x batch_size %d = %d sequences/step; STEPS counts optimizer steps, so "
-        "this run sees %.0fM tokens at seq_len=%d",
+        "world_size %d x batch_size %d = %d sequences/step; %d optimizer steps over %s "
+        "= %.0fM tokens",
         world_size,
         args.batch_size,
         world_size * args.batch_size,
-        total * world_size * args.batch_size * schedule.stages[0][0] / 1e6,
-        schedule.stages[0][0],
+        total,
+        " -> ".join(f"{sl // 1024}K" for sl, _ in schedule.stages),
+        tokens / 1e6,
     )
     logger.info(
         "schedule: %s (%d steps); WSD warmup %d -> peak %.1e, stable %d, decay %d -> %.1e",
@@ -472,7 +478,24 @@ def main() -> int:
             if seq_len != current_len:
                 # A new length means new eligibility, so the loader is rebuilt rather than
                 # reused; iterating a stale loader would keep the old seq_len silently.
-                logger.info("step %d: switching to seq_len=%d", step, seq_len)
+                if current_len is not None:
+                    # Say this out loud at the boundary: loss(L) ~ log(L) + const, so the
+                    # reported loss steps up by log(new/old) purely because the softmax got
+                    # wider. Without the warning it reads as a regression at exactly the
+                    # moment something changed, which is the worst time to be guessing.
+                    logger.info(
+                        "step %d: seq_len %d -> %d; expect the loss to rise by ~%.2f "
+                        "(log %d/%d) from the wider softmax alone -- watch "
+                        "loss_minus_log_seq instead",
+                        step,
+                        current_len,
+                        seq_len,
+                        math.log(seq_len / current_len),
+                        seq_len,
+                        current_len,
+                    )
+                else:
+                    logger.info("step %d: starting at seq_len=%d", step, seq_len)
                 loader = loader_for(seq_len, args, tokenizer, rank, world_size)
                 iterator = iter(loader)
                 current_len = seq_len
@@ -537,6 +560,12 @@ def main() -> int:
                                 "step": step,
                                 "seq_len": seq_len,
                                 "loss": accumulated,
+                                # loss(L) ~ log(L) + const, measured +0.69 per doubling, so a
+                                # length curriculum puts a ~log-2 step in the raw curve at each
+                                # boundary. Subtracting log(seq_len) gives a quantity that IS
+                                # comparable across stages -- plot this one to see whether the
+                                # objective is improving through a length change.
+                                "loss_minus_log_seq": accumulated - math.log(seq_len),
                                 "grad_norm": float(grad_norm),
                                 "lr": lr_schedule.get_last_lr()[0],
                                 "recall": recall,

@@ -41,6 +41,8 @@ from kvpress.presses.gqa_indexer.autotune import (
     batch_for_length,
     candidate_grid,
     default_token_budget,
+    is_resource_limit,
+    is_shared_memory_limit,
     pick_best,
     profile_key,
 )
@@ -217,6 +219,8 @@ __all__ = [
     "batch_for_length",
     "candidate_grid",
     "default_token_budget",
+    "is_resource_limit",
+    "is_shared_memory_limit",
     "pick_best",
     "profile_key",
 ]

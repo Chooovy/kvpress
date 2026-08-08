@@ -79,9 +79,31 @@ four sequences of work, so per-step time would systematically prefer small batch
 ``tolerance`` go to the lower-memory candidate, since headroom is what absorbs the fragmentation
 that a long run accumulates.
 
-OOM is an expected outcome here, not an error -- it is how the top of the range is found. Any
-*other* exception is fatal and stops the sweep, following the same rule as the capacity bench:
-a search that treats a bug as a resource limit reports a confidently wrong number.
+A resource limit is an expected outcome here, not an error -- it is how the top of the range is
+found. Two shapes occur and they call for opposite fixes, so they are reported separately:
+
+* **OOM** -- not enough VRAM. Answered by a smaller batch, which the grid already offers.
+* **SHMEM** -- Triton's ``OutOfResources``, raised when a block size needs more shared memory
+  than the SM has. ``block=(128,128)`` wants ~256 KiB against the ~227 KiB an H20-class SM
+  provides. This depends only on ``(BLOCK_M, BLOCK_N, head_dim)``, never on tile or batch, so
+  the sweep records the pair once and skips it everywhere else.
+
+Note that ``OutOfResources`` is neither a ``RuntimeError`` subclass nor does its message contain
+"out of memory", so a classifier keyed on either treats it as a bug and aborts the whole run.
+That happened. Both predicates now match on the message wording, which is what the Triton
+``OutOfResources``, older bare-``RuntimeError`` and wrapped-``CompilationError`` forms share.
+
+Any *other* exception is fatal and stops the sweep, tracked by an explicit ``fatal`` flag rather
+than by comparing the error string: ``error != "OOM"`` is exactly what let the shared-memory case
+through, and that trap returns every time a new limit gets its own wording.
+
+Cost
+----
+Profiling runs real forward+backward steps -- a full grid is ~180 across an 8K/16K/32K
+curriculum, which at 32K can exceed an hour. ``time_budget_s`` bounds it (15 minutes by default
+from the training script) and the remaining lengths take the token-budget default, labelled
+``measured=False`` and logged. Unmeasured fallbacks are deliberately **not** cached, so a later
+run retries them instead of trusting a guess forever.
 
 The cache
 ---------
@@ -114,19 +136,56 @@ GIB = 1024**3
 STAGE1_KIB_PER_TOKEN = 654.0
 
 
-def is_oom(exc: BaseException) -> bool:
+def is_resource_limit(exc: BaseException) -> bool:
     """
-    Whether an exception is an allocation failure rather than a bug.
+    Whether an exception is a resource limit rather than a bug.
 
-    A dedicated ``OutOfMemoryError`` counts unconditionally; a bare ``RuntimeError`` only if it
-    says so. Only the "out of memory" phrase is accepted: "CUDA error: an illegal memory access"
-    also mentions memory but is a bug, and classifying it as OOM would end a sweep with a
-    plausible number instead of a stack trace.
+    Three shapes count, and the third is the one that is easy to miss:
+
+    1. ``torch.OutOfMemoryError`` -- unconditional.
+    2. A message containing "out of memory", which is how pre-2.5 torch and some allocator
+       paths report it.
+    3. Triton's ``OutOfResources``, raised when a block size needs more **shared memory** than
+       the SM has. This is neither a subclass of ``RuntimeError`` nor does it say "out of
+       memory" -- it says "out of resource: shared memory, Required: N, Hardware limit: M".
+       It is exactly the kind of thing the sweep exists to discover, since whether
+       ``block=(128,128)`` fits is a property of the GPU: ~256 KB required against the 227 KB
+       an H20/A100 SM provides. Missing it made the profiler abort the whole run with "the
+       step itself is broken" on a candidate that simply does not fit this card.
+
+    Everything else stays a bug. "CUDA error: an illegal memory access" also mentions memory,
+    and classifying that as a resource limit would end a sweep with a plausible number instead
+    of a stack trace -- so the match stays on specific phrases, not on the word "memory".
     """
     named = getattr(torch, "OutOfMemoryError", None)
     if named is not None and isinstance(exc, named):
         return True
-    return "out of memory" in str(exc).lower()
+    # Matched by name rather than by importing triton: this module must import on a box with no
+    # triton installed, and the exception type is only reachable through it.
+    if type(exc).__name__ == "OutOfResources":
+        return True
+    message = str(exc).lower()
+    return "out of memory" in message or "out of resource" in message
+
+
+def is_shared_memory_limit(exc: BaseException) -> bool:
+    """
+    Whether the limit hit was **shared memory** rather than VRAM.
+
+    Worth separating because the fixes are opposite: an OOM is answered by a smaller batch
+    (which the candidate grid already offers), while a shared-memory limit is a property of the
+    block size and the GPU, so it will fail at every batch and every tile. Matched on the
+    message rather than the exception type, since the same condition arrives as Triton's
+    ``OutOfResources``, as a bare ``RuntimeError`` on older Triton, and wrapped in a
+    ``CompilationError`` -- the wording is what they share.
+    """
+    return "out of resource" in str(exc).lower()
+
+
+# Kept as an alias: `is_oom` reads naturally at the call site and the name is referenced from
+# the capacity bench's docstring, but "resource limit" is what the predicate actually means now
+# that shared-memory exhaustion counts too.
+is_oom = is_resource_limit
 
 
 def batch_for_length(seq_len: int, token_budget: int, *, max_batch: int = 0) -> int:
@@ -191,6 +250,11 @@ class Measurement:
     peak_gib: float = float("nan")
     backend_used: str | None = None
     error: str | None = None
+    # Whether the failure was a resource limit (skip this candidate) or a bug (stop the sweep).
+    # A flag rather than a string comparison on `error`: matching `error != "OOM"` is what let a
+    # Triton shared-memory limit abort a whole profiling run as "the step is broken", and the
+    # same trap reappears every time a new limit shape gets its own message.
+    fatal: bool = False
 
     @property
     def seconds_per_token(self) -> float:
@@ -212,6 +276,7 @@ def candidate_grid(
     max_batch: int = 0,
     tiles: tuple[int, ...] = (1024, 2048, 4096),
     blocks: tuple[int, ...] = (64, 128),
+    block_pairs: tuple[tuple[int, int], ...] | None = None,
     batches: tuple[int, ...] | None = None,
 ) -> list[Candidate]:
     """
@@ -221,25 +286,39 @@ def candidate_grid(
     the fallback when the budget turns out optimistic. Tiles above ``seq_len`` are dropped
     (a tile wider than the axis is just the axis, so measuring both is measuring the same thing
     twice), and blocks must stay powers of two for the kernels.
+
+    ``blocks`` is expanded to the *asymmetric* pairs, not just the diagonal. The kernel's shared
+    memory is roughly ``BLOCK_M * BLOCK_N + BLOCK_M * D``, which is not symmetric in the two, so
+    ``(128, 64)`` can fit on a card where ``(128, 128)`` does not -- measured on an H20-class SM
+    (227 KiB): ``(64,64)`` ~115, ``(64,128)`` ~154, ``(128,64)`` ~205, ``(128,128)`` ~256 KiB.
+    Sweeping only the diagonal would make the one useful large block unreachable and leave the
+    log reading as if 128 were simply impossible here. Pass ``block_pairs`` to override.
     """
     if batches is None:
         target = batch_for_length(seq_len, token_budget, max_batch=max_batch)
         batches = (target,) if target == 1 else (target, target // 2)
 
+    for block in blocks:
+        if block & (block - 1):
+            raise ValueError(f"block sizes must be powers of two, got {block}")
+    if block_pairs is None:
+        block_pairs = tuple((m, n) for m in blocks for n in blocks)
+    for block_m, block_n in block_pairs:
+        if block_m & (block_m - 1) or block_n & (block_n - 1):
+            raise ValueError(f"block sizes must be powers of two, got ({block_m}, {block_n})")
+
     usable_tiles = tuple(sorted({min(t, seq_len) for t in tiles}))
     grid: list[Candidate] = []
     for batch in dict.fromkeys(batches):  # dedupe, preserve order
         for tile in usable_tiles:
-            for block in blocks:
-                if block & (block - 1):
-                    raise ValueError(f"block sizes must be powers of two, got {block}")
+            for block_m, block_n in block_pairs:
                 grid.append(
                     Candidate(
                         batch_size=int(batch),
                         key_tile=int(tile),
                         query_tile=int(tile),
-                        block_m=int(block),
-                        block_n=int(block),
+                        block_m=int(block_m),
+                        block_n=int(block_n),
                     )
                 )
     return grid
@@ -299,19 +378,33 @@ def measure(
             torch.cuda.synchronize()
         elapsed = (time.perf_counter() - started) / max(1, iters)
     except Exception as exc:  # noqa: BLE001 -- classified immediately below
-        # Catch broadly, then classify: only an allocation failure is a valid measurement.
-        # Anything else is a bug in the step and is returned as an error for the caller to
-        # raise on. Catching only the OOM types would let a TypeError or a shape mismatch escape
-        # as a raw traceback from inside the sweep, which reads as "autotune is broken" rather
-        # than "the step you asked me to time is broken".
+        # Catch broadly, then classify: only a resource limit is a valid measurement. Anything
+        # else is a bug in the step and is returned as an error for the caller to raise on.
+        # Catching only the OOM types would let a TypeError or a shape mismatch escape as a raw
+        # traceback from inside the sweep, which reads as "autotune is broken" rather than "the
+        # step you asked me to time is broken".
         reset_peak()
-        if is_oom(exc):
+        if is_resource_limit(exc):
+            # Distinguish the two, because they call for opposite responses: too little VRAM
+            # means lower the batch (the grid already offers a half), while too little shared
+            # memory means this block size cannot run on this GPU at any batch size.
+            #
+            # Keyed on the message, not the class name: the same limit reaches us as Triton's
+            # OutOfResources, as a RuntimeError from an older Triton, and wrapped inside a
+            # CompilationError. All three say "out of resource", and only the message is common
+            # to them -- classifying by type would silently mislabel two of the three as OOM
+            # and send the reader to the wrong knob.
+            if is_shared_memory_limit(exc):
+                return Measurement(
+                    candidate=candidate, seq_len=seq_len, ok=False, error=f"SHMEM ({exc})"
+                )
             return Measurement(candidate=candidate, seq_len=seq_len, ok=False, error="OOM")
         return Measurement(
             candidate=candidate,
             seq_len=seq_len,
             ok=False,
             error=f"{type(exc).__name__}: {exc}",
+            fatal=True,
             backend_used=getattr(trainer, "backend_used", None),
         )
 
@@ -485,47 +578,96 @@ def autotune(
     warmup: int = 1,
     iters: int = 2,
     tolerance: float = 0.03,
+    time_budget_s: float = 0.0,
     on_result=None,
 ) -> dict[int, Profile]:
     """
     Profile every length in the curriculum and return the winner for each.
 
-    Raises on a non-OOM failure: that is a bug in the step, and continuing would rank the
-    remaining candidates against a configuration that never ran. OOM is not a failure here --
-    at the largest batch it is the expected way to find the ceiling.
+    Raises only on a genuine bug in the step: continuing would rank the remaining candidates
+    against a configuration that never ran. Resource limits are *not* failures here -- at the
+    largest batch an OOM is the expected way to find the ceiling, and a Triton shared-memory
+    limit is how a block size that this GPU cannot run gets discovered.
+
+    ``time_budget_s`` bounds the whole sweep. Profiling runs real forward+backward steps, so a
+    full grid is 180 of them across an 8K/16K/32K curriculum -- at 32K that is potentially most
+    of an hour before training starts. When the budget is exhausted the remaining lengths take
+    the token-budget default and say so, which is the honest failure: a silent truncation would
+    look identical to a completed sweep. 0 disables the bound.
     """
     profiles: dict[int, Profile] = {}
+    # Block pairs this GPU cannot run at all. Shared-memory capacity depends only on
+    # (BLOCK_M, BLOCK_N, head_dim) -- never on key_tile/query_tile or batch -- so once a pair
+    # exceeds the SM limit it will exceed it for every other candidate too. Remembering that
+    # skips the redundant probes (3 tiles x 2 batches = up to 6 per pair per length) instead of
+    # re-learning the same fact, which matters when one probe at 32K is minutes long.
+    dead_blocks: set[tuple[int, int]] = set()
+    deadline = time.perf_counter() + time_budget_s if time_budget_s > 0 else None
     for seq_len in seq_lens:
+        if deadline is not None and time.perf_counter() >= deadline:
+            logger.warning(
+                "autotune time budget (%.0f s) exhausted before L=%d; using the token-budget "
+                "default for it. Raise --autotune-time-budget, or narrow the curriculum.",
+                time_budget_s,
+                seq_len,
+            )
+            profiles[seq_len] = Profile.fallback(seq_len, token_budget, max_batch=max_batch)
+            continue
         grid = candidate_grid(
             seq_len, token_budget, max_batch=max_batch, tiles=tiles, blocks=blocks
         )
         logger.info("profiling L=%d over %d candidates", seq_len, len(grid))
         results: list[Measurement] = []
         for candidate in grid:
+            if deadline is not None and time.perf_counter() >= deadline and results:
+                # Stop mid-grid only if something already succeeded, so a partial sweep still
+                # returns a measured answer rather than an unmeasured guess.
+                logger.warning(
+                    "  time budget exhausted at L=%d after %d/%d candidates; ranking those",
+                    seq_len,
+                    len(results),
+                    len(grid),
+                )
+                break
+            block = (candidate.block_m, candidate.block_n)
+            if block in dead_blocks:
+                logger.info(
+                    "  %-44s     skipped: block %s exceeded shared memory earlier",
+                    candidate.label(),
+                    block,
+                )
+                continue
             result = measure(
                 step_fn, trainer, candidate, seq_len, warmup=warmup, iters=iters
             )
-            if result.error and result.error != "OOM":
+            if result.fatal:
                 raise RuntimeError(
-                    f"profiling {candidate.label()} at L={seq_len} failed with a non-OOM "
-                    f"error, which means the step itself is broken: {result.error}"
+                    f"profiling {candidate.label()} at L={seq_len} failed with an error that is "
+                    f"not a resource limit, which means the step itself is broken: {result.error}"
                 )
+            if result.error and result.error.startswith("SHMEM"):
+                dead_blocks.add(block)
             results.append(result)
             if on_result is not None:
                 on_result(result)
             status = (
                 f"{result.seconds:7.2f}s peak {result.peak_gib:6.2f} GiB"
                 if result.ok
-                else "    OOM"
+                # Report which limit was hit, not a generic "OOM": too little VRAM is fixed by
+                # a smaller batch, too little shared memory by a smaller block, and a log that
+                # conflates them sends you to the wrong knob.
+                else f"    skipped: {result.error}"
             )
             logger.info("  %-44s %s", candidate.label(), status)
 
         best = pick_best(results, tolerance=tolerance)
         if best is None:
             logger.warning(
-                "every candidate OOMed at L=%d; falling back to batch=1 and default tiles. "
-                "Lower --token-budget, or this length does not fit at all.",
+                "every candidate hit a resource limit at L=%d; falling back to batch=1 and "
+                "default tiles. Reasons: %s. Lower --token-budget if these are OOM; if they are "
+                "SHMEM, this GPU cannot run the swept block sizes and 64 is the safe one.",
                 seq_len,
+                "; ".join(sorted({str(r.error) for r in results})),
             )
             profiles[seq_len] = Profile.fallback(seq_len, seq_len, max_batch=1)
         else:
@@ -573,9 +715,20 @@ def autotune_cached(
         )
         fresh = autotune(step_fn, trainer, missing, token_budget=token_budget, **kwargs)
         profiles.update(fresh)
-        entry.update({str(k): asdict(v) for k, v in fresh.items()})
-        cache[key] = entry
-        save_cache(cache_path, cache)
+        # Cache only what was actually measured. An unmeasured fallback -- from a time budget
+        # running out, or from every candidate hitting a resource limit -- is a guess, and
+        # storing it would make the next run skip the length forever on the strength of a
+        # measurement that never happened. Leaving it out means the next run retries.
+        measured = {str(k): asdict(v) for k, v in fresh.items() if v.measured}
+        skipped = [k for k, v in fresh.items() if not v.measured]
+        if skipped:
+            logger.info(
+                "not caching unmeasured fallbacks for %s; a later run will retry them", skipped
+            )
+        if measured:
+            entry.update(measured)
+            cache[key] = entry
+            save_cache(cache_path, cache)
     else:
         logger.info("autotune: all %d lengths served from %s", len(seq_lens), cache_path)
 

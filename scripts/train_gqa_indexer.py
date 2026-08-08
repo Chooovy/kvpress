@@ -349,6 +349,7 @@ def run_autotune(
             token_budget=budget,
             force=args.autotune_force,
             max_batch=args.max_batch,
+            time_budget_s=args.autotune_time_budget,
         )
         for profile in profiles.values():
             logger.info("autotune chose %s", profile.describe())
@@ -477,6 +478,14 @@ def main() -> int:
         default=0,
         help="cap on autotuned batch size (0 = uncapped); use when the data loader, not "
         "memory, is the limit",
+    )
+    tune.add_argument(
+        "--autotune-time-budget",
+        type=float,
+        default=900.0,
+        help="seconds to spend profiling before falling back to token-budget defaults for the "
+        "remaining lengths (0 = unbounded). A full grid is ~180 real fwd+bwd steps, which at "
+        "32K can exceed an hour, so this is bounded by default and says so when it truncates.",
     )
 
     optim = parser.add_argument_group("optimization")

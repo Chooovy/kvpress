@@ -18,6 +18,7 @@ Two properties are pinned here because getting them wrong is silent rather than 
 from __future__ import annotations
 
 import json
+import time
 from unittest import mock
 
 import pytest
@@ -34,6 +35,7 @@ from kvpress.presses.gqa_indexer.autotune import (
     default_token_budget,
     device_key,
     is_oom,
+    is_resource_limit,
     load_cache,
     measure,
     pick_best,
@@ -181,6 +183,24 @@ def test_grid_rejects_non_power_of_two_blocks():
         candidate_grid(8192, 32768, blocks=(100,))
 
 
+def test_grid_includes_asymmetric_block_pairs():
+    """
+    Shared memory is roughly ``BLOCK_M * BLOCK_N + BLOCK_M * D`` -- not symmetric in the two.
+
+    On a 227 KiB SM, ``(128,128)`` needs ~256 KiB and fails while ``(128,64)`` needs ~205 and
+    fits. A diagonal-only grid would make the one usable large block unreachable and leave the
+    log reading as though 128 were impossible on the card.
+    """
+    grid = candidate_grid(8192, 32768, tiles=(2048,), blocks=(64, 128))
+    pairs = {(c.block_m, c.block_n) for c in grid}
+    assert pairs == {(64, 64), (64, 128), (128, 64), (128, 128)}
+
+
+def test_grid_rejects_non_power_of_two_block_pairs():
+    with pytest.raises(ValueError, match="powers of two"):
+        candidate_grid(8192, 32768, block_pairs=((128, 96),))
+
+
 # ----------------------------------------------------------------------
 # Ranking
 # ----------------------------------------------------------------------
@@ -223,7 +243,7 @@ def test_pick_best_returns_none_when_everything_failed():
 
 
 # ----------------------------------------------------------------------
-# OOM classification
+# Resource-limit classification
 # ----------------------------------------------------------------------
 def test_oom_is_recognized_from_the_message():
     assert is_oom(RuntimeError("CUDA out of memory. Tried to allocate 20.00 GiB"))
@@ -237,6 +257,47 @@ def test_an_illegal_access_is_not_an_oom():
     assert not is_oom(RuntimeError("CUDA error: an illegal memory access was encountered"))
 
 
+def test_triton_shared_memory_exhaustion_is_a_resource_limit():
+    """
+    Regression: this aborted a real profiling run.
+
+    Triton raises ``OutOfResources`` when a block size needs more shared memory than the SM
+    has -- ``block=(128,128)`` wants ~256 KiB against the 227 KiB an H20-class SM provides. The
+    exception is NOT a ``RuntimeError`` subclass and its message says "out of resource: shared
+    memory", not "out of memory", so a classifier keyed on either of those calls it a bug and
+    kills the whole sweep. It is the opposite: discovering that a block size does not fit this
+    GPU is precisely what the sweep is for.
+    """
+    message = (
+        "out of resource: shared memory, Required: 262144, Hardware limit: 232448. "
+        "Reducing block sizes or `num_stages` may help."
+    )
+
+    class OutOfResources(Exception):  # matches Triton's shape: not a RuntimeError
+        def __str__(self):
+            return message
+
+    assert not isinstance(OutOfResources(), RuntimeError)
+    assert "out of memory" not in message
+    assert is_resource_limit(OutOfResources())
+    # Also match on the message alone, for a Triton version that renames the class.
+    assert is_resource_limit(RuntimeError(message))
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RuntimeError("CUDA error: an illegal memory access was encountered"),
+        ValueError("shape mismatch"),
+        TypeError("step_fn() takes 1 positional argument but 2 were given"),
+        KeyError("input_ids"),
+    ],
+)
+def test_genuine_bugs_are_not_resource_limits(exc):
+    """The widened predicate must not have swallowed real failures."""
+    assert not is_resource_limit(exc)
+
+
 def test_measure_records_oom_without_raising(fake_cuda):
     """OOM at the top of the range is how the ceiling is found, so it must be data."""
 
@@ -244,7 +305,22 @@ def test_measure_records_oom_without_raising(fake_cuda):
         raise RuntimeError("CUDA out of memory")
 
     result = measure(step, FakeTrainer(), Candidate(8, 2048, 2048), 8192, warmup=0, iters=1)
-    assert not result.ok and result.error == "OOM"
+    assert not result.ok and result.error == "OOM" and not result.fatal
+
+
+def test_measure_labels_a_shared_memory_failure_distinctly(fake_cuda):
+    """
+    OOM and SHMEM need opposite responses -- smaller batch versus smaller block -- so the log
+    must not conflate them, or it sends you to the wrong knob.
+    """
+
+    def step(batch_size, seq_len):
+        raise RuntimeError("out of resource: shared memory, Required: 262144, Hardware limit: 1")
+
+    result = measure(step, FakeTrainer(), Candidate(1, 2048, 2048, 128, 128), 8192,
+                     warmup=0, iters=1)
+    assert not result.ok and not result.fatal
+    assert result.error.startswith("SHMEM")
 
 
 def test_measure_reports_a_non_oom_failure_as_an_error(fake_cuda):
@@ -253,7 +329,24 @@ def test_measure_reports_a_non_oom_failure_as_an_error(fake_cuda):
 
     result = measure(step, FakeTrainer(), Candidate(1, 2048, 2048), 8192, warmup=0, iters=1)
     assert not result.ok
+    assert result.fatal
     assert result.error is not None and result.error != "OOM"
+
+
+def test_fatal_is_a_flag_not_a_string_comparison(fake_cuda):
+    """
+    Why the flag exists.
+
+    The sweep used to decide fatality with ``error != "OOM"``, which made every newly-worded
+    resource limit fatal by default -- exactly how the Triton shared-memory case escaped. A
+    limit must be non-fatal regardless of how its message reads.
+    """
+
+    def step(batch_size, seq_len):
+        raise RuntimeError("out of resource: shared memory, Required: 9, Hardware limit: 1")
+
+    result = measure(step, FakeTrainer(), Candidate(1, 2048, 2048), 8192, warmup=0, iters=1)
+    assert result.error != "OOM" and not result.fatal
 
 
 def test_autotune_raises_on_a_non_oom_failure(fake_cuda):
@@ -262,11 +355,53 @@ def test_autotune_raises_on_a_non_oom_failure(fake_cuda):
     def step(batch_size, seq_len):
         raise ValueError("the step itself is broken")
 
-    with pytest.raises(RuntimeError, match="non-OOM"):
+    with pytest.raises(RuntimeError, match="not a resource limit"):
         autotune(
             step, FakeTrainer(), [8192], token_budget=8192, tiles=(2048,), blocks=(64,),
             warmup=0, iters=1,
         )
+
+
+def test_autotune_survives_a_shared_memory_limit(fake_cuda):
+    """
+    Regression for the reported abort: a block size this GPU cannot run must be skipped and the
+    sweep must still produce a profile.
+    """
+    trainer = FakeTrainer()
+
+    def step(batch_size, seq_len):
+        if (trainer.block_m, trainer.block_n) == (128, 128):
+            raise RuntimeError(
+                "out of resource: shared memory, Required: 262144, Hardware limit: 232448"
+            )
+
+    profiles = autotune(
+        step, trainer, [8192], token_budget=32768, tiles=(2048,), blocks=(64, 128),
+        warmup=0, iters=1,
+    )
+    assert profiles[8192].measured
+    assert (profiles[8192].block_m, profiles[8192].block_n) != (128, 128)
+
+
+def test_a_shared_memory_failure_is_learned_once(fake_cuda):
+    """
+    Shared-memory capacity depends only on the block pair, never on tile or batch, so retrying
+    a dead pair is pure waste -- and at 32K a single probe is minutes long.
+    """
+    trainer = FakeTrainer()
+    attempts = []
+
+    def step(batch_size, seq_len):
+        pair = (trainer.block_m, trainer.block_n)
+        attempts.append(pair)
+        if pair == (128, 128):
+            raise RuntimeError("out of resource: shared memory, Required: 9, Hardware limit: 1")
+
+    autotune(
+        step, trainer, [8192, 16384], token_budget=32768, tiles=(1024, 2048),
+        blocks=(64, 128), warmup=0, iters=1,
+    )
+    assert attempts.count((128, 128)) == 1, attempts.count((128, 128))
 
 
 def test_measure_applies_the_candidate_to_the_trainer(fake_cuda):
@@ -455,3 +590,62 @@ def test_device_key_works_without_cuda():
     """Importable and callable on a CPU box, so the cache logic stays testable anywhere."""
     with mock.patch("torch.cuda.is_available", lambda: False):
         assert device_key()["gpu"] == "cpu"
+
+
+# ----------------------------------------------------------------------
+# Cost bounding
+# ----------------------------------------------------------------------
+def test_time_budget_falls_back_for_unprofiled_lengths(fake_cuda):
+    """
+    Profiling runs real steps -- ~180 of them across an 8K/16K/32K grid -- so an unbounded
+    sweep can cost more than it saves. When the budget runs out the remaining lengths must get
+    a labelled default rather than a silent truncation that looks like a finished sweep.
+    """
+
+    def slow_step(batch_size, seq_len):
+        time.sleep(0.02)
+
+    profiles = autotune(
+        slow_step, FakeTrainer(), [8192, 16384, 32768],
+        token_budget=32768, tiles=(1024, 2048), blocks=(64,),
+        warmup=0, iters=1, time_budget_s=0.05,
+    )
+    assert set(profiles) == {8192, 16384, 32768}
+    assert not all(p.measured for p in profiles.values()), "budget should have truncated"
+    assert profiles[8192].measured, "the first length should still get measured"
+
+
+def test_unmeasured_fallbacks_are_not_cached(tmp_path, fake_cuda):
+    """
+    A guess must not be stored as though it were a measurement.
+
+    Caching a time-budget or all-OOM fallback would make every later run skip that length on
+    the strength of a measurement that never happened.
+    """
+
+    def dead_step(batch_size, seq_len):
+        raise torch.OutOfMemoryError("CUDA out of memory")
+
+    cache = tmp_path / "c.json"
+    profiles = autotune_cached(
+        dead_step, FakeTrainer(), [8192],
+        cache_path=cache, key="k", token_budget=32768,
+        tiles=(2048,), blocks=(64,), warmup=0, iters=1,
+    )
+    assert not profiles[8192].measured
+    assert not cache.is_file() or "8192" not in json.loads(cache.read_text()).get("k", {})
+
+
+def test_measured_results_are_still_cached(tmp_path, fake_cuda):
+    """The complement of the above: a real measurement must persist."""
+
+    def step(batch_size, seq_len):
+        pass
+
+    cache = tmp_path / "c.json"
+    autotune_cached(
+        step, FakeTrainer(), [8192],
+        cache_path=cache, key="k", token_budget=32768,
+        tiles=(2048,), blocks=(64,), warmup=0, iters=1,
+    )
+    assert "8192" in json.loads(cache.read_text())["k"]

@@ -435,6 +435,15 @@ def main() -> int:
     loss.add_argument("--topk-tile", type=int, default=128)
     loss.add_argument("--backend", choices=("auto", "torch", "triton"), default="auto")
     loss.add_argument(
+        "--capture-lse",
+        choices=("never", "auto", "always"),
+        default="never",
+        help="reuse the logsumexp flash-attention already computed instead of recomputing it "
+        "with teacher_lse_from_qk on every layer of every step. 'auto' falls back per layer "
+        "when the mask is not purely causal (padding or --skip-sink-in-loss); 'always' refuses "
+        "to start unless it is usable. Check with: python -m scripts.check_flash_lse",
+    )
+    loss.add_argument(
         "--block-m", type=int, default=64, help="Triton query-block size (power of two)"
     )
     loss.add_argument(
@@ -632,6 +641,7 @@ def main() -> int:
         backend=args.backend,
         block_m=args.block_m,
         block_n=args.block_n,
+        capture_lse=args.capture_lse,
     )
     optimizer, lr_schedule = build_optimizer(params, args)
 

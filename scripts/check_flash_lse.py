@@ -137,28 +137,33 @@ def check_no_padding() -> tuple[bool, str]:
 
 def check_training_path_uses_capture() -> tuple[bool, str]:
     """
-    Does the code that actually trains call the capture?
+    Does the code that actually trains call the capture, and is the flag on by default?
 
-    This is the requirement that decides the answer today, and the only one the other checks
-    cannot reveal: ``FusedIndexerTrainer`` calls ``teacher_lse_from_qk`` unconditionally, so the
-    lse is recomputed even where flash-attention could have handed it over. Checked by
-    inspecting the trainer's source rather than by trusting this docstring to stay true.
+    Checked by inspecting the trainer rather than by trusting this docstring: the wiring is what
+    decides the answer, and a passing check 1-4 means nothing if the loss never asks for the
+    captured value. Reports the default separately, because a wired-but-off path still
+    recomputes -- which is the state right after this landed, since ``capture_lse`` defaults to
+    ``never`` until it has been exercised on real hardware.
     """
     import inspect
 
-    from kvpress.presses.gqa_indexer import fused_trainer
+    from kvpress.presses.gqa_indexer import FusedIndexerTrainer, fused_trainer
 
     source = inspect.getsource(fused_trainer)
-    calls_capture = "capture_teacher_lse" in source
-    calls_recompute = "teacher_lse_from_qk(" in source
-    if calls_capture:
-        return True, "FusedIndexerTrainer calls capture_teacher_lse"
-    if calls_recompute:
+    if "capture_teacher_lse" not in source:
         return False, (
-            "FusedIndexerTrainer calls teacher_lse_from_qk (recompute) and never "
-            "capture_teacher_lse -- so the lse is recomputed regardless of flash-attn"
+            "FusedIndexerTrainer never calls capture_teacher_lse -- the lse is recomputed "
+            "regardless of flash-attn"
         )
-    return False, "could not find either lse path in fused_trainer"
+    default = getattr(FusedIndexerTrainer, "capture_lse", None)
+    if default is None:
+        return False, "capture_teacher_lse is referenced but there is no capture_lse setting"
+    if default == "never":
+        return True, (
+            f"wired in, but capture_lse defaults to {default!r} -- pass --capture-lse auto "
+            "(or always) to use it"
+        )
+    return True, f"wired in and enabled by default (capture_lse={default!r})"
 
 
 def check_model_attn(model_path: str) -> tuple[bool, str]:
@@ -210,6 +215,9 @@ def main() -> int:
     print()
     if usable:
         print("VERDICT: the captured lse is usable -- the teacher logsumexp is free.")
+        print()
+        print("Enable it with --capture-lse auto (falls back per layer if the mask is not")
+        print("purely causal), or CAPTURE_LSE=auto scripts/train_gqa_indexer.sh stage1.")
         return 0
 
     blocked = [label for label, (passed, _) in checks if not passed]
@@ -218,11 +226,6 @@ def main() -> int:
     print("The teacher lse is therefore recomputed by teacher_lse_from_qk on every layer of")
     print("every step. That is exact and correct -- it is a throughput cost, not a bug, and it")
     print("does not block training.")
-    if any(label.startswith("5.") for label in blocked):
-        print()
-        print("Note that check 5 is the binding one: wiring capture_teacher_lse into")
-        print("FusedIndexerTrainer is a code change, so installing flash-attn alone would not")
-        print("make the lse free.")
     return 1
 
 

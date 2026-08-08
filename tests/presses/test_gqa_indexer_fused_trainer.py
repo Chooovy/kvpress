@@ -940,3 +940,167 @@ def test_capacity_model_reproduces_the_measured_h20_run():
     # The support is still the largest single term at this topk, just half what it was.
     assert itemized["support"] > itemized["teacher_q"]
     assert itemized["support"] / itemized["total"] > 0.6
+
+
+# ----------------------------------------------------------------------
+# Reusing flash-attention's logsumexp
+# ----------------------------------------------------------------------
+class _InjectedCapture:
+    """Stand in for capture_teacher_lse, which needs CUDA to run flash-attn."""
+
+    def __init__(self, lse_by_layer):
+        self.lse_by_layer = lse_by_layer
+
+    def __enter__(self):
+        return self.lse_by_layer
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _flash_style_lse(model, input_ids):
+    """
+    The lse flash-attention would return: causal mask only, from the layer's real Q/K.
+
+    Collected through the same reconstruction the trainer uses, which is the point -- if the
+    rebuilt query did not match what attention used, the captured lse would be normalizing a
+    different distribution than the loss scores.
+    """
+    from kvpress.presses.gqa_indexer.fused_loss import teacher_lse_from_qk
+    from kvpress.presses.gqa_indexer.fused_trainer import (
+        attention_scaling,
+        teacher_query_states,
+    )
+    from kvpress.presses.gqa_indexer.indexer import build_indexer_mask
+    from kvpress.utils import extract_keys_and_values
+
+    out = {}
+
+    def hook(module, args, kwargs, output):
+        hidden = kwargs.get("hidden_states", args[0] if args else None)
+        position = kwargs.get("position_embeddings")
+        keys, _ = extract_keys_and_values(kwargs.get("past_key_values"), module.layer_idx)
+        query = teacher_query_states(module, hidden, position).detach()
+        causal = build_indexer_mask(
+            query.shape[2], keys.shape[2], query.device, dtype=torch.float32
+        )
+        out[int(module.layer_idx)] = teacher_lse_from_qk(
+            query, keys.detach(), attention_scaling(module), mask=causal,
+            key_tile=16, query_tile=16,
+        )
+        return output
+
+    handles = [
+        layer.self_attn.register_forward_hook(hook, with_kwargs=True)
+        for layer in model.model.layers
+    ]
+    with torch.no_grad():
+        model(input_ids=input_ids, use_cache=True)
+    for handle in handles:
+        handle.remove()
+    return out
+
+
+def test_captured_lse_gives_the_same_loss_as_recomputing(unit_test_model, monkeypatch):  # noqa: F811
+    """
+    The property the whole optimization rests on.
+
+    A captured lse is only a speedup if it is the *same* normalizer. If it is not, training is
+    quietly wrong: the teacher rows stop summing to one and nothing downstream notices.
+    """
+    from kvpress.presses.gqa_indexer import fused_trainer as ft
+
+    model = unit_test_model
+    press = GQAIndexerPress(compression_ratio=0.5)
+    press.post_init_from_model(model)
+    freeze_all_but_indexer(model)
+    input_ids = torch.randint(0, 1000, (1, 32), device=model.device)
+    captured = _flash_style_lse(model, input_ids)
+
+    baseline = FusedIndexerTrainer(press=press, key_tile=16, query_tile=16, backend="torch")
+    loss_recomputed, _ = fused_indexer_training_step(model, baseline, input_ids=input_ids)
+    assert baseline.lse_source == "recomputed"
+
+    reuser = FusedIndexerTrainer(
+        press=press, key_tile=16, query_tile=16, backend="torch", capture_lse="auto"
+    )
+    monkeypatch.setattr(ft, "capture_teacher_lse", lambda m: _InjectedCapture(captured))
+    loss_captured, _ = fused_indexer_training_step(model, reuser, input_ids=input_ids)
+
+    assert reuser.lse_source == "captured", "the capture path did not engage"
+    torch.testing.assert_close(loss_captured, loss_recomputed, rtol=1e-6, atol=1e-6)
+
+
+def test_skip_sink_forces_the_recompute(unit_test_model, monkeypatch):  # noqa: F811
+    """
+    ``skip_sink_in_loss`` folds extra per-key masking into the mask *before* the logsumexp, so
+    the rows stay normalized. A causal-only lse would leave the skipped mass in the denominator,
+    so the captured value must be refused rather than used.
+    """
+    from kvpress.presses.gqa_indexer import fused_trainer as ft
+
+    model = unit_test_model
+    press = GQAIndexerPress(compression_ratio=0.5)
+    press.post_init_from_model(model)
+    freeze_all_but_indexer(model)
+    input_ids = torch.randint(0, 1000, (1, 32), device=model.device)
+    captured = _flash_style_lse(model, input_ids)
+
+    trainer = FusedIndexerTrainer(
+        press=press, key_tile=16, query_tile=16, backend="torch",
+        capture_lse="auto", skip_sink_in_loss=4,
+    )
+    monkeypatch.setattr(ft, "capture_teacher_lse", lambda m: _InjectedCapture(captured))
+    fused_indexer_training_step(model, trainer, input_ids=input_ids)
+    assert trainer.lse_source == "recomputed"
+
+
+def test_capture_always_rejects_skip_sink_at_construction():
+    """
+    ``always`` is a promise the run could not keep with skip_sink set -- every layer would fall
+    back -- so it fails loudly at construction instead of quietly measuring the slow path.
+    """
+    press = GQAIndexerPress(compression_ratio=0.5)
+    with pytest.raises(ValueError, match="skip_sink_in_loss"):
+        FusedIndexerTrainer(press=press, capture_lse="always", skip_sink_in_loss=4)
+
+
+def test_capture_is_rejected_for_stage_two():
+    """Stage 2's global teacher needs a dense full-axis logsumexp, not a causal one."""
+    press = GQAIndexerPress(compression_ratio=0.5)
+    with pytest.raises(NotImplementedError, match="stage 1 only"):
+        FusedIndexerTrainer(press=press, stage="sparse", topk=8, capture_lse="auto")
+
+
+def test_capture_lse_rejects_an_unknown_mode():
+    press = GQAIndexerPress(compression_ratio=0.5)
+    with pytest.raises(ValueError, match="capture_lse must be"):
+        FusedIndexerTrainer(press=press, capture_lse="yes")
+
+
+def test_capture_defaults_to_never():
+    """Opt-in: it changes what the teacher is normalized against, so it is not silently on."""
+    press = GQAIndexerPress(compression_ratio=0.5)
+    assert FusedIndexerTrainer(press=press).capture_lse == "never"
+
+
+def test_captured_dict_is_cleared_after_the_pass(unit_test_model, monkeypatch):  # noqa: F811
+    """
+    Holding the dict past the forward pass would keep every layer's lse alive between steps and
+    risk a stale value being reused if a later pass captured nothing.
+    """
+    from kvpress.presses.gqa_indexer import fused_trainer as ft
+
+    model = unit_test_model
+    press = GQAIndexerPress(compression_ratio=0.5)
+    press.post_init_from_model(model)
+    freeze_all_but_indexer(model)
+    input_ids = torch.randint(0, 1000, (1, 32), device=model.device)
+    captured = _flash_style_lse(model, input_ids)
+
+    trainer = FusedIndexerTrainer(
+        press=press, key_tile=16, query_tile=16, backend="torch", capture_lse="auto"
+    )
+    monkeypatch.setattr(ft, "capture_teacher_lse", lambda m: _InjectedCapture(captured))
+    fused_indexer_training_step(model, trainer, input_ids=input_ids)
+    assert trainer.captured_lse is None

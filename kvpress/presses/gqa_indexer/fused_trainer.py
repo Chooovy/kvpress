@@ -27,7 +27,7 @@ detached: the teacher is a frozen reference.
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 
 import torch
@@ -47,6 +47,7 @@ from kvpress.presses.gqa_indexer.fused_sparse_loss import (
 from kvpress.presses.gqa_indexer.indexer import MASK_NEG, build_indexer_mask
 from kvpress.presses.gqa_indexer.press import GQAIndexerPress, get_language_model
 from kvpress.presses.gqa_indexer.sparse_support import resolve_topk, streaming_topk_support
+from kvpress.presses.gqa_indexer.teacher_lse import capture_teacher_lse
 from kvpress.presses.gqa_indexer.triton_fused_loss import (
     HAS_TRITON,
     decompose_mask,
@@ -144,6 +145,13 @@ class FusedIndexerTrainer:
         the wrong thing. Stage 2 is torch-only for now.
     block_m, block_n : int
         Triton tile sizes; must be powers of two.
+    capture_lse : str
+        Where the teacher's logsumexp comes from. ``never`` (default) recomputes it with
+        ``teacher_lse_from_qk``. ``auto`` reuses the value flash-attention already computed
+        during the model's own forward pass -- free, but only valid when the loss's mask is
+        purely causal, so it falls back per layer otherwise. ``always`` refuses to start unless
+        the capture is usable, so a benchmark cannot silently measure the recompute. See
+        :meth:`teacher_lse`.
     """
 
     press: GQAIndexerPress
@@ -167,9 +175,19 @@ class FusedIndexerTrainer:
     block_m: int = 64
     block_n: int = 64
 
+    # Reuse flash-attention's logsumexp instead of recomputing it. "auto" uses it when
+    # flash-attn is importable AND the mask is purely causal, else recomputes; "never" always
+    # recomputes; "always" refuses to start unless the capture is usable, so a benchmark cannot
+    # silently measure the slow path. See `teacher_lse` for why the mask condition is required.
+    capture_lse: str = "never"
+
     per_layer_losses: dict[int, torch.Tensor] = field(default_factory=dict)
     per_layer_recall: dict[int, float] = field(default_factory=dict)
     backend_used: str | None = field(default=None, init=False)
+    # Populated by `hooks` for the duration of one forward pass when capture is active.
+    captured_lse: dict[int, torch.Tensor] | None = field(default=None, init=False)
+    lse_source: str | None = field(default=None, init=False)
+    _warned_lse_fallback: bool = field(default=False, init=False)
 
     def __post_init__(self):
         if self.stage not in ("dense", "sparse"):
@@ -192,6 +210,27 @@ class FusedIndexerTrainer:
             raise NotImplementedError(
                 "the Triton path currently covers stage 1 only; stage 2 runs on the torch "
                 "backend. Use backend='auto' with stage='sparse'."
+            )
+        if self.capture_lse not in ("never", "auto", "always"):
+            raise ValueError(
+                f"capture_lse must be 'never', 'auto' or 'always', got {self.capture_lse!r}"
+            )
+        if self.capture_lse != "never" and self.stage == "sparse":
+            # Stage 2's teacher is restricted to each row's support, so a dense causal lse is
+            # the wrong normalizer for it -- 'global' mode needs the full-axis value, which is
+            # what teacher_lse_from_qk gives. Refuse rather than quietly ignoring the flag.
+            raise NotImplementedError(
+                "capture_lse covers stage 1 only; stage 2's teacher_mode='global' needs a "
+                "dense logsumexp over the full key axis. Use capture_lse='never'."
+            )
+        if self.capture_lse == "always" and self.skip_sink_in_loss > 0:
+            # Caught at construction because 'always' is a promise the run cannot keep here:
+            # every layer would fall back, so a benchmark would report the slow path under a
+            # flag that says otherwise.
+            raise ValueError(
+                "capture_lse='always' is incompatible with skip_sink_in_loss>0: flash's lse "
+                "covers causality only, so skipping sink keys would leave the teacher rows "
+                "un-normalized. Use capture_lse='auto' to fall back per layer."
             )
 
     def reset(self) -> None:
@@ -273,13 +312,13 @@ class FusedIndexerTrainer:
             )
 
         with torch.no_grad():
-            lse = teacher_lse_from_qk(
+            lse = self.teacher_lse(
                 query_states,
                 key_states,
                 scaling,
                 mask=mask,
-                key_tile=self.key_tile,
-                query_tile=self.query_tile,
+                layer_idx=int(module.layer_idx),
+                kwargs=kwargs,
             )
 
         if self.use_triton(indexer, hidden_states, query_states, key_states):
@@ -449,6 +488,75 @@ class FusedIndexerTrainer:
             )
         return loss
 
+    def teacher_lse(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        scaling: float,
+        *,
+        mask: torch.Tensor,
+        layer_idx: int,
+        kwargs: dict,
+    ) -> torch.Tensor:
+        """
+        The teacher's ``(B, H, Sq)`` logsumexp: reuse flash-attention's, or recompute it.
+
+        ``teacher_lse_from_qk`` is exact but streams the whole ``Q @ K^T`` again, on every layer
+        of every step, on both backends -- the Triton kernel takes ``lse`` as an *input*, so it
+        does not avoid this. flash-attention already computed the same quantity during the
+        model's own forward pass and will hand it back for free, which is what
+        :func:`~.teacher_lse.capture_teacher_lse` collects into ``self.captured_lse``.
+
+        Using a captured value is only valid when the loss's mask is **pure causal**, because
+        flash's ``lse`` covers causality and nothing else. Two things break that, and both are
+        checked rather than assumed:
+
+        * padding -- ``exp(alpha - lse)`` then stops summing to one over the kept keys, silently
+          under-weighting the rows with the most padding;
+        * ``skip_sink_in_loss`` -- extra per-key masking, folded into ``mask`` *before* the
+          logsumexp precisely so the rows stay normalized. A causal-only ``lse`` would leave the
+          skipped mass in the denominator.
+
+        ``decompose_mask`` already answers "is this mask causal plus per-key padding", so it is
+        reused here instead of a second mask analysis: ``keep is None`` is exactly the
+        pure-causal case. Anything else falls back to the recompute, which is correct for any
+        mask.
+        """
+        captured = None
+        if self.captured_lse is not None:
+            captured = self.captured_lse.get(layer_idx)
+        if captured is not None:
+            ok, keep = decompose_mask(
+                mask, query_states.shape[2], key_states.shape[2],
+                key_states.shape[2] - query_states.shape[2],
+                bsz=query_states.shape[0],
+            )
+            if ok and keep is None:
+                self.lse_source = "captured"
+                return captured.to(device=query_states.device, dtype=torch.float32)
+            # Say why once per trainer rather than per layer per step: at 36 layers x 1500 steps
+            # a per-layer warning is 54000 lines, which buries the one thing worth reading.
+            if not self._warned_lse_fallback:
+                logger.warning(
+                    "a captured teacher lse is available but this layer's mask is not purely "
+                    "causal (skip_sink_in_loss=%d, padding=%s), so it cannot be used: flash's "
+                    "lse covers causality only, and reusing it here would leave the teacher "
+                    "rows un-normalized. Falling back to teacher_lse_from_qk.",
+                    self.skip_sink_in_loss,
+                    kwargs.get("attention_mask") is not None,
+                )
+                self._warned_lse_fallback = True
+
+        self.lse_source = "recomputed"
+        return teacher_lse_from_qk(
+            query_states,
+            key_states,
+            scaling,
+            mask=mask,
+            key_tile=self.key_tile,
+            query_tile=self.query_tile,
+        )
+
     def apply_sink_skip(self, mask: torch.Tensor) -> torch.Tensor:
         """
         Optionally drop the sink keys from the objective.
@@ -495,19 +603,45 @@ class FusedIndexerTrainer:
 
     @contextmanager
     def hooks(self, model: nn.Module):
-        """Register the per-layer hooks for the duration of the block."""
+        """
+        Register the per-layer hooks for the duration of the block.
+
+        When ``capture_lse`` is on, this also wraps the pass in
+        :func:`~.teacher_lse.capture_teacher_lse`, which swaps in an attention implementation
+        that asks flash-attention for the ``lse`` it already computed. The capture must be
+        entered *outside* the forward pass and the dict it yields is filled as layers run --
+        which is why it is bound here rather than inside the loss hook: by the time a layer's
+        hook fires, that layer's ``lse`` is already in the dict.
+        """
         self.press.post_init_from_model(model)
         self.reset()
         handles = []
-        try:
-            for layer in get_language_model(model).layers:
-                handles.append(
-                    layer.self_attn.register_forward_hook(self.forward_hook, with_kwargs=True)
-                )
-            yield self
-        finally:
-            for handle in handles:
-                handle.remove()
+        with ExitStack() as stack:
+            if self.capture_lse != "never":
+                try:
+                    self.captured_lse = stack.enter_context(capture_teacher_lse(model))
+                except ImportError:
+                    if self.capture_lse == "always":
+                        raise
+                    # 'auto' means "use it if available", so a box without flash-attn simply
+                    # recomputes. Logged once, since it is a throughput fact worth knowing.
+                    if not self._warned_lse_fallback:
+                        logger.warning(
+                            "capture_lse='auto' but flash-attn is unavailable; recomputing the "
+                            "teacher logsumexp with teacher_lse_from_qk"
+                        )
+                        self._warned_lse_fallback = True
+                    self.captured_lse = None
+            try:
+                for layer in get_language_model(model).layers:
+                    handles.append(
+                        layer.self_attn.register_forward_hook(self.forward_hook, with_kwargs=True)
+                    )
+                yield self
+            finally:
+                for handle in handles:
+                    handle.remove()
+                self.captured_lse = None
 
 
 def fused_indexer_training_step(

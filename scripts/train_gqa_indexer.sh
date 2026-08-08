@@ -56,6 +56,15 @@ AUTOTUNE="${AUTOTUNE:-0}"
 TOKEN_BUDGET="${TOKEN_BUDGET:-0}"
 AUTOTUNE_TIME_BUDGET="${AUTOTUNE_TIME_BUDGET:-900}"
 
+# Reuse the logsumexp flash-attention already computed, instead of recomputing it with
+# teacher_lse_from_qk on every layer of every step (which runs on BOTH backends -- the Triton
+# kernel takes lse as an input, so it does not avoid the recompute).
+#
+# Default "never" until it has been exercised on real hardware: it changes what the teacher is
+# normalized against, so it is opt-in rather than silently on. `$0 check` reports whether this
+# box can use it; "auto" falls back per layer when the mask is not purely causal.
+CAPTURE_LSE="${CAPTURE_LSE:-never}"
+
 cd "$(dirname "$0")/.."
 
 # The tokenizer's thread pool is forked by the dataloader workers; it warns per worker and
@@ -163,6 +172,7 @@ case "$MODE" in
       --peak-lr "$PEAK_LR" --final-lr "$FINAL_LR" \
       --warmup-frac "$WARMUP_FRAC" --stable-frac "$STABLE_FRAC" \
       --batch-size "${BATCH_SIZE:-1}" --take-from random --shuffle-buffer 64 \
+      --capture-lse "$CAPTURE_LSE" \
       --num-workers "${WORKERS:-2}" \
       --out "$OUT/stage1" --metrics-file "$OUT/stage1/metrics.jsonl" \
       --save-every "${SAVE_EVERY:-200}" --log-every "${LOG_EVERY:-10}"

@@ -253,8 +253,26 @@ def loader_for(
     )
 
 
-def save(path: Path, model, args, step: int, extra: dict | None = None) -> None:
-    """Write the indexer weights plus enough metadata to know what produced them."""
+def save(
+    path: Path,
+    model,
+    args,
+    step: int,
+    extra: dict | None = None,
+    optimizer=None,
+    lr_schedule=None,
+) -> None:
+    """
+    Write the indexer weights plus enough metadata to know what produced them.
+
+    With ``--save-optimizer`` (on by default) the AdamW state and the LR-schedule position are
+    written alongside the weights, which is what ``--resume-from`` needs to continue a run
+    without restarting Adam's moments from zero or re-warming the LR. They roughly triple the
+    file -- Adam keeps two moments per trained parameter, ~680 MB against 340 MB of weights here
+    -- still a fraction of the 16 GB backbone, but no longer the "few MB" the weights alone are,
+    which is why ``--no-save-optimizer`` exists for when resume is not needed. A weights-only
+    reader (eval, ``--init-from``, the stage-2 warm start) simply ignores the extra keys.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "indexer": indexer_state_dict(model, args.scorer_attr),
@@ -273,8 +291,63 @@ def save(path: Path, model, args, step: int, extra: dict | None = None) -> None:
     }
     if extra:
         payload["metrics"] = extra
+    if args.save_optimizer and optimizer is not None and lr_schedule is not None:
+        payload["optim"] = optimizer.state_dict()
+        payload["lr_schedule"] = lr_schedule.state_dict()
     torch.save(payload, path)
     logger.info("saved %s (step %d)", path, step)
+
+
+def resume_training_state(
+    path: str, model, optimizer, lr_schedule, scorer_attr: str, schedule_str: str, device: str
+) -> int:
+    """
+    Restore weights + AdamW state + LR-schedule position from a ``--resume-from`` checkpoint.
+
+    Returns the number of optimizer steps already taken; the training loop skips every step
+    below it, so the LR curve and the curriculum position pick up exactly where the interrupted
+    run left off. The saved ``step`` equals the scheduler's ``last_epoch`` (one ``.step()`` per
+    optimizer step), so restoring the scheduler and skipping to ``start_step`` keeps the LR of
+    the next step identical to the un-interrupted run.
+
+    This is the whole difference from ``--init-from``: that one is a weights-only warm start that
+    restarts the schedule and Adam from zero -- correct for beginning stage 2 from stage 1 (a
+    different schedule and objective, where stage 1's moments would be actively wrong), and wrong
+    for continuing an interrupted run of the *same* schedule.
+    """
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    load_indexer_state_dict(model, ckpt.get("indexer", ckpt), scorer_attr)
+    if "optim" not in ckpt or "lr_schedule" not in ckpt:
+        raise SystemExit(
+            f"{path} has no optimizer state (written without --save-optimizer, or by an older "
+            "version). Resuming it would restart Adam from zero and re-warm the LR -- which is "
+            "exactly what --init-from does, so use that for a weights-only warm start, or resume "
+            "from a checkpoint saved with --save-optimizer."
+        )
+    saved = ckpt.get("config", {}).get("schedule")
+    if saved != schedule_str:
+        raise SystemExit(
+            f"--resume-from was trained under --schedule {saved!r}, not {schedule_str!r}. The LR "
+            "curve and the step counter are defined against the schedule total, so resuming under "
+            "a different schedule would drop the optimizer at the wrong point of the wrong curve. "
+            "Pass the schedule the checkpoint was trained with (--max-steps still truncates it)."
+        )
+    optimizer.load_state_dict(ckpt["optim"])
+    # AdamW's moments come back on CPU from map_location; move them to the param device, or the
+    # first step raises on a device mismatch between the parameter (cuda) and its state (cpu).
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
+    lr_schedule.load_state_dict(ckpt["lr_schedule"])
+    start_step = int(ckpt["step"])
+    logger.info(
+        "resumed from %s: %d steps done, AdamW + LR schedule restored (next lr %.2e)",
+        path,
+        start_step,
+        lr_schedule.get_last_lr()[0],
+    )
+    return start_step
 
 
 def run_autotune(
@@ -420,7 +493,21 @@ def main() -> int:
     model_group.add_argument("--head-dim", type=int, default=None)
     model_group.add_argument("--n-heads", type=int, default=None)
     model_group.add_argument("--scorer-attr", default="indexer")
-    model_group.add_argument("--init-from", default=None, help="resume indexer weights")
+    model_group.add_argument(
+        "--init-from",
+        default=None,
+        help="load indexer WEIGHTS only and start a fresh schedule (Adam and the LR both restart "
+        "from zero). This is the stage-2-from-stage-1 warm start. To CONTINUE an interrupted run "
+        "where the optimizer and LR must pick up where they stopped, use --resume-from instead.",
+    )
+    model_group.add_argument(
+        "--resume-from",
+        default=None,
+        help="continue an interrupted run: restore indexer weights, AdamW state and LR-schedule "
+        "position from a checkpoint saved with --save-optimizer, and skip the steps already done. "
+        "Requires the same --schedule the checkpoint was trained with. Mutually exclusive with "
+        "--init-from.",
+    )
 
     loss = parser.add_argument_group("objective")
     loss.add_argument("--stage", choices=("dense", "sparse"), default="dense")
@@ -499,6 +586,17 @@ def main() -> int:
 
     optim = parser.add_argument_group("optimization")
     optim.add_argument("--schedule", default="32768:1500", help="SEQ_LEN:STEPS,...")
+    optim.add_argument(
+        "--max-steps",
+        type=int,
+        default=0,
+        help="stop after this many optimizer steps regardless of the schedule total (0 = run "
+        "the whole schedule). The LR is still computed from the full --schedule, so this "
+        "truncates a run at a defined point WITHOUT reshaping WSD -- e.g. run the 1500-step "
+        "8192:300,16384:300,32768:900 curriculum but stop at 600, giving an LR over 0..600 "
+        "identical to the untruncated run (warmup 150, still at peak, no decay). The loader for "
+        "the stage it stops before is never built, so the truncation costs nothing.",
+    )
     optim.add_argument("--peak-lr", type=float, default=1e-3, help="WSD plateau")
     optim.add_argument("--final-lr", type=float, default=5e-6, help="WSD floor, hit on the last step")
     optim.add_argument("--warmup-frac", type=float, default=0.10)
@@ -513,6 +611,14 @@ def main() -> int:
     io.add_argument("--save-every", type=int, default=200)
     io.add_argument("--log-every", type=int, default=10)
     io.add_argument("--metrics-file", default=None, help="append JSONL metrics here")
+    io.add_argument(
+        "--save-optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="write AdamW state and the LR-schedule position into each checkpoint so "
+        "--resume-from can continue the run. On by default; --no-save-optimizer keeps "
+        "checkpoints weights-only (~340 MB vs ~1 GB) when resume is not needed.",
+    )
     io.add_argument("--dry-run", action="store_true", help="build everything, run 2 steps")
 
     args = parser.parse_args()
@@ -525,6 +631,12 @@ def main() -> int:
             "--stage sparse needs an explicit --topk. Deriving it from a keep-ratio makes the "
             "retained support O(L^2) -- 696 GB across 36 layers at L=32K, ratio 0.25 -- which "
             "would cap sequence length far below what the loss itself allows."
+        )
+    if args.init_from and args.resume_from:
+        parser.error(
+            "--init-from and --resume-from are mutually exclusive: the first is a weights-only "
+            "warm start that restarts the schedule and Adam, the second continues an interrupted "
+            "run with both preserved. Pick one."
         )
     if not torch.cuda.is_available():
         parser.error("no CUDA device; indexer distillation needs a GPU")
@@ -645,6 +757,15 @@ def main() -> int:
     )
     optimizer, lr_schedule = build_optimizer(params, args)
 
+    # start_step is 0 for a fresh run and the completed-step count for a resumed one. The loop
+    # skips every step below it, so a resumed run does not re-run the curriculum it already saw
+    # and its LR continues on the same WSD curve rather than re-warming.
+    start_step = 0
+    if args.resume_from:
+        start_step = resume_training_state(
+            args.resume_from, model, optimizer, lr_schedule, args.scorer_attr, args.schedule, device
+        )
+
     # Profile before the loop, not lazily at each boundary: a mid-run measurement would charge
     # its OOM probes to a step that also has to succeed, and the whole point of measuring is
     # that some candidates are expected to fail.
@@ -684,6 +805,12 @@ def main() -> int:
 
     try:
         for step, seq_len in schedule.lengths():
+            if step < start_step:
+                # Already completed in the run we resumed; skip with no work so the LR schedule
+                # and the curriculum position stay aligned with where it stopped. The loader is
+                # not built until the first non-skipped step, so a mid-curriculum resume pays
+                # nothing for the stages before it.
+                continue
             if seq_len != current_len:
                 # A new length means new eligibility, so the loader is rebuilt rather than
                 # reused; iterating a stale loader would keep the old seq_len silently.
@@ -755,7 +882,8 @@ def main() -> int:
                 accumulated = all_reduce_mean(accumulated, device)
 
             window.append(accumulated)
-            if step % args.log_every == 0 or step == args.total_steps - 1:
+            reached_max = bool(args.max_steps) and step + 1 >= args.max_steps
+            if step % args.log_every == 0 or step == args.total_steps - 1 or reached_max:
                 recall = trainer.mean_recall()
                 peak = torch.cuda.max_memory_allocated() / 1024**3
                 logger.info(
@@ -770,7 +898,7 @@ def main() -> int:
                     lr_schedule.get_last_lr()[0],
                     peak,
                     f"recall {recall:.3f} " if recall is not None else "",
-                    (time.time() - started) / (step + 1),
+                    (time.time() - started) / (step - start_step + 1),
                 )
                 if metrics_handle:
                     metrics_handle.write(
@@ -805,7 +933,15 @@ def main() -> int:
 
             if rank == 0 and args.save_every and (step + 1) % args.save_every == 0:
                 save(out_dir / f"step{step + 1}.pt", model, args, step + 1,
-                     {"loss": accumulated})
+                     {"loss": accumulated}, optimizer=optimizer, lr_schedule=lr_schedule)
+
+            if reached_max:
+                logger.info(
+                    "reached --max-steps %d of the %d-step schedule; stopping before decay",
+                    args.max_steps,
+                    args.total_steps,
+                )
+                break
 
             if args.dry_run and step >= 1:
                 logger.info("dry run complete")
@@ -815,7 +951,8 @@ def main() -> int:
             metrics_handle.close()
 
     if rank == 0:
-        save(out_dir / "final.pt", model, args, step + 1)
+        save(out_dir / "final.pt", model, args, step + 1,
+             optimizer=optimizer, lr_schedule=lr_schedule)
     if world_size > 1:
         # Barrier before teardown: rank 0 is still writing the checkpoint, and destroying the
         # group underneath it can abort the write.

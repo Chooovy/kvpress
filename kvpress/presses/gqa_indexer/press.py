@@ -70,6 +70,11 @@ class GQAIndexerPress(ScorerPress):
         ``mean`` or ``max`` pooling over each chunk's token scores.
     use_vnorm : bool
         Scale scores by the value-vector norm, as several kvpress scorers do.
+    gate_scale : bool
+        Give each indexer the learnable ``gate_scale`` scalar that end-to-end (gated-attention)
+        training needs. Off by default: distillation never reads it, so a distillation
+        checkpoint stays free of the extra parameter. Required by
+        :class:`~kvpress.presses.gqa_indexer.e2e_trainer.E2EIndexerTrainer`.
     scorer_attr : str
         Attribute name the indexer is registered under on each attention module.
     """
@@ -81,6 +86,7 @@ class GQAIndexerPress(ScorerPress):
     n_heads: int | None = None
     head_dim: int | None = None
     rope_dim: int | None = None
+    gate_scale: bool = False
 
     # Query-axis reduction
     query_reduce: str = "mean"
@@ -137,10 +143,21 @@ class GQAIndexerPress(ScorerPress):
             n_heads=n_heads,
             head_dim=head_dim,
             rope_dim=rope_dim,
+            gate_scale=self.gate_scale,
         )
 
     def post_init_from_model(self, model: nn.Module, force_reinit: bool = False) -> None:
-        """Attach a :class:`GQAIndexer` to every attention layer (idempotent)."""
+        """
+        Attach a :class:`GQAIndexer` to every attention layer.
+
+        Idempotent when the attached indexer already has the geometry this press would
+        build, and a **hard error** when it does not. Re-attaching is skipped rather than
+        redone so a loaded checkpoint survives a second call, but silently accepting a
+        mismatched indexer would mean the press scores with geometry other than the one it
+        was configured for -- and ``rope_dim`` in particular is not a parameter shape, so
+        ``load_indexer_state_dict`` cannot catch it either. Pass ``force_reinit=True`` to
+        deliberately replace the existing indexers (discarding their weights).
+        """
         if self._initialized and not force_reinit:
             return
 
@@ -148,9 +165,18 @@ class GQAIndexerPress(ScorerPress):
         created = 0
         for layer in language_model.layers:
             attn = layer.self_attn
-            if hasattr(attn, self.scorer_attr) and not force_reinit:
-                continue
             indexer_config = self.build_indexer_config(model, attn)
+            existing = getattr(attn, self.scorer_attr, None)
+            if existing is not None and not force_reinit:
+                if existing.config != indexer_config:
+                    raise ValueError(
+                        f"{type(attn).__name__} already has a {self.scorer_attr!r} with geometry "
+                        f"{existing.config}, but this press is configured for {indexer_config}. "
+                        "Scoring would silently use the attached geometry rather than the "
+                        "requested one. Use a fresh model, or force_reinit=True to replace it "
+                        "(which discards the existing weights)."
+                    )
+                continue
             indexer = GQAIndexer(indexer_config).to(device=model.device, dtype=model.dtype)
             attn.register_module(self.scorer_attr, indexer)
             created += 1

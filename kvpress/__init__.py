@@ -22,8 +22,15 @@ from kvpress.presses.duo_attention_press import DuoAttentionPress
 from kvpress.presses.expected_attention_press import ExpectedAttentionPress
 from kvpress.presses.expected_attention_with_stats import ExpectedAttentionStatsPress
 from kvpress.presses.fastkvzip_press import FastKVzipPress
+from kvpress.presses.facility_location_press import FacilityLocationPress
 from kvpress.presses.finch_press import FinchPress
-from kvpress.presses.gqa_indexer import GQAIndexer, GQAIndexerConfig, GQAIndexerPress
+from kvpress.presses.gqa_indexer import (
+    GQAIndexer,
+    GQAIndexerConfig,
+    GQAIndexerPress,
+    SparseAttentionContext,
+)
+from kvpress.presses.gqa_indexer.train import load_indexer_state_dict
 from kvpress.presses.key_rerotation_press import KeyRerotationPress
 from kvpress.presses.keydiff_press import KeyDiffPress
 from kvpress.presses.knorm_press import KnormPress
@@ -62,6 +69,7 @@ __all__ = [
     "ExpectedAttentionPress",
     "KnormPress",
     "ObservedAttentionPress",
+    "FacilityLocationPress",
     "RandomPress",
     "SimLayerKVPress",
     "SnapKVPress",
@@ -97,6 +105,8 @@ __all__ = [
     "CapPress",
     "LUKVPress",
     "GQAIndexerPress",
+    "SparseAttentionContext",
+    "load_indexer_state_dict",
     "GQAIndexer",
     "GQAIndexerConfig",
 ]

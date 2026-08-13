@@ -82,6 +82,18 @@ pure token scorer and chunking remains a swappable policy.
 
 ## Training
 
+Two objectives ship. They are alternatives, not stages of one recipe:
+
+- **Distillation** (`FusedIndexerTrainer`) — match the frozen model's own attention weights.
+  The score never enters the forward pass.
+- **End-to-end** (`E2EIndexerTrainer`) — add the score inside the attention softmax so the LM
+  loss trains it directly. See [End-to-end training](#end-to-end-training-gated-attention).
+
+Both expose a full-scope stage and a top-k-scope stage under the same `stage` names, so they
+can be compared at matched budget.
+
+### Distillation
+
 Two stages, both training only the indexer (backbone frozen so the teacher is fixed):
 
 - **Stage 1, `stage="dense"`** — teacher is the true attention grouped per KV head;
@@ -142,6 +154,258 @@ whenever the dense path's student drifts, which is what
 The teacher is grouped **per KV group**, not averaged over all heads — matching MiniMax M3
 Eq. 9. Averaging across groups would give every indexer head an identical target and waste
 the per-head capacity that motivates the whole design.
+
+## End-to-end training (gated attention)
+
+> **Design analysis:** [`ROUTER_LEARNABILITY.md`](ROUTER_LEARNABILITY.md) works out *why* a gated
+> router is learnable at all — the no-op loophole, what normalization and pinning each contribute,
+> why DMA/SparseK/STE never face the problem, and HSA's two-level decomposition. It also records
+> the current implementation's known gap (see "Known gap" below) and two retracted conclusions.
+> Read it before changing the gate form.
+
+Distillation's supervision is a surrogate: it teaches the indexer to rank keys by *where the
+dense model attends*, which is not the same as *which keys the prediction needs* under a fixed
+budget. SAS measures the gap directly — their distillation baseline covers **more** attention
+mass yet scores **lower** downstream (96.8% mass / 79.5% acc against 79.5% / 79.5% at K=64), so
+`mean_recall` is a biased objective, not merely a noisy one.
+
+`E2EIndexerTrainer` removes the surrogate by putting the score inside the softmax:
+
+```
+out = softmax(scale · q·kᵀ + gate_scale · qi·kiᵀ) V
+```
+
+No teacher, no KL, no second forward pass — the loss is the model's own, and `dL/dscore` comes
+from the ordinary attention backward.
+
+```python
+from kvpress import GQAIndexerPress
+from kvpress.presses.gqa_indexer import E2EIndexerTrainer, e2e_indexer_training_step
+
+press = GQAIndexerPress(compression_ratio=0.5, gate_scale=True)   # gate_scale=True is required
+trainer = E2EIndexerTrainer(press=press, stage="dense")           # full scope
+press.post_init_from_model(model)
+optimizer = torch.optim.AdamW(trainer.indexer_parameters(model), lr=1e-3)
+
+loss = e2e_indexer_training_step(model, trainer, input_ids=input_ids)
+loss.backward(); optimizer.step()
+
+# Then, at the eviction budget used at eval:
+trainer = E2EIndexerTrainer(press=press, stage="sparse", keep_ratio=1 - press.compression_ratio)
+```
+
+### Inside the softmax, not outside
+
+`softmax(q·kᵀ) · g` looks equivalent and is not. Writing `p` for the ungated probability and `p̃`
+for the gated one:
+
+```
+outer:  dg_m = Σ_{i∈m} p_i · doᵀ v_i
+inner:  dg_m = Σ_{i∈m} (p̃_i / g_m) · doᵀ (v_i − out)
+```
+
+Only the inner form carries `(v_i − out)` — a *relative* signal saying whether key `i` pulls the
+output somewhere better than where it already is, which is what lets the gate reallocate
+attention mass. The outer form scales a fixed probability and can never reorder one key against
+another. SAS ablates both; outer is markedly worse (42.0 vs 55.6 on MATH500).
+
+### The no-op hole, and why pinning closes it
+
+Adding the **same** number to every key of a row cancels in the softmax. So a gate that is *flat
+along the key axis* does nothing, and the model falls back to the frozen dense backbone — which is
+already strong. The router reaches that point at zero cost (`qi = 0`, or `gate_scale → 0`),
+satisfying the LM loss having learned **no ranking at all**.
+
+Every failure row of SAS's Table 1 is this one hole, reached differently:
+
+| gate | how it flattens | distance to dense | SAS 1-epoch |
+|---|---|---|---|
+| `s` (raw) | `s = 0` | **0.0** | 18.8 |
+| `log sigmoid(s)` | `s → +∞` (saturates) | 2e-16 | 17.0 |
+| `log softmax(s)`, no pin | `s = const` | 2e-16 | — |
+| `log softmax(s)` **+ pin** | **unreachable** | 1.2 | **54.4** |
+
+(dense baseline 56.1)
+
+Two conditions are needed **together**:
+
+1. **Normalize** over the key axis, fixing the total multiplier the gated keys may spend at 1.
+2. **Exempt some keys** from that normalizer, pinning their gate to 1 (log-space 0).
+
+With both, a flat gate is arithmetically impossible: pinned keys sit at multiplier 1, and matching
+them on all `N` gated keys would need the gated multipliers to sum to `N`, not 1. The router can
+only choose **which** keys get the fixed budget — and that choice is the ranking.
+
+Normalizing *without* pinning is **inert, not merely weaker**: `logsumexp(s)` is one constant per
+row, so it cancels too, and `log softmax(s)` is *exactly* interchangeable with raw `s` (forward and
+`d/ds`, to 1e-15; the mechanism is `Σ_k dS_k = 0`). The pin is what makes the normalizer
+load-bearing — it is not something SAS added unnecessarily. Both facts are asserted by
+`test_flat_gate_variants_all_reach_the_no_op` and `test_pin_closes_the_no_op_hole`, the latter
+checking that a pin blocks *both* routes (flat `qi` **and** `gate_scale → 0`).
+
+`pin_mode="none"` keeps the un-pinned behaviour as an ablation baseline, and warns.
+
+### Which pins need a kernel
+
+The only reason `self` and `sink` take different code paths.
+
+| pin | query-dependent? | folds into concat? | cost |
+|---|---|---|---|
+| `sink` (first `n_sink` keys) | no | **yes**, 1 extra dim | one SDPA call |
+| `self` (each query's diagonal) | **yes** | **no** | second attention path |
+
+Folding needs the indexer key zeroed at pinned positions. `sink` pins the same keys for every
+query, so a static `K` expresses it and the rank-one `−LSE` term rides in one extra dimension
+(verified 1.1e-15). `self` pins a *different* column per row, which no shared `K` can represent —
+the naive attempt is wrong by 2.5, not by rounding.
+
+So `self` takes a two-branch route: history-only attention (which *does* fold — inside that branch
+`−LSE` is a per-row constant and cancels, so no extra dimension is needed) plus the pinned keys,
+merged by their log-sum-exps. The `−LSE` re-enters only in the merge weight, which is exactly where
+the budget acts. Exact to 6.7e-16, checked against both the shared reference and a separately
+written two-branch reference.
+
+**Current limitation:** the `self` path builds explicit logits, so it is `O(Sq·Sk)` in memory. SDPA
+returns no log-sum-exp and recovering one would cost a third pass, so `self` is the
+correctness / short-sequence path today; a fused kernel (gate applied per tile, single pass) is what
+would make it viable at 32K. **`sink` needs none of this** — it stays one SDPA call at any length.
+
+Both pins need the history `logsumexp`. It streams over key tiles **and recomputes them in the
+backward pass**, so retention is `O(L)` per layer — measured 1.27 GiB across 36 layers at
+`L=8192`, against ~259 GiB for the first implementation, which OOM'd on step 1. The extra cost is
+one recomputed `Di`-wide GEMM per tile, not memory.
+
+> The first version was a plain loop of differentiable tile ops. That bounds the *forward* peak,
+> which is what its docstring claimed, but autograd retained every tile's intermediates until
+> backward: 3.6× the full score matrix, and **worse as the tile shrank** — the knob meant to save
+> memory made it worse. The fix uses the closed-form gradient `d(lse)/d(s_k) = softmax(s)_k`, so
+> only `lse` needs saving. `test_history_lse_retains_only_o_l` and
+> `test_history_lse_retention_does_not_grow_as_the_tile_shrinks` are the regression tests whose
+> absence let it ship; both fail on the old implementation.
+
+A row whose only visible
+key is pinned (query 0 under `self`) has *no* history; its `logsumexp` would be `−inf` and the gate
+`+inf`, so those rows get an inert gate instead of a NaN that would spread through the model.
+
+### Pinning does not apply to the sparse scope
+
+Under `stage="sparse"` the forward is already restricted to the router's own top-k, so a flat gate
+does **not** recover dense attention — there is no no-op to block. Same structural reason DMA (hard
+`-inf` on unselected keys) and SparseK (`Σp = k` solved, not learned) need no pin: their training
+forward is sparse, so "dense" was never a fallback.
+
+The combination is **rejected**, not ignored. `pin_mode` left unset resolves to `"self"` for the
+dense stage and `"none"` for the sparse one, so `stage="sparse"` needs no second flag.
+
+One untested risk remains: the scarcity is `log(1/N_history)`, which deepens from −1.8 nats at 6
+history keys to −10.4 at 32K. Whether that over-suppresses history at long context is not measured.
+See [`ROUTER_LEARNABILITY.md`](ROUTER_LEARNABILITY.md) §9.
+
+### The concat identity — why token-wise scoring is not the hard part
+
+The gate is *bilinear*, and that is what makes token-level full scope affordable:
+
+```
+scale·(q·k) + λ·(qi·ki)  ≡  scale·([q, (λ/scale)·qi] · [k, ki])
+```
+
+So gated attention **is** ordinary attention at `head_dim = D + Di`, and SDPA computes it with
+the gradient reaching `qi`/`ki` for free. Verified to ~1e-15 across shapes by
+`test_concat_matches_explicit`.
+
+What decides whether folding is available is **not** block-vs-token granularity. A *block* gate
+folds too, provided it is bilinear — broadcast the pooled block key back to its tokens on the key
+side and the identity holds unchanged (verified, 2e-16). Two other properties decide it:
+
+1. **The score must be bilinear.** `qi·ki` folds. A score with a nonlinearity or a projection
+   *after* the Q–K interaction does not, and has to be materialized.
+2. **The gate must be uniform over keys.** SAS pins its self-block gate to 1; that alone breaks
+   the fold (verified: 6e-1 error), for the same reason it revives the normalizer below.
+
+This indexer satisfies both, so no gate table and no kernel. SAS satisfies neither, so it needs
+one.
+
+Granularity *does* decide how expensive that table is once you're forced to build it. At
+`L=32K, H=4, fp32`:
+
+| gate table | size |
+|---|---|
+| `(query, block)`, B=128 | 0.12 GiB |
+| `(query, block)`, B=64 | 0.25 GiB |
+| `(query, token)` | **16 GiB** |
+
+So a materialize-the-gate design is affordable at block granularity and not at token
+granularity — which is why, had this indexer needed a table, token-wise scoring would have been
+the harder case, not the easier one. Folding sidesteps the question entirely.
+
+**V must be padded to the concatenated width.** Flash requires `Q.size(-1) == V.size(-1)`, and the
+concat widens Q/K to `D + Di` while V stays at `Dv`. That mismatch makes SDPA fall back to the
+**math** backend, which materializes the `(B, H, Sq, Sk)` attention weights *and retains them for
+backward* — 4.0 GiB per layer at `L=8192, Hq=32` in bf16, so **144 GiB across 36 layers**.
+`pad_value_to_width` widens V and slices the output back, which is exact (~1e-15 in forward and
+every gradient) and restores `O(L)` retention. Measured growth per doubling of `L`: **~4× unpadded,
+~2× padded**.
+
+> This shipped as an OOM. An earlier version of this note claimed `Dqk=256 / Dv=128` merely
+> "steers SDPA to its memory-efficient backend — still `O(n)` memory, somewhat slower". That was
+> wrong in the way that mattered: the check performed was whether SDPA *accepted* the shapes, not
+> which backend it *chose*. SDPA returns correct numbers on the math backend, so nothing but the
+> memory reveals it. `test_value_is_padded_so_flash_stays_eligible` and
+> `test_padding_v_makes_retention_linear_not_quadratic` are the guards; the latter runs on CPU,
+> since torch ships a fused CPU kernel and the backend choice reproduces there.
+
+Cost of the pad: 2× the V bandwidth and 2× the `P @ V` GEMM at `Di == D`, plus roughly 2× what
+flash retains (11.3 GiB vs 5.7 GiB across 36 layers at `L=8192`) — all `O(L)`. A fused Triton kernel
+(two `tl.dot`s per tile, `Dv` at its true width) would avoid the padding entirely, and is the
+remaining reason to write one.
+
+### Why `gate_scale` starts where it does
+
+`IndexerNorm` leaves q/k at unit variance per channel, so the raw score has std `~√head_dim`:
+measured **11.4** against **1.0** for a real `q·k/√head_dim` attention logit at `head_dim=128`.
+Added unscaled the gate would swamp the attention it is meant to modulate. `gate_scale` is a
+learnable per-layer scalar initialized to `head_dim**-0.5`, which brings it to std ≈ 1 — and when
+the indexer's `head_dim` equals the model's (the default), that is exactly the attention softmax
+scale, so the concatenated form needs no rescale at all.
+
+**It must not be initialized to 0.** Zero is tempting — training would start from exactly the
+frozen dense model, unperturbed — but `dL/dscore ∝ gate_scale`, so zero is a fixed point the run
+never leaves. Pinned by `test_zero_gate_scale_severs_the_router_gradient`. The price of having a
+gradient is a std-1 perturbation of the logits at step 0.
+
+Being learnable also makes it a diagnostic: `trainer.gate_scales` per layer says how hard each
+layer leans on its router. One that collapses toward 0 is a router not earning its place, which no
+loss curve would tell you.
+
+### Full vs sparse scope
+
+Under **full** scope every key is gated, so every key's score gets a content-dependent gradient.
+Under **sparse** scope an unselected key contributes nothing to the output, so it has no gradient
+of its own and moves only through the softmax normalizer — the whole unselected set is dragged
+together rather than judged individually. SAS shows this as a perfect line (`R² = 1.00`) through
+the unselected points in their Figure 5; `test_full_scope_gradients_are_independent` asserts the
+stronger discrete form: the sparse-scope gradient at unselected slots is *identically zero*.
+
+That is what full scope buys for its `O(n²)`, and it is the largest single effect in SAS's
+ablation (47.4 → 55.6).
+
+### The train/inference mismatch is deliberate
+
+Under `stage="dense"`, training gates all keys while inference hard-selects top-k. That looks like
+a bug and is the design. SAS tests the consistent alternative (STE, hard top-k in the forward) and
+it is consistently **worse** — 61.30 → 51.48 on AIME25 at budget 4096 — because a hard forward
+collapses the score into a selected/unselected bit and discards the ranking information near the
+top-k boundary. `stage="sparse"` is the consistent variant, available for exactly that comparison.
+
+### What is trained
+
+Only the indexers; `freeze_backbone` puts every other parameter at `requires_grad=False`, matching
+SAS and matching distillation — otherwise the comparison would confound "end-to-end gradient" with
+"more trainable parameters". The gradient still *flows through* the frozen backbone to reach the
+router, which is the point.
+
+`gate_scale=False` (the default) keeps the parameter out of the state dict entirely, so
+distillation checkpoints stay byte-compatible with what they were before this feature existed.
 
 ## Correctness notes
 
@@ -470,6 +734,95 @@ two implementations only on live rows.**
 Stage 2 is torch-only for now; `backend="triton"` with `stage="sparse"` raises rather than
 pretending. Fusing it needs top-k inside the kernel, which is a different problem — the
 selection has to be complete before the loss pass can start.
+
+
+## Sparse attention at inference (GQA DSA)
+
+Everything above trains the indexer, and `GQAIndexerPress` spends it on **eviction**: keys
+leave the cache, so every later query sees the same reduced cache. `sparse_attention.py` and
+`triton_sparse_attention.py` do the other thing the indexer enables, and the thing DSA
+actually ships — keep the cache whole and let **each query attend to its own top-k keys**.
+Nothing is discarded, so a key one query ignored is still there for the next one; the saving
+is in attention FLOPs and score-matrix bandwidth rather than in cache residency.
+
+That is why this needs a kernel at all. Eviction ends with a smaller *dense* cache, which
+ordinary dense attention handles unchanged. Per-query selection is a **gather** — every
+`(query, KV head)` row reads a different `topk` slice — and no dense kernel expresses it.
+
+```python
+from kvpress.presses.gqa_indexer import streaming_topk_support, sparse_gqa_attention
+
+# indices: (B, Hkv, Sq, topk) int32, ascending, -1 in empty slots
+indices, _ = streaming_topk_support(q_idx, k_idx, topk=512, force_sink=4, force_local=64)
+out, lse = sparse_gqa_attention(q, k, v, indices)   # (B, H, Sq, Dv), (B, H, Sq)
+```
+
+The index convention is exactly what `sort_support` already emits, so the selector feeds the
+kernel with no adapter. `-1` (Megatron/sglang's choice) rather than `Sk`-as-sentinel
+(tilelang's) because it is checkable without knowing `Sk` and cannot be mistaken for a real
+position.
+
+| | batched | varlen |
+|---|---|---|
+| entry point | `triton_sparse_gqa_attention` | `triton_sparse_gqa_attention_varlen` |
+| `q` | `(B, H, Sq, D)` | `(total_q, H, D)` |
+| `k`, `v` | `(B, Hkv, Sk, D)` | `(total_k, Hkv, D)` |
+| `indices` | `(B, Hkv, Sq, topk)` | `(total_q, Hkv, topk)`, **sequence-local** |
+| metadata | — | `cu_seqlens_q`, `cu_seqlens_k` |
+
+Varlen indices are sequence-local (slot `j` means row `cu_seqlens_k[s] + j`), which keeps the
+indexer's output usable unchanged and lets a sequence move in the buffer without rewriting its
+indices. No page tables, no block tables — deliberately simpler than sglang. Mixed
+prefill+decode batches and empty sequences both work; each sequence is bottom-right aligned
+within itself. Both layouts share one kernel body, so there is one thing to be correct rather
+than two that agree — and each packed sequence is verified **bit-identical** to the batched
+kernel run on that sequence alone.
+
+### Why the tiles are shaped this way
+
+MLA's sparse kernels (tilelang `sparse_mla_fwd`, FlashMLA) put 64–128 heads in the GEMM's `M`
+dimension, because one shared latent cache means *all* heads share one index list and so one
+gathered tile. Under GQA the selection is per KV head, so only `group_size = H // Hkv` query
+heads — typically 4–8 — share a list. That cannot be widened by also tiling over query tokens,
+the usual fix for a short `M`: adjacent queries hold *different* index lists, so they cannot
+share a gathered tile. It is intrinsic to per-query selection under GQA, not an artifact of
+this implementation. The QK GEMM is therefore bandwidth-bound on the gather, which is the
+regime that makes the approach worthwhile — but a configuration where `topk` approaches `Sk`
+will lose to a dense kernel.
+
+### `block_k` must be ≥ 16
+
+Triton's NVIDIA backend reports `min_dot_size = (M=1, N=1, K=16)` — only the **contraction**
+dim is constrained. Two consequences, and guessing wrong either way costs something:
+
+- `M` needs no padding, so `BLOCK_G` rounds `group_size` to a power of two rather than to 16.
+  At `group_size=4` that is a 4× smaller fp32 accumulator and 4× fewer wasted QK lanes.
+- `block_k` **must** be ≥ 16, since `P @ V` contracts over it. This is validated eagerly
+  because `TRITON_INTERPRET=1` does *not* apply the floor: `block_k=8` runs green on CPU and
+  then fails to compile on the first GPU. `test_dot_shapes_are_legal_on_hardware` restates the
+  rule over every tile shape the launcher computes, which is what keeps an interpreter-only
+  test run honest about hardware.
+
+### Correctness
+
+Two independent torch references: one gathers `topk` keys, one scatters a dense `(Sq, Sk)`
+mask. They share no index arithmetic — the part easiest to get subtly wrong — so their
+agreement is evidence about the *operation*, not about one implementation of it. With
+`topk == Sk` both reduce to `scaled_dot_product_attention` to 3e-7, which pins the scale, the
+softmax and the bottom-right causal alignment at once. The kernel matches the gather reference
+to ~5e-7 in fp32 across group sizes 1–16, non-power-of-two head dims, and `Dv != D`.
+
+Empty rows are defined as `out = 0`, `lse = -inf` rather than `0/0 = NaN`: `-inf` is the honest
+log of an empty sum and is what a downstream combine needs in order to give the row zero
+weight. Rows can genuinely be empty — a short causal row plus padding produces one — and a NaN
+there would propagate through the whole model instead of staying local. Malformed indices
+(out of range, wrong negative, duplicated, past the diagonal) are masked, never dereferenced;
+every gather address is clamped first.
+
+**Not yet wired into a press.** These are the op and its kernel, tested standalone. Using them
+end-to-end also needs an attention-module hook that calls the indexer, selects, and dispatches
+here instead of to SDPA — plus a decode path that caches indexer keys across steps, which the
+eviction press does not need either (see *Status*).
 
 
 ## Memory optimizations

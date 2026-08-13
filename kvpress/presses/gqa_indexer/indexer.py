@@ -132,6 +132,11 @@ class GQAIndexerConfig:
         Number of leading channels to rotate. ``0`` disables RoPE; must be even.
     norm_eps : float
         Epsilon for the q/k LayerNorms.
+    gate_scale : bool
+        Create the learnable ``gate_scale`` scalar used by end-to-end (gated-attention)
+        training. Left ``False`` for distillation, which never reads it, so a
+        distillation-trained checkpoint carries no extra parameter. See
+        :attr:`GQAIndexer.gate_scale`.
     """
 
     hidden_size: int
@@ -139,6 +144,7 @@ class GQAIndexerConfig:
     head_dim: int
     rope_dim: int = 0
     norm_eps: float = 1e-5
+    gate_scale: bool = False
 
     def __post_init__(self):
         if self.rope_dim % 2 != 0:
@@ -181,6 +187,20 @@ class GQAIndexer(nn.Module):
     module stays a pure scorer.
     """
 
+    #: Natural magnitude for the score when it is used as an additive attention gate.
+    #:
+    #: ``IndexerNorm`` leaves q and k at unit variance per channel, so the ``head_dim``-long
+    #: dot product has standard deviation ``~sqrt(head_dim)``: measured 11.4 against 1.0 for a
+    #: real ``q @ k / sqrt(head_dim)`` attention logit at ``head_dim=128``. Added raw, the gate
+    #: would be an 11x louder term than the attention it is supposed to modulate. Dividing by
+    #: ``sqrt(head_dim)`` -- the same correction, and for the same reason, as attention's own
+    #: scaling -- brings it to std 1.0.
+    #:
+    #: Note this is exactly the attention softmax scale when the indexer's ``head_dim`` equals
+    #: the model's, which is the default: the concatenated form in
+    #: :mod:`~kvpress.presses.gqa_indexer.gated_attention` then needs no rescale at all.
+    GATE_SCALE_INIT = staticmethod(lambda head_dim: head_dim**-0.5)
+
     def __init__(self, config: GQAIndexerConfig):
         super().__init__()
         self.config = config
@@ -195,6 +215,21 @@ class GQAIndexer(nn.Module):
         # fp32 statistics regardless of the module dtype -- see IndexerNorm.
         self.q_norm = IndexerNorm(config.head_dim, eps=config.norm_eps)
         self.k_norm = IndexerNorm(config.head_dim, eps=config.norm_eps)
+
+        # Multiplier on the score when it acts as an additive attention gate. One scalar per
+        # layer, so each layer learns how much to lean on its own router -- and the trained
+        # value is a readout on whether the router earns its place at all.
+        #
+        # Deliberately NOT initialized to 0. A zero gate would start end-to-end training from
+        # exactly the frozen dense model, which is tempting, but `dL/dscore` is proportional to
+        # this scalar: at 0 the router receives no gradient and the run never leaves that point.
+        # Starting at the natural scale means accepting a std-1 perturbation of the attention
+        # logits at step 0, which is the price of having a gradient at all.
+        self.gate_scale = (
+            nn.Parameter(torch.tensor(self.GATE_SCALE_INIT(config.head_dim)))
+            if config.gate_scale
+            else None
+        )
 
     def project_q(self, hidden_states: torch.Tensor, cos=None, sin=None) -> torch.Tensor:
         """Project and rotate indexer queries -> (B, n_heads, Sq, D)."""
@@ -218,6 +253,23 @@ class GQAIndexer(nn.Module):
         if cos is not None:
             k = apply_rotary(k, cos, sin)
         return k.squeeze(1)
+
+    def require_gate_scale(self) -> torch.Tensor:
+        """
+        The gate multiplier, raising when this indexer was not built with one.
+
+        Raises rather than defaulting to the init constant: an indexer without the parameter
+        is one that will not *learn* the gate strength, and end-to-end training would then
+        report a healthy loss while silently running the fixed-scale ablation instead of the
+        configured one.
+        """
+        if self.gate_scale is None:
+            raise RuntimeError(
+                "this indexer has no gate_scale parameter, so it cannot be used as an "
+                "attention gate. Build it with GQAIndexerConfig(gate_scale=True) -- or, from "
+                "the press, GQAIndexerPress(gate_scale=True)."
+            )
+        return self.gate_scale
 
     def forward(
         self,

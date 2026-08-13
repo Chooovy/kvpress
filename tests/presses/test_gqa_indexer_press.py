@@ -19,6 +19,7 @@ from kvpress.presses.gqa_indexer import (
     aggregate_chunk_scores,
     build_indexer_mask,
     build_dense_indexer_target,
+    build_position_embeddings,
     build_sparse_indexer_target,
     compute_indexer_loss,
     freeze_all_but_indexer,
@@ -471,6 +472,17 @@ def test_layer_loss_rejects_shape_mismatch():
 # ----------------------------------------------------------------------
 # Press integration
 # ----------------------------------------------------------------------
+def score_kwargs(model, hidden_states):
+    """
+    The kwargs ``score`` sees at inference, which always include position_embeddings.
+
+    The press is hooked onto ``self_attn``, so it is handed the layer's own (cos, sin);
+    calling ``score`` with ``{}`` instead is not a lighter version of the same thing, it is
+    a NoPE student the press never runs -- and ``get_rope_tables`` rejects it outright.
+    """
+    return {"position_embeddings": build_position_embeddings(model, hidden_states)}
+
+
 def test_press_scores_are_per_kv_head(unit_test_model):  # noqa: F811
     press = GQAIndexerPress(compression_ratio=0.5)
     press.post_init_from_model(unit_test_model)
@@ -481,7 +493,7 @@ def test_press_scores_are_per_kv_head(unit_test_model):  # noqa: F811
     hidden = torch.randn(1, 12, unit_test_model.config.hidden_size, device=unit_test_model.device)
     keys = torch.randn(1, n_kv, 12, head_dim, device=unit_test_model.device)
 
-    scores = press.score(module, hidden, keys, keys, None, {})
+    scores = press.score(module, hidden, keys, keys, None, score_kwargs(unit_test_model, hidden))
     assert scores.shape == (1, n_kv, 12)
 
 
@@ -494,7 +506,7 @@ def test_press_protects_sink_and_local(unit_test_model):  # noqa: F811
     hidden = torch.randn(1, 16, unit_test_model.config.hidden_size, device=unit_test_model.device)
     keys = torch.randn(1, n_kv, 16, module.head_dim, device=unit_test_model.device)
 
-    scores = press.score(module, hidden, keys, keys, None, {})
+    scores = press.score(module, hidden, keys, keys, None, score_kwargs(unit_test_model, hidden))
     # Protection uses a finite sentinel, not +inf, so scores stay usable in arithmetic.
     assert torch.isfinite(scores).all()
     protected = torch.cat([scores[..., :2], scores[..., -3:]], dim=-1)
@@ -512,7 +524,7 @@ def test_press_protected_tokens_survive_compression(unit_test_model):  # noqa: F
     hidden = torch.randn(1, seq_len, unit_test_model.config.hidden_size, device=unit_test_model.device)
     keys = torch.randn(1, n_kv, seq_len, module.head_dim, device=unit_test_model.device)
 
-    scores = press.score(module, hidden, keys, keys, None, {})
+    scores = press.score(module, hidden, keys, keys, None, score_kwargs(unit_test_model, hidden))
     n_kept = int(seq_len * (1 - press.compression_ratio))
     kept = scores.topk(n_kept, dim=-1).indices[0, 0].tolist()
     for idx in (0, 1, seq_len - 2, seq_len - 1):
@@ -529,7 +541,7 @@ def test_press_chunk_mode_gives_chunk_uniform_scores(unit_test_model):  # noqa: 
     hidden = torch.randn(1, 16, unit_test_model.config.hidden_size, device=unit_test_model.device)
     keys = torch.randn(1, n_kv, 16, module.head_dim, device=unit_test_model.device)
 
-    scores = press.score(module, hidden, keys, keys, None, {})
+    scores = press.score(module, hidden, keys, keys, None, score_kwargs(unit_test_model, hidden))
     for start in range(0, 16, 4):
         chunk = scores[0, 0, start : start + 4]
         assert torch.allclose(chunk, chunk[0].expand(4)), f"chunk at {start} is not uniform"
@@ -709,10 +721,40 @@ def test_get_rope_tables_raises_when_rope_is_wanted_but_absent(unit_test_model):
 def test_get_rope_tables_allows_deliberate_nope(unit_test_model):  # noqa: F811
     """rope_dim=0 is an explicit opt-in, so it must stay silent."""
     press = GQAIndexerPress(compression_ratio=0.5, rope_dim=0)
-    press.post_init_from_model(unit_test_model)
+    # force_reinit because the session-scoped fixture is shared: an earlier test has
+    # already attached a rope_dim>0 indexer, and post_init now refuses to reuse it.
+    press.post_init_from_model(unit_test_model, force_reinit=True)
     indexer = press.get_indexer(get_attention_modules(unit_test_model)[0])
     assert indexer.rope_dim == 0
     assert press.get_rope_tables(indexer, {}) == (None, None)
+    # Leave the fixture as the other tests expect to find it.
+    GQAIndexerPress(compression_ratio=0.5).post_init_from_model(unit_test_model, force_reinit=True)
+
+
+def test_post_init_rejects_a_mismatched_existing_indexer(unit_test_model):  # noqa: F811
+    """
+    Reusing an attached indexer whose geometry differs from the request must be an error.
+
+    post_init skips layers that already carry an indexer, so a press could otherwise score
+    with geometry it never asked for. rope_dim is the dangerous case: it is not a parameter
+    shape, so load_indexer_state_dict cannot catch the divergence either -- the press would
+    just quietly run a NoPE student, or a RoPE one, contrary to its own config.
+    """
+    GQAIndexerPress(compression_ratio=0.5).post_init_from_model(unit_test_model, force_reinit=True)
+
+    with pytest.raises(ValueError, match="already has a 'indexer' with geometry"):
+        GQAIndexerPress(compression_ratio=0.5, rope_dim=0).post_init_from_model(unit_test_model)
+
+    # Matching geometry stays idempotent, and force_reinit is the documented escape hatch.
+    press = GQAIndexerPress(compression_ratio=0.5)
+    first = press.get_indexer(get_attention_modules(unit_test_model)[0])
+    GQAIndexerPress(compression_ratio=0.5).post_init_from_model(unit_test_model)
+    assert press.get_indexer(get_attention_modules(unit_test_model)[0]) is first
+    GQAIndexerPress(compression_ratio=0.5, rope_dim=0).post_init_from_model(
+        unit_test_model, force_reinit=True
+    )
+    assert press.get_indexer(get_attention_modules(unit_test_model)[0]).rope_dim == 0
+    GQAIndexerPress(compression_ratio=0.5).post_init_from_model(unit_test_model, force_reinit=True)
 
 
 def test_compute_indexer_loss_applies_rope(unit_test_model_output_attention):  # noqa: F811

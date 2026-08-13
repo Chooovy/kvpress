@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
+import inspect
 
 import pytest
 import torch
@@ -15,6 +16,7 @@ from kvpress import (
     CriticalAdaKVPress,
     CriticalKVPress,
     DMSPress,
+    FacilityLocationPress,
     FastKVzipPress,
     KeyRerotationPress,
     KnormPress,
@@ -28,6 +30,24 @@ from kvpress import (
 )
 from tests.default_presses import default_presses
 from tests.fixtures import unit_test_model, unit_test_model_output_attention  # noqa: F401
+
+
+def init_press_from_model(press, model):
+    """
+    Call ``post_init_from_model`` for presses that need it, on a model shared across kwargs.
+
+    ``GQAIndexerPress`` attaches an indexer module to each attention layer and refuses to
+    reuse one whose geometry differs from what it was configured for. Since this loop drives
+    many kwargs sets through a single session-scoped model, later variants (e.g. ``rope_dim=0,
+    head_dim=32``) would otherwise inherit the first variant's indexer and never exercise the
+    geometry they name, so ask for a fresh one.
+    """
+    if not hasattr(press, "post_init_from_model"):
+        return
+    if "force_reinit" in inspect.signature(press.post_init_from_model).parameters:
+        press.post_init_from_model(model, force_reinit=True)
+    else:
+        press.post_init_from_model(model)
 
 
 def test_composed_press(unit_test_model):  # noqa: F811
@@ -48,6 +68,41 @@ def test_chunk_press(unit_test_model):  # noqa: F811
             cache = DynamicCache()
             unit_test_model(input_ids, past_key_values=cache).past_key_values
             assert cache.get_seq_length() == 128
+
+
+def test_chunk_press_slices_position_embeddings_per_chunk(unit_test_model):  # noqa: F811
+    """
+    Each chunk must be scored with its own RoPE tables, not the whole sequence's.
+
+    ChunkPress slices hidden_states/keys/values per chunk but used to forward kwargs
+    untouched, so a press that rotates queries saw positions the chunk does not contain.
+    That is silent for SnapKV -- ``cos[:, -window_size:]`` is the end of the sequence rather
+    than of the chunk, so it picks different keys with no error -- and fatal for a press that
+    rotates the full chunk, which is how the mismatch was noticed.
+    """
+    seen = []
+    # Read from __dict__, not the class, so the saved value is the staticmethod descriptor
+    # itself -- restoring a plain function would leave later tests calling it as a bound
+    # method, silently shifting every argument by one.
+    original = SnapKVPress.__dict__["compute_window_attention"]
+    unwrapped = SnapKVPress.compute_window_attention
+
+    def spy(module, hidden_states, keys, window_size, position_embeddings):
+        seen.append((hidden_states.shape[1], position_embeddings[0].shape[-2]))
+        return unwrapped(module, hidden_states, keys, window_size, position_embeddings)
+
+    SnapKVPress.compute_window_attention = staticmethod(spy)
+    try:
+        press = ChunkPress(press=SnapKVPress(compression_ratio=0.5, window_size=4), chunk_length=24)
+        with press(unit_test_model):
+            input_ids = torch.randint(0, 1024, (1, 72), device=unit_test_model.device)
+            unit_test_model(input_ids, past_key_values=DynamicCache())
+    finally:
+        SnapKVPress.compute_window_attention = original
+
+    assert seen
+    for hidden_len, rope_len in seen:
+        assert rope_len == hidden_len, f"rope table spans {rope_len} positions for {hidden_len} tokens"
 
 
 def test_chunkkv_press(unit_test_model):  # noqa: F811
@@ -81,8 +136,7 @@ def test_presses_run(unit_test_model, press_dict, wrapper_press):  # noqa: F811
     for kwargs in press_dict["kwargs"]:
         press = cls(**kwargs)
         if wrapper_press is not None:
-            if hasattr(press, "post_init_from_model"):
-                press.post_init_from_model(unit_test_model)
+            init_press_from_model(press, unit_test_model)
             if issubclass(wrapper_press, ComposedPress):
                 if isinstance(press, (KVzipPress, FastKVzipPress, KVComposePress)):
                     # KVzipPress, FastKVzipPress and KVComposePress are currently not compatible with ComposedPress
@@ -101,8 +155,7 @@ def test_presses_run(unit_test_model, press_dict, wrapper_press):  # noqa: F811
                 press = DMSPress(press=press, threshold=-0.5, sliding_window_size=32)
 
         # TODO: Handle post_init_from_model differently
-        if hasattr(press, "post_init_from_model"):
-            press.post_init_from_model(unit_test_model)
+        init_press_from_model(press, unit_test_model)
         with press(unit_test_model):
             input_ids = torch.randint(0, 1024, (1, 128), device=unit_test_model.device)
             unit_test_model(input_ids, past_key_values=DynamicCache()).past_key_values
@@ -111,7 +164,7 @@ def test_presses_run(unit_test_model, press_dict, wrapper_press):  # noqa: F811
 
 
 def test_presses_run_observed_attention(unit_test_model_output_attention):  # noqa: F811
-    for cls in [ObservedAttentionPress]:
+    for cls in [ObservedAttentionPress, FacilityLocationPress]:
         for compresion_ratio in [0.2, 0.8]:
             press = cls(compression_ratio=compresion_ratio)
             with press(unit_test_model_output_attention):

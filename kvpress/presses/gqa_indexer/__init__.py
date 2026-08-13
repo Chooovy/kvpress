@@ -25,6 +25,17 @@ attention, which drops three of DSA's components rather than porting them:
 Selection stays at token granularity inside the indexer; chunk/block aggregation is a
 separate, optional post-processing step on the token scores (see
 :mod:`kvpress.presses.gqa_indexer.aggregate`).
+
+Two training objectives ship, and they are alternatives rather than stages of one recipe:
+
+* **Distillation** (:mod:`~kvpress.presses.gqa_indexer.fused_trainer`) matches the frozen
+  model's own attention weights. The score never enters the forward pass.
+* **End-to-end** (:mod:`~kvpress.presses.gqa_indexer.e2e_trainer`) adds the score inside the
+  attention softmax so the LM loss trains it directly, following SAS. Needs
+  ``GQAIndexerPress(gate_scale=True)``.
+
+Both expose a full-scope stage and a top-k-scope stage under the same ``stage`` names, so the
+two objectives can be compared at matched budget.
 """
 
 from kvpress.presses.gqa_indexer.aggregate import (
@@ -60,6 +71,11 @@ from kvpress.presses.gqa_indexer.data import (
     shard_paths,
     wsd_lr_lambda,
 )
+from kvpress.presses.gqa_indexer.e2e_trainer import (
+    STAGES,
+    E2EIndexerTrainer,
+    e2e_indexer_training_step,
+)
 from kvpress.presses.gqa_indexer.fused_loss import (
     accumulation_dtype,
     group_view,
@@ -83,6 +99,32 @@ from kvpress.presses.gqa_indexer.fused_trainer import (
     fused_indexer_training_step,
     teacher_query_states,
 )
+from kvpress.presses.gqa_indexer.gate_pin import (
+    PIN_MODES,
+    check_pin_mode,
+    gate_from_score,
+    history_lse,
+    is_query_dependent,
+    pinned_mask,
+    pins_self,
+    pins_sink,
+)
+from kvpress.presses.gqa_indexer.gated_attention import (
+    SCOPES,
+    build_concat_qk,
+    pad_value_to_width,
+    causal_mask_bottom_right,
+    check_gate_shapes,
+    gated_attention,
+    gated_attention_full,
+    gated_attention_pinned_self,
+    gated_attention_reference,
+    gated_attention_sparse,
+)
+from kvpress.presses.gqa_indexer.triton_gated_attention import (
+    gated_kernels_available,
+    triton_gated_attention,
+)
 from kvpress.presses.gqa_indexer.indexer import (
     GQAIndexer,
     GQAIndexerConfig,
@@ -100,6 +142,20 @@ from kvpress.presses.gqa_indexer.loss import (
     normalize_indexer_target,
 )
 from kvpress.presses.gqa_indexer.press import GQAIndexerPress
+from kvpress.presses.gqa_indexer.sparse_inference import (
+    IMPL_NAME as SPARSE_ATTENTION_IMPL_NAME,
+    SparseAttentionContext,
+)
+from kvpress.presses.gqa_indexer.sparse_attention import (
+    check_sparse_shapes,
+    pack_varlen,
+    resolve_scaling,
+    slot_validity,
+    sparse_gqa_attention_dense_reference,
+    sparse_gqa_attention_reference,
+    sparse_gqa_attention_varlen_reference,
+    unpack_varlen,
+)
 from kvpress.presses.gqa_indexer.sparse_support import (
     causal_keep,
     excluded_key_mask,
@@ -134,6 +190,13 @@ from kvpress.presses.gqa_indexer.triton_fused_loss import (
     triton_indexer_loss,
     triton_interpret_enabled,
 )
+from kvpress.presses.gqa_indexer.triton_sparse_attention import (
+    seq_ids_from_cu_seqlens,
+    sparse_gqa_attention,
+    sparse_kernels_available,
+    triton_sparse_gqa_attention,
+    triton_sparse_gqa_attention_varlen,
+)
 
 __all__ = [
     # Data loading
@@ -153,6 +216,8 @@ __all__ = [
     "GQAIndexerConfig",
     "IndexerNorm",
     "GQAIndexerPress",
+    "SparseAttentionContext",
+    "SPARSE_ATTENTION_IMPL_NAME",
     "build_indexer_mask",
     "slice_rope_tables",
     "aggregate_chunk_scores",
@@ -182,6 +247,31 @@ __all__ = [
     "attention_scaling",
     "fused_indexer_training_step",
     "teacher_query_states",
+    # End-to-end (gated-attention) training
+    "E2EIndexerTrainer",
+    "e2e_indexer_training_step",
+    "STAGES",
+    "SCOPES",
+    "gated_attention",
+    "gated_attention_full",
+    "gated_attention_sparse",
+    "gated_attention_pinned_self",
+    "gated_attention_reference",
+    "build_concat_qk",
+    "causal_mask_bottom_right",
+    "check_gate_shapes",
+    "pad_value_to_width",
+    "triton_gated_attention",
+    "gated_kernels_available",
+    # Gate pinning (what stops the gate flattening into a no-op)
+    "PIN_MODES",
+    "check_pin_mode",
+    "gate_from_score",
+    "history_lse",
+    "is_query_dependent",
+    "pinned_mask",
+    "pins_self",
+    "pins_sink",
     "make_recompute_teacher",
     "teacher_lse_from_qk",
     "teacher_probs_from_lse",
@@ -203,6 +293,20 @@ __all__ = [
     "make_sparse_recompute_teacher",
     "fused_sparse_indexer_kl_rows",
     "fused_sparse_indexer_loss",
+    # Sparse attention at inference: per-query top-k, no eviction
+    "check_sparse_shapes",
+    "resolve_scaling",
+    "slot_validity",
+    "sparse_gqa_attention",
+    "sparse_gqa_attention_reference",
+    "sparse_gqa_attention_dense_reference",
+    "sparse_gqa_attention_varlen_reference",
+    "sparse_kernels_available",
+    "triton_sparse_gqa_attention",
+    "triton_sparse_gqa_attention_varlen",
+    "seq_ids_from_cu_seqlens",
+    "pack_varlen",
+    "unpack_varlen",
     # Triton kernels for stage 1
     "HAS_TRITON",
     "kernels_available",

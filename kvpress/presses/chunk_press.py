@@ -47,6 +47,27 @@ class ChunkPress(BasePress):
     def compression_ratio(self, value):
         self.press.compression_ratio = value
 
+    def _slice_kwargs(self, kwargs: dict, start: int) -> dict:
+        """
+        Narrow ``position_embeddings`` to the chunk that is being scored.
+
+        ``hidden_states``, keys and values are all sliced per chunk, so the RoPE tables have
+        to follow or they describe positions the chunk does not contain. Presses that rotate
+        queries themselves (SnapKV, TOVA, ThinK, Finch) would otherwise read the wrong
+        positions silently -- ``cos[:, -window_size:]`` means the end of the *sequence*, not
+        the end of the chunk -- while a press that rotates the whole chunk (GQAIndexerPress)
+        fails outright on the length mismatch.
+        """
+        position_embeddings = kwargs.get("position_embeddings")
+        if position_embeddings is None:
+            return kwargs
+        cos, sin = position_embeddings
+        stop = start + self.chunk_length
+        return {
+            **kwargs,
+            "position_embeddings": (cos[..., start:stop, :], sin[..., start:stop, :]),
+        }
+
     def compress(
         self,
         module: nn.Module,
@@ -71,7 +92,7 @@ class ChunkPress(BasePress):
                 keys[:, :, i : i + self.chunk_length],
                 values[:, :, i : i + self.chunk_length],
                 attentions,
-                kwargs,
+                self._slice_kwargs(kwargs, i),
             )
             chunk_length = keys[:, :, i : i + self.chunk_length].shape[2]
             n_kept = max(1, int(chunk_length * (1 - self.press.compression_ratio)))

@@ -13,14 +13,25 @@ import numpy as np
 import pandas as pd
 import torch
 import yaml
-from benchmarks.needle_in_haystack.utils import insert_needle_in_haystack
 from datasets import load_dataset
-from evaluate_registry import DATASET_REGISTRY, PRESS_REGISTRY, SCORER_REGISTRY
 from fire import Fire
 from tqdm import tqdm
 from transformers import FineGrainedFP8Config, Pipeline, pipeline
 
-from kvpress import (
+# Run as a plain script without pip-installing the package: put the repo root on sys.path so
+# `import kvpress` resolves. Must precede the evaluate_registry import too -- that module imports
+# kvpress itself, so it is the line that fails first without this.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from benchmarks.needle_in_haystack.utils import insert_needle_in_haystack  # noqa: E402
+from evaluate_registry import (  # noqa: E402
+    DATASET_REGISTRY,
+    PRESS_REGISTRY,
+    SCORER_REGISTRY,
+)
+from kvpress import (  # noqa: E402
     ComposedPress,
     DecodingPress,
     DMSPress,
@@ -67,6 +78,13 @@ class EvaluationConfig:
 
     # Model-specific parameters
     model_kwargs: Optional[Dict[str, Any]] = None
+
+    # Attention kernel. None keeps the historical behaviour: flash_attention_2 whenever the
+    # flash_attn package merely *imports*, with no check that the build actually works against the
+    # installed torch/transformers. A mismatched build does not raise -- it silently returns wrong
+    # logits, which reads as "the model scores 0 on everything" rather than as a crash. Set this to
+    # "sdpa" (or "eager") to take that variable out of an evaluation.
+    attn_implementation: Optional[str] = None
 
     # Press information (will be set after press setup)
     press_init_command: Optional[str] = None
@@ -374,6 +392,12 @@ class EvaluationRunner:
         if isinstance(self.press, ObservedAttentionPress):
             model_kwargs["attn_implementation"] = "eager"
             logger.info("ObservedAttentionPress detected, setting attn_implementation to 'eager'.")
+        elif self.config.attn_implementation:
+            # Explicit wins over autodetection: a flash-attn build that imports but does not match
+            # the installed torch returns wrong logits silently, so being able to pin "sdpa" is how
+            # that gets ruled out without uninstalling the package.
+            model_kwargs["attn_implementation"] = self.config.attn_implementation
+            logger.info("Using requested attn_implementation=%r.", self.config.attn_implementation)
         else:
             try:
                 import flash_attn  # noqa: F401

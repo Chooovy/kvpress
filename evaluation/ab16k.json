@@ -1,0 +1,92 @@
+[
+  {
+    "ckpt": "e2e",
+    "length": 8192,
+    "block_g_floor": 16,
+    "precision": "tf32",
+    "key_tile": 512,
+    "prefill_s": 9.407,
+    "all_s": [
+      9.407,
+      9.407,
+      9.41
+    ],
+    "select_s": 6.749,
+    "attend_s": 1.679
+  },
+  {
+    "ckpt": "e2e",
+    "length": 8192,
+    "block_g_floor": 16,
+    "precision": "tf32",
+    "key_tile": 2048,
+    "prefill_s": 5.246,
+    "all_s": [
+      5.246,
+      5.246,
+      5.25
+    ],
+    "select_s": 2.612,
+    "attend_s": 1.68
+  },
+  {
+    "ckpt": "e2e",
+    "length": 8192,
+    "block_g_floor": 16,
+    "precision": "tf32",
+    "key_tile": 4096,
+    "prefill_s": 4.571,
+    "all_s": [
+      4.571,
+      4.571,
+      4.571
+    ],
+    "select_s": 1.912,
+    "attend_s": 1.681
+  },
+  {
+    "ckpt": "e2e",
+    "length": 16384,
+    "block_g_floor": 16,
+    "precision": "tf32",
+    "key_tile": 512,
+    "prefill_s": 31.982,
+    "all_s": [
+      31.974,
+      31.982,
+      31.996
+    ],
+    "select_s": 26.673,
+    "attend_s": 3.351
+  },
+  {
+    "ckpt": "e2e",
+    "length": 16384,
+    "block_g_floor": 16,
+    "precision": "tf32",
+    "key_tile": 2048,
+    "prefill_s": 14.523,
+    "all_s": [
+      14.52,
+      14.523,
+      14.538
+    ],
+    "select_s": 9.219,
+    "attend_s": 3.351
+  },
+  {
+    "ckpt": "e2e",
+    "length": 16384,
+    "block_g_floor": 16,
+    "precision": "tf32",
+    "key_tile": 4096,
+    "prefill_s": 11.853,
+    "all_s": [
+      11.852,
+      11.853,
+      11.963
+    ],
+    "select_s": 6.54,
+    "attend_s": 3.351
+  }
+]

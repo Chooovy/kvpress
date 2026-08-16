@@ -73,6 +73,22 @@ class SparseAttentionContext:
         Triton topk-tile; power of two, ``>= 16``. Memory/throughput knob only.
     causal : bool
         Mask slots past each query's diagonal. Redundant for causally-selected indices and cheap.
+    precision : str
+        ``tl.dot`` precision. ``"tf32"`` by default here, unlike the kernel's own ``"ieee"``
+        default, because at inference the operands are the model's own bf16 q/k/v: every bf16
+        value is exactly representable in tf32 (10 mantissa bits against bf16's 8), so the QK
+        dot is *bit-identical* either way, and the PV dot's only genuine fp32 operand -- the
+        softmax weights -- rounds to ~2e-4 relative, some 30x below the bf16 epsilon the output
+        is stored at. Measured on an H20 at ``L=8192, topk=2048``: 67.0 s per prefill under
+        ``"ieee"`` against 9.4 s under ``"tf32"``, for identical error against the fp32
+        reference (7.52e-3 both, i.e. bf16 output rounding alone).
+
+        The reason the gap is so large is that ``"ieee"`` fp32 does not use tensor cores at all,
+        so ``BLOCK_G`` -- padded up to 16 on Triton 3.3, which requires ``M >= 16`` -- becomes
+        real work rather than lanes the hardware was going to occupy regardless: M scales the
+        kernel ~linearly under ``"ieee"`` (1.89x for 2x M, measured) and barely at all under
+        ``"tf32"`` (1.09x). Pass ``"ieee"`` to reproduce the fp32 reference exactly, which is
+        what the tests do; it is the wrong default for a bf16 model at length.
 
     Usage
     -----
@@ -91,6 +107,7 @@ class SparseAttentionContext:
         force_local: int = 0,
         block_k: int = 64,
         causal: bool = True,
+        precision: str = "tf32",
     ):
         if topk <= 0:
             raise ValueError(f"topk must be positive, got {topk}")
@@ -108,6 +125,9 @@ class SparseAttentionContext:
         self.force_local = int(force_local)
         self.block_k = int(block_k)
         self.causal = bool(causal)
+        if precision not in ("ieee", "tf32"):
+            raise ValueError(f"precision must be 'ieee' or 'tf32', got {precision!r}")
+        self.precision = precision
 
         # Per-layer state, all keyed by layer_idx and reset on entry.
         self._hidden_states: dict[int, torch.Tensor] = {}
@@ -193,6 +213,7 @@ class SparseAttentionContext:
             scaling=scaling,
             causal=self.causal,
             block_k=self.block_k,
+            precision=self.precision,
         )  # (B, H, Sq, Dv)
         # The attention interface contract is (B, Sq, H, D); our op returns (B, H, Sq, D).
         return out.transpose(1, 2).contiguous()

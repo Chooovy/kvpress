@@ -132,6 +132,11 @@ from kvpress.presses.gqa_indexer.indexer import (
     build_indexer_mask,
     slice_rope_tables,
 )
+from kvpress.presses.gqa_indexer.scalar_indexer import (
+    DEFAULT_POS_SLOPE,
+    ScalarIndexer,
+    ScalarIndexerConfig,
+)
 from kvpress.presses.gqa_indexer.loss import (
     build_dense_indexer_target,
     build_sparse_indexer_target,
@@ -164,6 +169,7 @@ from kvpress.presses.gqa_indexer.sparse_support import (
     resolve_topk,
     sort_support,
     streaming_topk_support,
+    topk_tiles,
 )
 from kvpress.presses.gqa_indexer.teacher_lse import (
     assert_flash_dtype_supported,
@@ -215,6 +221,9 @@ __all__ = [
     "GQAIndexer",
     "GQAIndexerConfig",
     "IndexerNorm",
+    "ScalarIndexer",
+    "ScalarIndexerConfig",
+    "DEFAULT_POS_SLOPE",
     "GQAIndexerPress",
     "SparseAttentionContext",
     "SPARSE_ATTENTION_IMPL_NAME",
@@ -286,6 +295,7 @@ __all__ = [
     "causal_keep",
     "sort_support",
     "streaming_topk_support",
+    "topk_tiles",
     "gather_support_keys",
     "expand_to_heads",
     "support_teacher_lse",

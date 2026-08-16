@@ -1,0 +1,115 @@
+{
+  "layer18": {
+    "effective_rank": {
+      "d": 4096,
+      "participation_ratio": 1.2796755092615506,
+      "entropy_rank": 3.0286157052215734,
+      "rank_90pct_energy": 7,
+      "rank_99pct_energy": 1351,
+      "top1_energy_frac": 0.8839476842800449
+    },
+    "auc": {
+      "full attention (ceiling, O(L^2))": {
+        "auc_raw": 1.0,
+        "auc_pos_matched": 1.0,
+        "auc_late": 1.0
+      },
+      "no state: ||h_t|| (SparseK-like)": {
+        "auc_raw": 0.5018516274899736,
+        "auc_pos_matched": 0.49892615092197296,
+        "auc_late": 0.49485967903153577
+      },
+      "EMA vector hl=64": {
+        "auc_raw": 0.6140014173152928,
+        "auc_pos_matched": 0.6136619528551248,
+        "auc_late": 0.6025138414739852
+      },
+      "EMA vector hl=512": {
+        "auc_raw": 0.642921894840303,
+        "auc_pos_matched": 0.6430339992078591,
+        "auc_late": 0.6182899490340645
+      },
+      "EMA vector hl=4096": {
+        "auc_raw": 0.6548596321501071,
+        "auc_pos_matched": 0.6586205559802423,
+        "auc_late": 0.6872677748753258
+      },
+      "delta rule beta=1 decay=1": {
+        "auc_raw": 0.5163679908088951,
+        "auc_pos_matched": 0.5023312900803529,
+        "auc_late": 0.5021581052010038
+      },
+      "delta rule beta=1 decay=0.99": {
+        "auc_raw": 0.6162472580106321,
+        "auc_pos_matched": 0.6208786400401858,
+        "auc_late": 0.6177764639715988
+      },
+      "delta rule beta=1 decay=0.95": {
+        "auc_raw": 0.6166631880639911,
+        "auc_pos_matched": 0.6202377500535046,
+        "auc_late": 0.6183440159720915
+      },
+      "delta rule beta=0.5 decay=0.99": {
+        "auc_raw": 0.656101718645432,
+        "auc_pos_matched": 0.6623703550291623,
+        "auc_late": 0.6623710315926916
+      },
+      "linear attn outer decay=0.99": {
+        "auc_raw": 0.7025212624945545,
+        "auc_pos_matched": 0.7115975007413945,
+        "auc_late": 0.7201079609103103
+      },
+      "EMA multiscale, LDA (upper bnd)": {
+        "auc_raw": 0.3419124155145691,
+        "auc_pos_matched": 0.34209523351244486,
+        "auc_late": 0.3434062819692393
+      },
+      "control: position -t": {
+        "auc_raw": 0.688794002432254,
+        "auc_pos_matched": 0.5513252949823053,
+        "auc_late": 0.47121445838503817
+      },
+      "control: random": {
+        "auc_raw": 0.5010020951021632,
+        "auc_pos_matched": 0.5003656995931727,
+        "auc_late": 0.5099965041020054
+      }
+    },
+    "saturation": {
+      "1.0": {
+        "windows": [
+          0.009400451555848122,
+          4.074724932467966e-12,
+          5.100503353006047e-13
+        ],
+        "bf16_distinct_frac_late": 0.002685546875
+      },
+      "0.999": {
+        "windows": [
+          0.03431424871087074,
+          0.02673327550292015,
+          0.025966692715883255
+        ],
+        "bf16_distinct_frac_late": 0.0350341796875
+      },
+      "0.99": {
+        "windows": [
+          0.20370882749557495,
+          0.20203495025634766,
+          0.19873975217342377
+        ],
+        "bf16_distinct_frac_late": 0.0322265625
+      },
+      "0.95": {
+        "windows": [
+          0.5038332939147949,
+          0.5003685355186462,
+          0.5018171668052673
+        ],
+        "bf16_distinct_frac_late": 0.0269775390625
+      }
+    },
+    "n_redundant": 7783,
+    "n_novel": 7783
+  }
+}

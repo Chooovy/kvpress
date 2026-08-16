@@ -112,3 +112,49 @@ def test_attn_implementation_restored_on_exit():
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
     assert "kvpress_gqa_indexer_sparse" not in type(ALL_ATTENTION_FUNCTIONS)._global_mapping
+
+
+@torch.no_grad()
+def test_precision_reaches_the_kernel():
+    """
+    ``precision`` must arrive at the kernel call, and default to ``tf32``.
+
+    Not a style preference: the parameter simply was not plumbed, so the eval silently ran the
+    kernel at its ``"ieee"`` default. That forgoes tensor cores, which turned ``BLOCK_G``'s
+    Triton-3.3 padding into a measured 7x per prefill (67.0 s against 9.4 s at ``L=8192,
+    topk=2048`` on an H20). A default asserted here is a default that cannot quietly regress.
+    """
+    import kvpress.presses.gqa_indexer.sparse_inference as si
+
+    model = _tiny_model()
+    press = _press(model)
+    ids = torch.randint(0, model.config.vocab_size, (1, 8))
+
+    seen: list[str | None] = []
+    original = si.sparse_gqa_attention
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("precision"))
+        return original(*args, **kwargs)
+
+    si.sparse_gqa_attention = spy
+    try:
+        with SparseAttentionContext(model, press, topk=8):
+            model(input_ids=ids)
+        assert seen and set(seen) == {"tf32"}, f"expected tf32 everywhere, got {set(seen)}"
+
+        seen.clear()
+        with SparseAttentionContext(model, press, topk=8, precision="ieee"):
+            model(input_ids=ids)
+        assert seen and set(seen) == {"ieee"}, f"expected ieee everywhere, got {set(seen)}"
+    finally:
+        si.sparse_gqa_attention = original
+
+
+def test_precision_is_validated():
+    """A typo must fail on construction, not silently fall through to the kernel default."""
+    model = _tiny_model()
+    press = _press(model)
+    with pytest.raises(ValueError, match="precision must be"):
+        SparseAttentionContext(model, press, topk=8, precision="fp32")
+

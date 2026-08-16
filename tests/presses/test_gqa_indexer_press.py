@@ -322,6 +322,52 @@ def test_recency_weighting_favours_recent_queries():
     assert recent.item() > mean.item()
 
 
+@pytest.mark.parametrize("mode", ["mean", "max", "last", "recency"])
+def test_reduce_queries_ignores_masked_pairs(mode):
+    """
+    Averaging modes must exclude MASK_NEG pairs, not average them in.
+
+    Key ``t`` is causally forbidden by ``t`` of the ``Sq`` rows, so folding the sentinel
+    into the mean adds ``MASK_NEG * t / Sq`` -- a ramp that buries the content signal and
+    makes top-k return the oldest keys regardless of score. Checked against an explicit
+    mask-aware reduction over unmasked logits.
+    """
+    torch.manual_seed(0)
+    q_len = k_len = 24
+    raw = torch.randn(1, 2, q_len, k_len, dtype=torch.float64)
+    valid = build_indexer_mask(q_len, k_len, torch.device("cpu")).bool().logical_not()
+    valid = valid.expand_as(raw)
+    masked = raw.masked_fill(~valid, MASK_NEG)
+
+    n = 6 if mode == "last" else None
+    r, v = (raw[:, :, -n:], valid[:, :, -n:]) if n else (raw, valid)
+    if mode == "max":
+        expected = r.masked_fill(~v, -torch.inf).amax(dim=2)
+    else:
+        w = v.to(r.dtype)
+        if mode == "recency":
+            decay = math.log(2.0) / 32.0
+            ages = torch.arange(r.shape[2] - 1, -1, -1, dtype=r.dtype)
+            w = w * torch.exp(-decay * ages).view(1, 1, -1, 1)
+        expected = (r * w).sum(dim=2) / w.sum(dim=2)
+
+    got = reduce_queries(masked, mode, valid_mask=masked > (MASK_NEG / 2), last_n_query=n)
+    torch.testing.assert_close(got, expected, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("mode", ["mean", "max", "recency"])
+def test_reduce_queries_fully_masked_key_is_finite(mode):
+    """A key no valid query can see ranks last but stays finite -- protect_boundaries
+    does arithmetic on these, and ``inf * 0`` is NaN."""
+    scores = torch.randn(1, 1, 4, 3)
+    valid = torch.ones(1, 1, 4, 3, dtype=torch.bool)
+    valid[..., 1] = False
+    out = reduce_queries(scores, mode, valid_mask=valid)
+    assert torch.isfinite(out).all()
+    assert out[0, 0, 1].item() == MASK_NEG
+    assert out[0, 0, 1] < out[0, 0, 0] and out[0, 0, 1] < out[0, 0, 2]
+
+
 @pytest.mark.parametrize("mode,expected", [("mean", [1.5, 5.5]), ("max", [3.0, 7.0])])
 def test_aggregate_chunk_scores(mode, expected):
     token_scores = torch.arange(10, dtype=torch.float).view(1, 1, 10)
@@ -495,6 +541,28 @@ def test_press_scores_are_per_kv_head(unit_test_model):  # noqa: F811
 
     scores = press.score(module, hidden, keys, keys, None, score_kwargs(unit_test_model, hidden))
     assert scores.shape == (1, n_kv, 12)
+
+
+def test_token_scores_ranks_by_content_not_position(unit_test_model):  # noqa: F811
+    """
+    End-to-end guard on the press path: with the mask folded into the mean, token scores
+    become a monotone ramp in key index carrying MASK_NEG magnitude, and top-k degenerates
+    to "keep the oldest keys" regardless of content.
+    """
+    torch.manual_seed(0)
+    press = GQAIndexerPress(compression_ratio=0.5, n_sink=0, n_local=0)
+    press.post_init_from_model(unit_test_model)
+    module = get_attention_modules(unit_test_model)[0]
+
+    hidden = torch.randn(1, 32, unit_test_model.config.hidden_size, device=unit_test_model.device)
+    scores = press.token_scores(module, hidden, score_kwargs(unit_test_model, hidden), k_len=32)
+
+    assert torch.isfinite(scores).all()
+    # The sentinel is 1e4; content logits are O(1..10). Magnitude alone catches the leak.
+    assert scores.abs().max() < 1e3, f"scores carry MASK_NEG magnitude: {scores.abs().max()}"
+    # A position ramp is monotone in the key index; content-driven scores are not.
+    diffs = scores[0, 0, 1:] - scores[0, 0, :-1]
+    assert not (diffs <= 0).all(), "scores decrease monotonically -- mask leaked into the mean"
 
 
 def test_press_protects_sink_and_local(unit_test_model):  # noqa: F811
@@ -918,3 +986,125 @@ def test_indexer_uses_the_fp32_norm():
     indexer = make_indexer()
     assert isinstance(indexer.q_norm, IndexerNorm)
     assert isinstance(indexer.k_norm, IndexerNorm)
+
+
+def _retained_bytes(out: torch.Tensor) -> int:
+    """Bytes the autograd graph holds behind ``out``, walking every ``_saved_*`` tensor."""
+    seen: set[int] = set()
+    stack = [out.grad_fn]
+    total = 0
+    while stack:
+        node = stack.pop()
+        if node is None or id(node) in seen:
+            continue
+        seen.add(id(node))
+        for attr in dir(node):
+            if not attr.startswith("_saved"):
+                continue
+            try:
+                saved = getattr(node, attr)
+            except Exception:  # noqa: BLE001 -- some _saved_* raise once freed
+                continue
+            if torch.is_tensor(saved) and saved.numel() > 1:
+                total += saved.numel() * saved.element_size()
+        stack.extend(n for n, _ in (node.next_functions or ()))
+    return total
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_indexer_norm_does_not_retain_an_upcast_copy(dtype):
+    """
+    The fp32 statistics must not cost an fp32 copy of the input in the autograd graph.
+
+    ``layer_norm(x.to(fp32), ...)`` saves the *upcast* tensor, so a bf16 input is retained at
+    fp32 width. That is invisible on the pairwise indexer, whose norms sit after ``w_k`` and are
+    ``head_dim``-wide, and severe on ScalarIndexer, where ``in_norm`` is the first op and runs at
+    full ``hidden_size``: 256 MiB per layer at ``L=16384``, ~9 GiB over 36 layers, which is what
+    made the scalar arm OOM at a length the pairwise arm trains at.
+
+    The bound asserted is "no wider than the input itself", which is what distinguishes saving
+    ``x`` from saving ``x.float()``.
+    """
+    dim = 512
+    norm = IndexerNorm(dim).to(dtype)
+    x = torch.randn(1, 64, dim, dtype=dtype, requires_grad=True)
+    input_bytes = x.numel() * x.element_size()
+
+    retained = _retained_bytes(norm(x))
+    assert retained <= input_bytes * 1.1, (
+        f"IndexerNorm retained {retained} bytes for a {input_bytes}-byte input -- an fp32 copy "
+        "is being saved for backward"
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32, torch.float64])
+@pytest.mark.parametrize("shape", [(2, 7, 16), (1, 128, 512), (3, 5, 1, 128)])
+def test_indexer_norm_matches_the_upcast_reference_forward_and_backward(dtype, shape):
+    """
+    Saving less must not change the arithmetic: forward *and* both gradients still match.
+
+    Checked against ``layer_norm(x.to(acc), ...)`` -- the straightforward form the memory fix
+    replaced -- because a hand-written backward is exactly the kind of change that can be right
+    in the forward and quietly wrong in the gradient. Tolerances are one ULP of the compute
+    dtype: at 512 channels the two differ only in reduction order.
+    """
+    dim = shape[-1]
+    torch.manual_seed(0)
+    norm = IndexerNorm(dim).to(dtype)
+    with torch.no_grad():
+        norm.weight.normal_(1.0, 0.1)
+        norm.bias.normal_(0.0, 0.1)
+    x = torch.randn(*shape, dtype=dtype)
+    grad = torch.randn(*shape, dtype=dtype)
+
+    acc = torch.float32 if dtype.itemsize < 4 else dtype
+    x_ref = x.clone().requires_grad_(True)
+    w_ref = norm.weight.detach().clone().requires_grad_(True)
+    b_ref = norm.bias.detach().clone().requires_grad_(True)
+    reference = torch.nn.functional.layer_norm(
+        x_ref.to(acc), (dim,), w_ref.to(acc), b_ref.to(acc), norm.eps
+    ).to(dtype)
+    reference.backward(grad)
+
+    x_got = x.clone().requires_grad_(True)
+    got = norm(x_got)
+    assert got.dtype == dtype
+    got.backward(grad)
+
+    tol = max(float(torch.finfo(dtype).eps) * 4, 1e-6)
+    for name, a, b in (
+        ("forward", got, reference),
+        ("d/dx", x_got.grad, x_ref.grad),
+        ("d/dweight", norm.weight.grad, w_ref.grad),
+        ("d/dbias", norm.bias.grad, b_ref.grad),
+    ):
+        scale = max(b.float().abs().max().item(), 1.0)
+        err = (a.float() - b.float()).abs().max().item()
+        assert err <= tol * scale, f"{name} differs by {err:.3e} (tol {tol * scale:.3e})"
+
+
+def test_indexer_norm_partial_gradient_requirements():
+    """
+    A frozen norm must not demand gradients the caller did not ask for.
+
+    The custom backward returns three gradients, so each has to be gated on its own
+    ``needs_input_grad`` -- returning a tensor for a frozen parameter is how a hand-written
+    Function starts silently accumulating into something that should not move.
+    """
+    dim = 32
+    norm = IndexerNorm(dim).to(torch.bfloat16)
+    norm.weight.requires_grad_(False)
+    norm.bias.requires_grad_(False)
+
+    x = torch.randn(2, 4, dim, dtype=torch.bfloat16, requires_grad=True)
+    norm(x).float().pow(2).sum().backward()
+    assert x.grad is not None and x.grad.abs().sum() > 0
+    assert norm.weight.grad is None and norm.bias.grad is None
+
+    # And the mirror case: parameters trainable, input a leaf that wants nothing back.
+    norm.weight.requires_grad_(True)
+    norm.bias.requires_grad_(True)
+    frozen = torch.randn(2, 4, dim, dtype=torch.bfloat16)
+    norm(frozen).float().pow(2).sum().backward()
+    assert norm.weight.grad is not None and norm.weight.grad.abs().sum() > 0
+    assert norm.bias.grad is not None

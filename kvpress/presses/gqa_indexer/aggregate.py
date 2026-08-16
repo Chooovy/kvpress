@@ -22,16 +22,30 @@ import math
 
 import torch
 
+from kvpress.presses.gqa_indexer.indexer import MASK_NEG
+
 
 def reduce_queries(
     scores: torch.Tensor,
     mode: str = "mean",
     *,
+    valid_mask: torch.Tensor | None = None,
     last_n_query: int | None = None,
     recency_half_life: float = 32.0,
 ) -> torch.Tensor:
     """
     Collapse the query axis of ``(B, h, Sq, Sk)`` into ``(B, h, Sk)``.
+
+    Averaging modes must be told which ``(query, key)`` pairs are real, because the logits
+    handed in carry the additive ``MASK_NEG`` sentinel on causally-forbidden and padded
+    pairs. Key ``t`` is forbidden by exactly ``t`` of the ``Sq`` query rows, so folding the
+    sentinel into the mean contributes ``MASK_NEG * t / Sq`` -- a monotone ramp in ``t``
+    that dwarfs the content signal (at ``Sq = 96`` the ramp spans ~1e4 against a score
+    spread of ~4) and reduces top-k to "keep the oldest keys". Passing ``valid_mask``
+    restricts both numerator and denominator to real pairs.
+
+    ``max`` is unaffected either way -- the sentinel is far below any real score, so it
+    never wins an ``amax`` -- but it accepts the mask too, so every mode is exact.
 
     Parameters
     ----------
@@ -42,6 +56,10 @@ def reduce_queries(
         ``max``    -- a key is important if *any* query wants it.
         ``last``   -- average over the final ``last_n_query`` queries only.
         ``recency``-- exponentially recency-weighted average over queries.
+    valid_mask : torch.Tensor, optional
+        Boolean, broadcastable to ``scores``: ``True`` where the ``(query, key)`` pair is
+        allowed. ``None`` means "every pair is real", which is only correct for logits that
+        were never masked -- callers holding masked logits must pass this.
     last_n_query : int, optional
         Window size for ``last``; also restricts ``mean``/``max``/``recency`` when set.
     recency_half_life : float
@@ -50,30 +68,67 @@ def reduce_queries(
     Returns
     -------
     torch.Tensor
-        (B, h, Sk) importance per key, per KV head.
+        (B, h, Sk) importance per key, per KV head. A key with no valid query in the
+        reduced window scores ``MASK_NEG`` -- ranked last, but finite, since the sentinel
+        is deliberately finite throughout this package (``inf * 0`` is NaN, and
+        :meth:`~.press.GQAIndexerPress.protect_boundaries` does arithmetic on these).
     """
     if scores.dim() != 4:
         raise ValueError(f"expected (B, h, Sq, Sk), got shape {tuple(scores.shape)}")
 
+    if valid_mask is not None:
+        if valid_mask.dtype != torch.bool:
+            raise ValueError(f"valid_mask must be bool, got {valid_mask.dtype}")
+        try:
+            valid_mask = valid_mask.expand_as(scores)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"valid_mask {tuple(valid_mask.shape)} is not broadcastable to "
+                f"scores {tuple(scores.shape)}"
+            ) from exc
+
     if last_n_query is not None:
         n = min(int(last_n_query), scores.shape[2])
         scores = scores[:, :, -n:, :]
+        if valid_mask is not None:
+            valid_mask = valid_mask[:, :, -n:, :]
 
     mode = (mode or "mean").lower()
     if mode in ("mean", "avg", "last"):
-        return scores.mean(dim=2)
+        if valid_mask is None:
+            return scores.mean(dim=2)
+        return _masked_weighted_mean(scores, valid_mask.to(scores.dtype))
     if mode in ("max", "amax"):
-        return scores.amax(dim=2)
+        if valid_mask is None:
+            return scores.amax(dim=2)
+        out = scores.masked_fill(~valid_mask, MASK_NEG).amax(dim=2)
+        return torch.where(valid_mask.any(dim=2), out, out.new_full((), MASK_NEG))
     if mode in ("recency", "recency_weighted"):
         q_len = scores.shape[2]
-        if q_len == 1:
-            return scores.squeeze(2)
         decay = math.log(2.0) / max(float(recency_half_life), 1e-3)
         ages = torch.arange(q_len - 1, -1, -1, device=scores.device, dtype=torch.float32)
-        w = torch.exp(-decay * ages)
-        w = w / w.sum().clamp_min(1e-8)
-        return (scores.float() * w.view(1, 1, q_len, 1)).sum(dim=2).to(scores.dtype)
+        w = torch.exp(-decay * ages).to(scores.dtype).view(1, 1, q_len, 1)
+        if valid_mask is not None:
+            w = w * valid_mask.to(scores.dtype)
+        elif q_len == 1:
+            return scores.squeeze(2)
+        return _masked_weighted_mean(scores, w.expand_as(scores))
     raise ValueError(f"Unknown query reduce mode {mode!r}; use mean, max, last or recency.")
+
+
+def _masked_weighted_mean(scores: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """
+    ``sum(scores * weights) / sum(weights)`` over the query axis, in at least fp32.
+
+    Masked entries still hold the ``MASK_NEG`` sentinel, so they are zeroed by the weight
+    rather than merely down-weighted: a ``0 * -1e4`` term would otherwise survive the sum.
+    Zero-weight keys (no valid query in the window) fall back to ``MASK_NEG``.
+    """
+    acc = torch.float32 if scores.dtype.itemsize < 4 else scores.dtype
+    weights = weights.to(acc)
+    total = weights.sum(dim=2)
+    out = (scores.to(acc) * weights).sum(dim=2) / total.clamp_min(torch.finfo(acc).tiny)
+    return torch.where(total > 0, out, out.new_full((), MASK_NEG)).to(scores.dtype)
 
 
 def aggregate_chunk_scores(

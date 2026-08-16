@@ -83,6 +83,11 @@ class SparseEvaluationConfig:
     force_sink: int = 4
     force_local: int = 64
     block_k: int = 64
+    # tl.dot precision. "tf32" because q/k/v here are the model's own bf16, and every bf16 value
+    # is exact in tf32 -- so the QK dot is bit-identical and the whole kernel matches the fp32
+    # reference to the same 7.5e-3 that bf16 output rounding costs anyway. "ieee" forgoes tensor
+    # cores entirely, which measured 67.0 s vs 9.4 s per 8K prefill on an H20 for no accuracy.
+    precision: str = "tf32"
 
     # Indexer geometry overrides. Leave None to derive from the model exactly as training did;
     # pass them only if training passed --n-heads/--head-dim/--rope-dim, since a wrong rope_dim
@@ -107,6 +112,9 @@ class SparseEvaluationConfig:
         assert self.dataset in SCORER_REGISTRY, f"No scorer found for {self.dataset}"
         assert self.indexer_ckpt, "indexer_ckpt is required (the trained indexer checkpoint)"
         assert 0.0 < self.fraction <= 1.0, f"fraction must be in (0, 1], got {self.fraction}"
+        assert self.precision in ("ieee", "tf32"), (
+            f"precision must be 'ieee' or 'tf32', got {self.precision!r}"
+        )
         assert self.force_sink + self.force_local <= self.topk, (
             f"force_sink + force_local = {self.force_sink + self.force_local} exceeds topk="
             f"{self.topk}"
@@ -247,6 +255,7 @@ class SparseEvaluationRunner:
             force_sink=cfg.force_sink,
             force_local=cfg.force_local,
             block_k=cfg.block_k,
+            precision=cfg.precision,
         )
         self.pipeline = pipeline
 

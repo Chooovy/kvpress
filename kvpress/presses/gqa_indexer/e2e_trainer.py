@@ -73,7 +73,13 @@ from dataclasses import dataclass, field
 import torch
 from torch import nn
 
-from kvpress.presses.gqa_indexer.gate_pin import check_pin_mode, pins_self
+from kvpress.presses.gqa_indexer.gate_pin import (
+    check_pin_mode,
+    history_lse,
+    history_mask,
+    pinned_mask,
+    pins_self,
+)
 from kvpress.presses.gqa_indexer.triton_fused_loss import HAS_TRITON
 from kvpress.presses.gqa_indexer.gated_attention import gated_attention
 from kvpress.presses.gqa_indexer.press import GQAIndexerPress, get_language_model
@@ -160,6 +166,16 @@ class E2EIndexerTrainer:
     #: means the layer is leaning harder on its router; one that collapses towards 0 means that
     #: layer's router is not earning its place, which no loss curve would tell you.
     gate_scales: dict[int, float] = field(default_factory=dict)
+    #: Layer index -> mean *participation ratio* of the gate, as a fraction of the history
+    #: length. This is the readout on whether the router learned to be SELECTIVE, which
+    #: ``gate_scales`` alone cannot say: a layer can lean hard on a router that still spreads its
+    #: attention over everything. Only populated when :attr:`measure_sparsity` is on, since it
+    #: costs a second streaming pass over the keys. See :meth:`_gate_participation`.
+    gate_sparsity: dict[int, float] = field(default_factory=dict)
+    #: Compute :attr:`gate_sparsity` on this forward. The driver turns it on only for the steps
+    #: it logs -- it is a diagnostic, not part of the objective, and it allocates an (Sq, Sk)
+    #: history mask (256 MiB at 16K) that the training path deliberately avoids.
+    measure_sparsity: bool = field(default=False)
     #: Layer index -> number of layers that actually ran, as a wiring check.
     layers_gated: int = field(default=0, init=False)
 
@@ -229,6 +245,7 @@ class E2EIndexerTrainer:
     def reset(self) -> None:
         """Drop the per-pass state from the previous forward."""
         self.gate_scales = {}
+        self.gate_sparsity = {}
         self.layers_gated = 0
         self._hidden_states.clear()
         self._kwargs.clear()
@@ -245,6 +262,53 @@ class E2EIndexerTrainer:
                 params.extend(indexer.parameters())
         return params
 
+    def upcast_gate_scales(self, model: nn.Module) -> tuple[int, list[float]]:
+        """
+        Put every ``gate_scale`` scalar in fp32.
+
+        Returns ``(how many were converted, their values)``.
+
+        **Why this is required, not an optimization.** ``post_init_from_model`` builds the whole
+        indexer at the model's dtype, which is bf16 for this run. bf16 has 8 mantissa bits, so
+        around the init value ``head_dim**-0.5 = 0.0884`` the representable values are ~3.0e-4
+        apart. AdamW's update is ``lr * m_hat / (sqrt(v_hat) + eps)``, whose magnitude is ~``lr``
+        for a stable gradient -- so during warmup (``lr`` 1.3e-5 rising to 1.5e-4) every single
+        step rounds straight back to the value it started from. The scalar is **frozen at its
+        initialization**, and it stays that way until ``lr`` alone exceeds the spacing.
+
+        Observed exactly that: ``gate_scale_mean`` pinned at 0.08837890625 -- bf16's rendering of
+        ``1/sqrt(128)`` -- identically across all 36 layers for 30 steps, while the loss fell 4.52
+        -> 2.42 and ``grad_norm`` moved 6.4 -> 0.80. The other indexer weights are unaffected:
+        their elements sit near 0.02 where bf16 spacing is ~1e-4, and they receive updates far
+        larger than one step's ``lr``. It is only the scalar, and only because 0.0884 is a large
+        value to be nudged by 1e-5 increments.
+
+        Left unfixed the run still trains ``w_q``/``w_k`` and the loss still falls, so nothing
+        looks wrong -- but the per-layer gate strength, which is the readout on whether a layer's
+        router earns its place at all, is a constant. The stored value would also be a rounded
+        one, so a resumed run inherits the same freeze.
+
+        fp32 is safe everywhere the scalar is consumed: the Triton kernel loads it with
+        ``.to(tl.float32)`` and accumulates its gradient into an fp32 buffer, and the reference
+        path multiplies it into an fp32 accumulator. In the concat path it divides ``q_idx``
+        before a ``.to(q.dtype)`` cast, so the product lands back in bf16 either way.
+        """
+        converted = 0
+        values: list[float] = []
+        for layer in get_language_model(model).layers:
+            indexer = getattr(layer.self_attn, self.press.scorer_attr, None)
+            gate_scale = getattr(indexer, "gate_scale", None) if indexer is not None else None
+            if gate_scale is None or gate_scale.dtype == torch.float32:
+                continue
+            # A new leaf Parameter, so this must happen BEFORE the optimizer is built -- an
+            # optimizer already holding the bf16 tensor would keep stepping that one.
+            indexer.gate_scale = nn.Parameter(
+                gate_scale.detach().to(torch.float32), requires_grad=gate_scale.requires_grad
+            )
+            values.append(float(indexer.gate_scale.detach()))
+            converted += 1
+        return converted, values
+
     def freeze_backbone(self, model: nn.Module) -> None:
         """
         Put every non-indexer parameter at ``requires_grad=False``.
@@ -252,7 +316,19 @@ class E2EIndexerTrainer:
         Identifies the indexers by module identity rather than by parameter-name substring: a
         name filter would also catch a backbone parameter that happens to contain the attribute
         name, and would silently train it.
+
+        Upcasts the ``gate_scale`` scalars to fp32 on the way through -- in bf16 they cannot be
+        moved by a warmup-sized learning rate at all. See :meth:`upcast_gate_scales`. Done here
+        because this is where the trainable set is decided, and it must precede the optimizer.
         """
+        converted, values = self.upcast_gate_scales(model)
+        if converted:
+            logger.info(
+                "upcast %d gate_scale scalar(s) to fp32 (value %.6f): at bf16's ~3.0e-4 spacing "
+                "there, a warmup learning rate rounds every step back and the gate would stay "
+                "frozen at initialization.",
+                converted, values[0],
+            )
         indexer_params = {id(p) for p in self.indexer_parameters(model)}
         if not indexer_params:
             raise RuntimeError(
@@ -351,6 +427,11 @@ class E2EIndexerTrainer:
         q_idx, k_idx, gate_scale = self.indexer_qk(module, hidden_states, kwargs)
         self.gate_scales[layer_idx] = float(gate_scale.detach())
         self.layers_gated += 1
+
+        if self.measure_sparsity:
+            self.gate_sparsity[layer_idx] = self._gate_participation(
+                q_idx, k_idx, gate_scale, key.shape[2], attention_mask
+            )
 
         indices = None
         if self.scope == "sparse":
@@ -468,6 +549,89 @@ class E2EIndexerTrainer:
                 global_mapping.pop(impl_name, None)
             self._hidden_states.clear()
             self._kwargs.clear()
+
+    def _gate_participation(
+        self, q_idx, k_idx, gate_scale, k_len: int, attention_mask
+    ) -> float | None:
+        """
+        Mean **participation ratio** of the gate, as a fraction of each row's history length.
+
+        What it measures. On a history key the gate is ``s_j - lse`` where ``lse`` is the
+        logsumexp of ``s`` over that row's history, so ``p_j = exp(gate_j)`` sums to exactly 1
+        over the history -- the gate is a probability distribution over keys, which is precisely
+        the "fixed budget" that pinning makes non-trivial. Its participation ratio
+        ``PR = 1 / sum_j p_j^2`` is the standard effective-support size of such a distribution:
+        ``PR = n`` for a flat distribution over ``n`` keys, ``PR = 1`` when one key takes
+        everything. Dividing by the history length gives a scale-free number:
+
+        * ``~1.0`` -- the gate is flat. The router is NOT selective, whatever ``gate_scale`` says.
+        * ``~0.5`` -- half the history is doing the work.
+        * ``->0``  -- strongly peaked, which is the behaviour eviction needs.
+
+        Why PR rather than counting keys above a threshold: no threshold has to be chosen, and it
+        is invariant to how the probability mass is permuted across keys, so it compares across
+        layers and sequence lengths. It is also exactly the quantity that predicts eviction
+        quality -- a top-k of size ``k`` captures most of the mass only if ``PR`` is around ``k``.
+
+        Computed with the streaming identity ``sum_j p_j^2 = exp(2*lse - lse2)`` where ``lse2`` is
+        the logsumexp of ``2*s``. Since ``s = gate_scale * qi.ki``, ``lse2`` is just
+        :func:`history_lse` called with ``2 * gate_scale`` -- so this reuses the same ``O(L)``
+        streaming kernel instead of materializing the ``(Sq, Sk)`` score matrix, which at 16K
+        would be 1 GiB per layer per head.
+
+        Returns ``None`` under the sparse scope, where the gate is not normalized over a history
+        (the forward is already restricted to the router's top-k, so this ratio is not defined
+        against the same denominator and comparing the two would be misleading).
+        """
+        if self.scope == "sparse":
+            return None
+
+        pinned = pinned_mask(
+            self.gate_pin_mode, q_idx.shape[2], k_len, q_idx.device, n_sink=self.sink_count
+        )
+        if pinned is None:
+            # pin_mode="none": every visible key is history. history_lse still needs a mask
+            # tensor, so build the all-false one it expects.
+            pinned = torch.zeros(
+                (q_idx.shape[2], k_len), dtype=torch.bool, device=q_idx.device
+            )
+
+        # no_grad throughout: this is a diagnostic. Leaving it in the graph would retain the
+        # streaming kernel's backward state for a term the objective never uses.
+        with torch.no_grad():
+            causal_keep = None
+            if attention_mask is not None:
+                from kvpress.presses.gqa_indexer.indexer import build_indexer_mask
+
+                causal_keep = build_indexer_mask(
+                    q_idx.shape[2], k_len, q_idx.device, attention_mask=attention_mask
+                ) == 0
+            common = dict(pinned=pinned, causal_keep=causal_keep, key_tile=self.key_tile)
+            lse = history_lse(q_idx, k_idx, gate_scale=gate_scale, **common)
+            lse2 = history_lse(q_idx, k_idx, gate_scale=2.0 * gate_scale, **common)
+
+            # sum p^2 = exp(lse2 - 2*lse), so PR = exp(2*lse - lse2).
+            pr = torch.exp(2.0 * lse - lse2)
+
+            # Rows with no history get lse=lse2=0 (documented in history_lse), hence PR=1 against
+            # a history of 0 -- meaningless, so they are excluded rather than counted as "flat".
+            # history_mask is the SAME function the normalizer uses, so the denominator here
+            # cannot drift from what the gate actually normalized over.
+            history_len = history_mask(
+                pinned, causal_keep, q_idx.shape[2], k_len, q_idx.device
+            ).sum(-1)
+            valid = history_len > 0
+            if not bool(valid.any()):
+                return None
+            fraction = pr / history_len.clamp(min=1).to(pr.dtype)
+            return float(fraction[..., valid].mean())
+
+    def mean_gate_sparsity(self) -> float | None:
+        """Mean gate participation fraction over the layers that measured it."""
+        values = [v for v in self.gate_sparsity.values() if v is not None]
+        if not values:
+            return None
+        return sum(values) / len(values)
 
     def mean_gate_scale(self) -> float | None:
         """Mean ``gate_scale`` over the layers that ran, or ``None`` before the first pass."""

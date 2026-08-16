@@ -13,10 +13,16 @@ from torch import nn
 
 from kvpress.presses.gqa_indexer.aggregate import aggregate_chunk_scores, reduce_queries
 from kvpress.presses.gqa_indexer.indexer import (
+    MASK_NEG,
     GQAIndexer,
     GQAIndexerConfig,
     build_indexer_mask,
     slice_rope_tables,
+)
+from kvpress.presses.gqa_indexer.scalar_indexer import (
+    DEFAULT_POS_SLOPE,
+    ScalarIndexer,
+    ScalarIndexerConfig,
 )
 from kvpress.presses.scorer_press import ScorerPress
 
@@ -75,6 +81,19 @@ class GQAIndexerPress(ScorerPress):
         training needs. Off by default: distillation never reads it, so a distillation
         checkpoint stays free of the extra parameter. Required by
         :class:`~kvpress.presses.gqa_indexer.e2e_trainer.E2EIndexerTrainer`.
+    scorer : str
+        Which scorer to attach. ``"pairwise"`` is :class:`~.indexer.GQAIndexer`, which scores
+        every ``(query, key)`` pair -- query-aware, and ``O(t)`` per decode step.
+        ``"scalar"`` is :class:`~.scalar_indexer.ScalarIndexer`, which scores each key once from
+        its own hidden state -- ``O(1)`` per decode step and one score per token of cache
+        instead of ``head_dim``, at the cost of query-awareness. The two satisfy the same
+        protocol, so everything downstream (this press, the trainers, the gate) is unchanged.
+    scalar_mid_dim : int
+        MLP width for ``scorer="scalar"``. ``0`` is SparseK's plain linear score; the arm's
+        capacity knob otherwise. See :class:`~.scalar_indexer.ScalarIndexerConfig`.
+    scalar_pos_slope : float
+        Recency tilt for ``scorer="scalar"``. Keeps top-k irreversible, which is what makes
+        the dropped keys safe to free.
     scorer_attr : str
         Attribute name the indexer is registered under on each attention module.
     """
@@ -87,6 +106,11 @@ class GQAIndexerPress(ScorerPress):
     head_dim: int | None = None
     rope_dim: int | None = None
     gate_scale: bool = False
+
+    # Which scorer, and the scalar arm's own knobs
+    scorer: str = "pairwise"
+    scalar_mid_dim: int = 256
+    scalar_pos_slope: float = DEFAULT_POS_SLOPE
 
     # Query-axis reduction
     query_reduce: str = "mean"
@@ -112,18 +136,44 @@ class GQAIndexerPress(ScorerPress):
             raise ValueError("n_sink and n_local must be non-negative")
         if self.chunk_size < 0:
             raise ValueError("chunk_size must be non-negative")
+        if self.scorer not in ("pairwise", "scalar"):
+            raise ValueError(f"scorer must be 'pairwise' or 'scalar', got {self.scorer!r}")
 
     # ------------------------------------------------------------------
     # Setup
     # ------------------------------------------------------------------
-    def build_indexer_config(self, model: nn.Module, module: nn.Module) -> GQAIndexerConfig:
-        """Derive indexer geometry from the model, honouring any explicit overrides."""
+    def build_indexer_config(self, model: nn.Module, module: nn.Module):
+        """Derive indexer geometry from the model, honouring any explicit overrides.
+
+        Returns a config for whichever scorer :attr:`scorer` names. Both configs report
+        ``rope_dim`` and ``n_heads``, which is all the press and the trainers read off them.
+        """
         config = model.config
         text_config = getattr(config, "text_config", config)
 
         # One indexer head per KV head: that is the granularity at which GQA holds
         # physically separate caches, so it is the granularity at which eviction can differ.
         n_heads = self.n_heads or text_config.num_key_value_heads
+
+        if self.scorer == "scalar":
+            # No head_dim and no rope_dim: the score is one number per (key, head), derived
+            # from that key alone, so there is nothing to rotate. head_dim/rope_dim overrides
+            # would silently do nothing, so reject them rather than accept and ignore.
+            for name in ("head_dim", "rope_dim"):
+                if getattr(self, name) is not None:
+                    raise ValueError(
+                        f"{name} was set but scorer='scalar' has no q/k geometry to apply it "
+                        f"to; the scalar score has no per-head dimension and no rotary width. "
+                        f"Drop {name}, or use scorer='pairwise'."
+                    )
+            return ScalarIndexerConfig(
+                hidden_size=text_config.hidden_size,
+                n_heads=n_heads,
+                mid_dim=self.scalar_mid_dim,
+                pos_slope=self.scalar_pos_slope,
+                gate_scale=self.gate_scale,
+            )
+
         head_dim = self.head_dim or getattr(
             module, "head_dim", text_config.hidden_size // text_config.num_attention_heads
         )
@@ -177,7 +227,8 @@ class GQAIndexerPress(ScorerPress):
                         "(which discards the existing weights)."
                     )
                 continue
-            indexer = GQAIndexer(indexer_config).to(device=model.device, dtype=model.dtype)
+            cls = ScalarIndexer if self.scorer == "scalar" else GQAIndexer
+            indexer = cls(indexer_config).to(device=model.device, dtype=model.dtype)
             attn.register_module(self.scorer_attr, indexer)
             created += 1
 
@@ -259,6 +310,11 @@ class GQAIndexerPress(ScorerPress):
         return reduce_queries(
             logits,
             self.query_reduce,
+            # The logits carry MASK_NEG on forbidden pairs; without this the averaging
+            # modes fold the sentinel into the mean and rank keys by position instead of
+            # content. Recovering validity from the logits themselves (rather than
+            # rebuilding the mask) keeps the two in step by construction.
+            valid_mask=logits > (MASK_NEG / 2),
             last_n_query=self.last_n_query,
             recency_half_life=self.recency_half_life,
         )

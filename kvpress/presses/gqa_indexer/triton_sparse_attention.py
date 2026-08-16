@@ -29,18 +29,24 @@ to hide it.
 
 ``tl.dot`` shape floors
 -----------------------
-Triton's NVIDIA backend reports ``min_dot_size = (M=1, N=1, K=16)``: only the **contraction**
-dimension is constrained. That has two consequences worth stating, because guessing wrong in
-either direction costs something real:
+Triton's per-backend ``min_dot_size`` gives the ``(M, N, K)`` lower bounds for ``tl.dot``, and
+it is **not** stable across releases: Triton 3.4+ on NVIDIA reports ``(1, 1, 16)``, constraining
+only the contraction dimension, while Triton 3.3 reports ``(16, 16, 16)``. Both matter here,
+because guessing wrong in either direction costs something real:
 
-- ``M`` needs no padding. ``BLOCK_G`` is ``group_size`` rounded to a power of two, not to 16 --
-  at ``group_size=4`` that is a 4x smaller ``[BLOCK_G, DV]`` fp32 accumulator and 4x fewer
-  wasted QK lanes.
+- ``M`` is ``BLOCK_G``, the group's query heads, and ``group_size`` is 4 or 8 on real GQA
+  models -- below 16 either way. So the floor is *asked of the backend* at runtime by
+  :func:`min_dot_m` rather than assumed: hardcoding 1 fails to compile on Triton 3.3, and
+  hardcoding 16 quadruples the ``[BLOCK_G, DV]`` fp32 accumulator on every version that does
+  not need it.
 - ``BLOCK_K`` **must** be >= 16, because the ``P @ V`` dot contracts over it. This is enforced
   in the wrappers rather than left to fail at compile time, since Triton's CPU interpreter does
   *not* apply the floor: a smaller ``block_k`` runs fine under ``TRITON_INTERPRET=1`` and then
   fails on the first real GPU. Validating eagerly keeps the interpreter tests honest about
   hardware.
+
+Padding ``M`` up is only a cost, never a correctness question: the extra lanes load ``q`` under
+``g_valid`` so they hold zeros, and the epilogue masks them out of both stores.
 
 Varlen
 ------
@@ -60,8 +66,23 @@ Numerics
 --------
 Accumulation is fp32 and ``tl.dot`` defaults to ``input_precision="ieee"``, matching
 :mod:`~.triton_fused_loss` and for the same reason: the kernel's job is first to be trusted
-against the fp32 reference, so it should not be off by TF32's ~1e-3 before it starts. Pass
-``precision="tf32"`` for throughput once that trust exists.
+against the fp32 reference, so it should not be off by TF32's ~1e-3 before it starts.
+
+That default is right for *this module's* tests and wrong for inference, so
+:class:`~.sparse_inference.SparseAttentionContext` overrides it to ``"tf32"``. The reason it is
+not merely a throughput knob: ``"ieee"`` fp32 does not use tensor cores, so it falls to FMA and
+``M`` -- i.e. ``BLOCK_G``, padded to 16 wherever :func:`min_dot_m` says it must be -- becomes
+real work instead of lanes the MMA would occupy anyway. Measured on an H20 at ``L=8192,
+topk=2048``: 67.0 s per prefill under ``"ieee"`` against 9.4 s under ``"tf32"``, and ``M`` scales
+the kernel ~linearly under ``"ieee"`` (1.89x for 2x ``M``) but not under ``"tf32"`` (1.09x).
+
+For a bf16 or fp16 model the accuracy cost of that is *nil*, not merely small: tf32 keeps 10
+mantissa bits against bf16's 8, so every operand the kernel upcasts is exactly representable and
+the ``Q @ K^T`` dot is bit-identical. Only the softmax weights in ``P @ V`` are genuinely fp32,
+and rounding them costs ~2e-4 relative -- ~30x under the bf16 epsilon the output is stored at.
+Both paths measure the same 7.52e-3 against the fp32 reference, which is bf16 store-rounding
+alone (``test_tf32_costs_nothing_on_low_precision_inputs``). Keep ``"ieee"`` for an fp32 caller,
+where the extra mantissa bits are real.
 
 Empty rows produce ``out = 0`` and ``lse = -inf`` rather than ``0/0``; see the module
 docstring of :mod:`~.sparse_attention` for why those particular values.
@@ -69,6 +90,7 @@ docstring of :mod:`~.sparse_attention` for why those particular values.
 
 from __future__ import annotations
 
+import functools
 import logging
 
 import torch
@@ -122,6 +144,43 @@ def check_block_k(block_k: int) -> None:
             "of the P @ V dot, and Triton requires K >= 16 on NVIDIA. Smaller values run under "
             "TRITON_INTERPRET=1 (which skips the check) and then fail to compile on a GPU."
         )
+
+
+#: Fallback ``M`` floor when the backend cannot be asked (no driver, or an unfamiliar Triton).
+#: 16 rather than 1 because it is the conservative direction: too large only wastes lanes, while
+#: too small fails to compile.
+_FALLBACK_MIN_DOT_M = 16
+
+
+@functools.lru_cache(maxsize=1)
+def min_dot_m() -> int:
+    """
+    The ``M`` floor ``tl.dot`` accepts on the active backend.
+
+    Asked of Triton rather than assumed, because the answer moved: Triton 3.3 on NVIDIA
+    requires ``M >= 16`` while 3.4+ allows ``M = 1``, and ``BLOCK_G`` is ``group_size`` -- 4 on
+    Qwen3-8B, so the difference decides whether the kernel compiles at all.
+
+    Probed for fp32 operands because that is what this kernel feeds ``tl.dot`` whatever the
+    caller's dtype: ``q``, ``k_tile`` and ``v_tile`` are all cast to fp32 on load. Taking the
+    input dtype as a parameter would imply a dependence that does not exist.
+
+    Falls back to :data:`_FALLBACK_MIN_DOT_M` when there is no active backend to ask -- no
+    driver (the CPU interpreter, or a machine with no GPU), or a Triton whose internals have
+    moved again. That direction is safe: a floor that is too high costs padded lanes, one that
+    is too low costs a compile error.
+    """
+    try:
+        from triton.compiler.compiler import make_backend
+        from triton.runtime import driver
+
+        backend = make_backend(driver.active.get_current_target())
+        min_dot_size = backend.get_codegen_implementation(backend.parse_options({}))["min_dot_size"]
+        operand = tl.block_type(tl.float32, [16, 16])
+        return int(min_dot_size(operand, operand)[0])
+    except Exception:  # noqa: BLE001 -- any failure to introspect means "use the safe floor"
+        logger.debug("could not query Triton's min_dot_size; assuming M >= %d", _FALLBACK_MIN_DOT_M)
+        return _FALLBACK_MIN_DOT_M
 
 
 if HAS_TRITON:
@@ -345,10 +404,11 @@ def _launch(
         k_len_static, query_offset_static,
         scale, n_kv_heads, topk,
         GROUP=group_size,
-        # M has no floor (min_dot_size is (1, 1, 16) -- only K is constrained), so this pads
-        # to a power of two rather than to 16: at group_size=4 that is a 4x smaller fp32
-        # accumulator and 4x fewer wasted QK lanes. See the module docstring.
-        BLOCK_G=block_pow2(group_size, minimum=1),
+        # M is padded to whatever floor the active backend enforces -- 1 on Triton 3.4+, 16 on
+        # 3.3 -- rather than to a constant, since group_size (4 or 8) is below either. The extra
+        # lanes are masked in the load and in both stores, so this is only a cost. See the
+        # module docstring.
+        BLOCK_G=block_pow2(group_size, minimum=min_dot_m()),
         D=dim, DV=dim_v,
         BLOCK_D=block_pow2(dim), BLOCK_DV=block_pow2(dim_v),
         BLOCK_K=block_k,

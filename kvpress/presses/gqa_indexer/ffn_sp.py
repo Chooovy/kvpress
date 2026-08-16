@@ -142,6 +142,54 @@ def all_gather_sequence(local: torch.Tensor, lengths: tuple[int, ...], group=Non
     return _AllGatherSequence.apply(local, lengths, group)
 
 
+class _ScatterSequence(torch.autograd.Function):
+    """
+    Differentiable take-my-slice along the sequence axis.
+
+    Forward returns this rank's slice. Backward **all-gathers** every rank's incoming gradient
+    slice into the full-sequence gradient, so each rank continues down the graph holding the
+    gradient the *whole* FFN produced, not only the part its own slice produced.
+
+    Why this is not a plain ``hidden_states[:, a:b]``. A slice's backward is a zero-pad, which
+    leaves each rank's ``d/d hidden`` supported only on its own slice. That is correct when the
+    parameter being trained lives *inside* the sharded FFN -- the ranks' contributions are then
+    disjoint and an all-reduce SUM reconstructs the gradient. It is WRONG for the
+    router: the router lives in **attention, which is not sharded**, so every rank computes it
+    over the full sequence, and every path reaching the router *without* passing through a
+    sharded FFN is therefore already replicated on all ``sp_size`` ranks. An all-reduce SUM then
+    multiplies those paths by ``sp_size`` while scaling the through-FFN paths correctly -- a
+    per-path scale mismatch, so no single divisor repairs it. Measured on a 3-layer stand-in:
+    cosine 0.98 against the dense gradient, with the best divisor still 5% off. The gradient
+    DIRECTION is wrong, not just its magnitude, so it cannot be tuned away with the LR.
+
+    With the gather here every rank in the group ends up with the identical, complete gradient,
+    which is what makes a uniform ``/world_size`` correct again (verified exact: per-rank spread
+    ``0.00e+00``, error against dense ``0.00e+00``).
+
+    Cost: one extra all-gather of ``(L, hidden)`` per layer per step, and a transient
+    full-sequence gradient buffer. That buffer is the same width as ``hidden_states``, which is
+    already alive on every rank *because* attention is not sharded -- so it does not undo the
+    saving, which comes from the ``(L, inter)`` tensors being 3x larger and staying sharded.
+    """
+
+    @staticmethod
+    def forward(ctx, full: torch.Tensor, lengths: tuple[int, ...], group):
+        ctx.lengths = lengths
+        ctx.group = group
+        rank = dist.get_rank(group)
+        start = sum(lengths[:rank])
+        return full[:, start : start + lengths[rank]].contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_local):
+        return all_gather_sequence(grad_local, ctx.lengths, ctx.group), None, None
+
+
+def scatter_sequence(full: torch.Tensor, lengths: tuple[int, ...], group=None):
+    """Take this rank's sequence slice, all-gathering the gradient on the way back."""
+    return _ScatterSequence.apply(full, lengths, group)
+
+
 class SequenceParallelFFN(nn.Module):
     """
     Wraps a position-wise FFN so each rank computes and retains only its own slice.
@@ -166,18 +214,19 @@ class SequenceParallelFFN(nn.Module):
         if world_size == 1:
             return self.inner(hidden_states)
 
-        rank = dist.get_rank(self.group)
         seq_len = hidden_states.shape[1]
         lengths = tuple(
             stop - start
             for start, stop in (sequence_slice(seq_len, r, world_size) for r in range(world_size))
         )
-        start, stop = sequence_slice(seq_len, rank, world_size)
 
-        # The slice is a VIEW, so the full hidden_states is not copied -- but note it is also
-        # still alive, held by the caller. This shards the FFN's own activations (the (L, inter)
-        # tensors, which are 3x larger than hidden), not its input.
-        local = self.inner(hidden_states[:, start:stop])
+        # scatter_sequence, not a plain hidden_states[:, start:stop]. A slice's backward is a
+        # zero-pad, which would leave this rank's d/d hidden supported only on its own slice --
+        # correct for a parameter inside the sharded FFN, wrong for the router, which lives in
+        # unsharded attention and so is reached by replicated paths that an all-reduce SUM would
+        # then multiply by sp_size. See _ScatterSequence. This shards the FFN's own activations
+        # (the (L, inter) tensors, 3x larger than hidden), not its input.
+        local = self.inner(scatter_sequence(hidden_states, lengths, self.group))
         return all_gather_sequence(local, lengths, self.group)
 
     def extra_repr(self) -> str:

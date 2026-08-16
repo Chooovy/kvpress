@@ -1,0 +1,115 @@
+{
+  "layer18": {
+    "effective_rank": {
+      "d": 4096,
+      "participation_ratio": 1.2796755092615506,
+      "entropy_rank": 3.0286157052215734,
+      "rank_90pct_energy": 7,
+      "rank_99pct_energy": 1351,
+      "top1_energy_frac": 0.8839476842800449
+    },
+    "auc": {
+      "full attention (ceiling, O(L^2))": {
+        "auc_raw": 1.0,
+        "auc_pos_matched": 1.0,
+        "auc_late": 1.0
+      },
+      "no state: ||h_t|| (SparseK-like)": {
+        "auc_raw": 0.5025916676738189,
+        "auc_pos_matched": 0.5026783079590592,
+        "auc_late": 0.5031397160976656
+      },
+      "EMA vector hl=64": {
+        "auc_raw": 0.6152520634348553,
+        "auc_pos_matched": 0.6132684817459101,
+        "auc_late": 0.6594812706052992
+      },
+      "EMA vector hl=512": {
+        "auc_raw": 0.6614626022258094,
+        "auc_pos_matched": 0.6562608281380383,
+        "auc_late": 0.6935870564708693
+      },
+      "EMA vector hl=4096": {
+        "auc_raw": 0.6642225651538044,
+        "auc_pos_matched": 0.6630814845530042,
+        "auc_late": 0.6962358510346776
+      },
+      "delta rule beta=1 decay=1": {
+        "auc_raw": 0.7311144850319576,
+        "auc_pos_matched": 0.7344685491769292,
+        "auc_late": 0.8135363839143785
+      },
+      "delta rule beta=1 decay=0.99": {
+        "auc_raw": 0.8159315457217075,
+        "auc_pos_matched": 0.8158205363195501,
+        "auc_late": 0.8206999931714936
+      },
+      "delta rule beta=1 decay=0.95": {
+        "auc_raw": 0.7317466590928162,
+        "auc_pos_matched": 0.7301942568177351,
+        "auc_late": 0.7407205480952209
+      },
+      "delta rule beta=0.5 decay=0.99": {
+        "auc_raw": 0.81462598428869,
+        "auc_pos_matched": 0.8140396622318974,
+        "auc_late": 0.8250467550399233
+      },
+      "linear attn outer decay=0.99": {
+        "auc_raw": 0.6690313323353103,
+        "auc_pos_matched": 0.6670960739617987,
+        "auc_late": 0.703276909777955
+      },
+      "EMA multiscale, LDA (upper bnd)": {
+        "auc_raw": 0.3305891469676586,
+        "auc_pos_matched": 0.33299449174555146,
+        "auc_late": 0.302229374451053
+      },
+      "control: position -t": {
+        "auc_raw": 0.5618916218183353,
+        "auc_pos_matched": 0.5132475900115994,
+        "auc_late": 0.46258651016531727
+      },
+      "control: random": {
+        "auc_raw": 0.4996760797165317,
+        "auc_pos_matched": 0.49974131358325113,
+        "auc_late": 0.507477052023907
+      }
+    },
+    "saturation": {
+      "1.0": {
+        "windows": [
+          0.08752518892288208,
+          3.047119889743044e-07,
+          1.9012333041246166e-07
+        ],
+        "bf16_distinct_frac_late": 0.0216064453125
+      },
+      "0.999": {
+        "windows": [
+          0.23298488557338715,
+          0.19118428230285645,
+          0.19358080625534058
+        ],
+        "bf16_distinct_frac_late": 0.022216796875
+      },
+      "0.99": {
+        "windows": [
+          0.5678073167800903,
+          0.5592663288116455,
+          0.5595341324806213
+        ],
+        "bf16_distinct_frac_late": 0.0191650390625
+      },
+      "0.95": {
+        "windows": [
+          0.7407737970352173,
+          0.7407016754150391,
+          0.7382174730300903
+        ],
+        "bf16_distinct_frac_late": 0.015625
+      }
+    },
+    "n_redundant": 7783,
+    "n_novel": 7783
+  }
+}

@@ -93,6 +93,20 @@ class IndexerNorm(nn.Module):
     reducing in bf16 is preferable.
 
     Parameter shapes and names match ``nn.LayerNorm``, so existing checkpoints load unchanged.
+
+    Memory
+    ------
+    The naive form -- ``layer_norm(x.to(fp32), ...)`` -- makes autograd save the **upcast**
+    tensor, so it retains an fp32 copy of the input rather than referring to the bf16 one the
+    caller already holds. On the pairwise indexer that is invisible: the norm sits after
+    ``w_k``, so the tensor is ``head_dim``-wide. On :class:`~.scalar_indexer.ScalarIndexer` it
+    is the *first* op and therefore runs at full ``hidden_size``, where the extra fp32 copy is
+    256 MiB per layer at ``L=16384`` -- 9 GiB across 36 layers, which is what made the scalar
+    arm OOM at a length the pairwise arm trains at comfortably.
+
+    So the statistics are taken from an fp32 view without handing that view to autograd:
+    :class:`_Fp32LayerNorm` saves the original ``x`` and re-derives what it needs in the
+    backward. Identical arithmetic in the forward, one wide fp32 tensor instead of two.
     """
 
     def __init__(self, dim: int, eps: float = 1e-5):
@@ -104,14 +118,64 @@ class IndexerNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Upcast only for low-precision inputs: an fp64 caller asked for fp64, and .float()
         # would silently narrow it -- the same trap accumulation_dtype exists to avoid.
-        acc = torch.float32 if x.dtype.itemsize < 4 else x.dtype
-        normalized = nn.functional.layer_norm(
-            x.to(acc), (x.shape[-1],), self.weight.to(acc), self.bias.to(acc), self.eps
-        )
-        return normalized.to(x.dtype)
+        if x.dtype.itemsize >= 4:
+            return nn.functional.layer_norm(
+                x, (x.shape[-1],), self.weight.to(x.dtype), self.bias.to(x.dtype), self.eps
+            )
+        return _Fp32LayerNorm.apply(x, self.weight, self.bias, self.eps)
 
     def extra_repr(self) -> str:
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
+
+
+class _Fp32LayerNorm(torch.autograd.Function):
+    """
+    LayerNorm with fp32 statistics that saves the *input's own* dtype, not the upcast copy.
+
+    Equivalent to ``layer_norm(x.float(), ...).to(x.dtype)`` in the forward, to the bit. The
+    difference is only what survives into the backward: ``x`` as the caller passed it, plus the
+    two ``(…, 1)`` statistics, rather than a full-width fp32 tensor. See :class:`IndexerNorm`
+    for why that matters at ``hidden_size`` width.
+
+    The backward is the standard LayerNorm gradient, recomputed in fp32 from ``x`` and the saved
+    mean/rstd -- the recompute is one pass over ``x`` and replaces a tensor twice its size.
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, eps):
+        x32 = x.float()
+        mean = x32.mean(-1, keepdim=True)
+        var = x32.var(-1, unbiased=False, keepdim=True)
+        rstd = torch.rsqrt(var + eps)
+        x_hat = (x32 - mean) * rstd
+        out = x_hat * weight.float() + bias.float()
+        # x in its ORIGINAL dtype; mean/rstd are (..., 1) so they are free at any width.
+        ctx.save_for_backward(x, weight, mean, rstd)
+        return out.to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, weight, mean, rstd = ctx.saved_tensors
+        g = grad_out.float()
+        x_hat = (x.float() - mean) * rstd
+
+        grad_weight = grad_bias = None
+        if ctx.needs_input_grad[1] or ctx.needs_input_grad[2]:
+            reduce_dims = tuple(range(g.dim() - 1))
+            if ctx.needs_input_grad[1]:
+                grad_weight = (g * x_hat).sum(reduce_dims).to(weight.dtype)
+            if ctx.needs_input_grad[2]:
+                grad_bias = g.sum(reduce_dims).to(weight.dtype)
+
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            n = x.shape[-1]
+            gw = g * weight.float()
+            grad_x = rstd / n * (
+                n * gw - gw.sum(-1, keepdim=True) - x_hat * (gw * x_hat).sum(-1, keepdim=True)
+            )
+            grad_x = grad_x.to(x.dtype)
+        return grad_x, grad_weight, grad_bias, None
 
 
 @dataclass

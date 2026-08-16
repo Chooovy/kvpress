@@ -69,6 +69,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from kvpress import GQAIndexerPress  # noqa: E402
 from kvpress.presses.gqa_indexer import (  # noqa: E402
+    DEFAULT_POS_SLOPE,
     PIN_MODES,
     E2EIndexerTrainer,
     e2e_indexer_training_step,
@@ -123,6 +124,13 @@ def save(
         "config": {
             "objective": "e2e_lm_loss",
             "model": args.model,
+            # Which router produced these weights. Without it the two arms' checkpoints are
+            # indistinguishable, and --init-from would load one into the other -- the parameter
+            # names differ, so load_indexer_state_dict (strict=False) would drop everything and
+            # silently start from init.
+            "scorer": args.scorer,
+            "scalar_mid_dim": args.scalar_mid_dim if args.scorer == "scalar" else None,
+            "scalar_pos_slope": args.scalar_pos_slope if args.scorer == "scalar" else None,
             "stage": args.stage,
             "pin_mode": args.pin_mode,
             "n_sink": args.n_sink,
@@ -326,6 +334,39 @@ def main() -> int:
     model_group.add_argument("--head-dim", type=int, default=None)
     model_group.add_argument("--n-heads", type=int, default=None)
     model_group.add_argument(
+        "--scorer",
+        choices=("pairwise", "scalar"),
+        default="pairwise",
+        help="which router to train. 'pairwise' scores every (query, key) pair -- query-aware, "
+        "and O(t) per decode step, which at 128K makes the router 32x the cost of the sparse "
+        "attention it feeds. 'scalar' scores each key once from its own hidden state: O(1) per "
+        "decode step and one score per token of cache instead of head_dim, at the cost of "
+        "query-awareness (a needle matters only to the query that asks for it, so a frozen "
+        "per-key score must keep it always or lose it). The two share this script, the loss, "
+        "the schedule and the checkpoint format, which is what makes them comparable; "
+        "--head-dim and --rope-dim do not apply to 'scalar' and are rejected with it.",
+    )
+    model_group.add_argument(
+        "--scalar-mid-dim",
+        type=int,
+        default=256,
+        help="MLP width for --scorer scalar; 0 is SparseK's plain linear score. This is the arm's "
+        "capacity knob, not just a parameter-matching one: in the probe study a nonlinear readout "
+        "of the hidden state beat a linear one by +0.12 held-out Spearman on total attention mass, "
+        "larger than anything a recurrent state added. At 256 the router is ~1.06M params/layer "
+        "against the pairwise arm's 4.72M; 1152 matches it exactly, which is the only setting that "
+        "isolates query-dependence from capacity.",
+    )
+    model_group.add_argument(
+        "--scalar-pos-slope",
+        type=float,
+        default=DEFAULT_POS_SLOPE,
+        help="recency tilt (t * eps) for --scorer scalar. Keeps top-k irreversible, which is what "
+        "makes a dropped key safe to free: verified 0 re-entries over 1500 steps with an absolute "
+        "tilt against 27 when normalised by sequence length. Also carries the recency duty so the "
+        "learned part is not pushed to predict ever-larger values (SparseK Sec. 3.2). 0 ablates it.",
+    )
+    model_group.add_argument(
         "--press-n-sink", type=int, default=4,
         help="keys the press protects from eviction. Also the default for --n-sink, so the keys "
         "exempted from the gate during training are the keys kept at inference.",
@@ -430,6 +471,19 @@ def main() -> int:
     optim.add_argument("--weight-decay", type=float, default=0.0)
     optim.add_argument("--grad-clip", type=float, default=1.0)
     optim.add_argument("--accum-steps", type=int, default=1)
+    optim.add_argument(
+        "--global-batch-size",
+        type=int,
+        default=0,
+        help="sequences per OPTIMIZER step, across all ranks (0 = whatever --batch-size x "
+        "--accum-steps x replicas happens to give). Set this and --accum-steps is derived so the "
+        "tokens/step matches regardless of --ffn-sp-size, which is the only way this run is "
+        "comparable to the distillation script. FFN-SP spends ranks on ONE sequence instead of on "
+        "sp_size of them, so --ffn-sp-size 8 on 8 GPUs leaves a single replica: without this flag "
+        "a step sees 1 sequence where the distillation run's 8-way DDP sees 8, i.e. 1/8 the "
+        "tokens at the same step number, and a step-600 checkpoint is NOT comparable. Must be "
+        "divisible by replicas x --batch-size.",
+    )
     optim.add_argument("--seed", type=int, default=0)
 
     io = parser.add_argument_group("io")
@@ -437,6 +491,17 @@ def main() -> int:
     io.add_argument("--save-every", type=int, default=200)
     io.add_argument("--log-every", type=int, default=10)
     io.add_argument("--metrics-file", default=None, help="append JSONL metrics here")
+    io.add_argument(
+        "--gate-sparsity",
+        action="store_true",
+        help="log the gate's participation ratio -- whether the router became SELECTIVE, which "
+        "gate_scale cannot answer (a layer can lean hard on a router that still spreads its mass "
+        "over every key). Reported as a fraction of history length: ~1.0 means a flat gate and no "
+        "sparsity learned, falling towards 0 means the router is concentrating, which is what "
+        "eviction needs. Measured only on logged steps, and only on the last micro-batch of an "
+        "accumulation group, but it does cost a second streaming pass over the keys plus an "
+        "(Sq, Sk) history mask (256 MiB at 16K) -- hence opt-in rather than always on.",
+    )
     io.add_argument(
         "--save-optimizer",
         action=argparse.BooleanOptionalAction,
@@ -500,13 +565,30 @@ def main() -> int:
         logger.info("subsets under %s:\n%s", args.data_root, describe_subsets(args.data_root))
 
     total = schedule.total_steps
-    # dp_world_size, not world_size: under FFN-SP the sp_size ranks of a group process ONE
-    # sequence together, so they contribute one sequence's tokens, not sp_size of them.
-    tokens = sum(sl * st for sl, st in schedule.stages) * dp_world_size * args.batch_size
+    # Sequences per optimizer step. dp_world_size, not world_size: under FFN-SP the sp_size ranks
+    # of a group process ONE sequence together, so they contribute one sequence, not sp_size.
+    if args.global_batch_size:
+        per_replica_step = dp_world_size * args.batch_size
+        if args.global_batch_size % per_replica_step:
+            raise SystemExit(
+                f"--global-batch-size {args.global_batch_size} is not divisible by "
+                f"{dp_world_size} replica(s) x --batch-size {args.batch_size} = "
+                f"{per_replica_step}. Gradient accumulation can only reach multiples of that, so "
+                f"the requested global batch is unreachable at --ffn-sp-size {args.ffn_sp_size}."
+            )
+        args.accum_steps = args.global_batch_size // per_replica_step
+        logger.info(
+            "--global-batch-size %d / (%d replica(s) x batch %d) -> --accum-steps %d. This is "
+            "what keeps tokens/step independent of --ffn-sp-size, and so comparable to the "
+            "distillation run at the same step number.",
+            args.global_batch_size, dp_world_size, args.batch_size, args.accum_steps,
+        )
+    seqs_per_step = dp_world_size * args.batch_size * args.accum_steps
+    tokens = sum(sl * st for sl, st in schedule.stages) * seqs_per_step
     logger.info(
-        "world_size %d x batch_size %d = %d sequences/step; %d optimizer steps over %s "
+        "%d replica(s) x batch_size %d x accum %d = %d sequences/step; %d optimizer steps over %s "
         "= %.0fM tokens",
-        dp_world_size, args.batch_size, dp_world_size * args.batch_size, total,
+        dp_world_size, args.batch_size, args.accum_steps, seqs_per_step, total,
         " -> ".join(f"{sl // 1024}K" for sl, _ in schedule.stages), tokens / 1e6,
     )
     logger.info(
@@ -570,7 +652,11 @@ def main() -> int:
         "scorer_attr": args.scorer_attr,
         "gate_scale": True,
         "n_sink": args.press_n_sink,
+        "scorer": args.scorer,
     }
+    if args.scorer == "scalar":
+        press_kwargs["scalar_mid_dim"] = args.scalar_mid_dim
+        press_kwargs["scalar_pos_slope"] = args.scalar_pos_slope
     for name in ("rope_dim", "head_dim", "n_heads"):
         value = getattr(args, name)
         if value is not None:
@@ -580,6 +666,16 @@ def main() -> int:
 
     if args.init_from:
         payload = torch.load(args.init_from, map_location="cpu")
+        # Refuse a checkpoint from the other arm. The two routers share no parameter names, so
+        # load_indexer_state_dict (strict=False, to accept a distillation checkpoint's missing
+        # gate_scale) would drop every tensor and start from init while logging success.
+        ckpt_scorer = (payload.get("config") or {}).get("scorer")
+        if ckpt_scorer is not None and ckpt_scorer != args.scorer:
+            raise SystemExit(
+                f"--init-from was trained with scorer={ckpt_scorer!r} but this run is "
+                f"scorer={args.scorer!r}. The two have different parameter names, so nothing "
+                f"would load and the run would silently start from scratch."
+            )
         # strict=False inside load_indexer_state_dict, so a distillation checkpoint (which has no
         # gate_scale) loads fine and leaves the scalar at its init. That is the intended way to
         # start end-to-end training from a distilled indexer.
@@ -666,7 +762,18 @@ def main() -> int:
 
             optimizer.zero_grad(set_to_none=True)
             accumulated = 0.0
-            for _ in range(args.accum_steps):
+            # Decided BEFORE the forward, because the diagnostic is computed inside it. Only on
+            # steps that get logged, and only on the LAST micro-batch of an accumulation group:
+            # it costs a second streaming pass over the keys plus an (Sq, Sk) history mask, and
+            # measuring every micro-step would pay that accum_steps times to report one number.
+            will_log = (
+                step % args.log_every == 0 or step == args.total_steps - 1
+                or (bool(args.max_steps) and step + 1 >= args.max_steps)
+            )
+            for micro in range(args.accum_steps):
+                trainer.measure_sparsity = (
+                    args.gate_sparsity and will_log and micro == args.accum_steps - 1
+                )
                 try:
                     batch = next(iterator)
                 except StopIteration:
@@ -697,13 +804,17 @@ def main() -> int:
                 # Before clipping, so every rank clips the same vector and takes an identical
                 # step -- clipping first would let each rank scale by its own local norm.
                 #
-                # Divide by DP_WORLD_SIZE, not world_size. average_gradients all-reduces with SUM,
-                # and under FFN-SP the sp_size ranks of one group each hold a DISJOINT slice of the
-                # same sequence -- their sum IS that sequence's full gradient, not sp_size copies
-                # of it. Dividing by world_size would shrink every gradient by sp_size, which
-                # trains at 1/sp_size of the intended learning rate and shows up as nothing more
-                # than a slightly flatter loss curve.
-                average_gradients(params, dp_world_size)
+                # Divide by WORLD_SIZE, not dp_world_size. SequenceParallelFFN all-gathers the
+                # gradient on the way back into the FFN, so the sp_size ranks of one group each
+                # end up with the SAME complete gradient for that sequence -- sp_size copies of
+                # it, not disjoint slices. A SUM over the group is therefore sp_size x too large,
+                # and world_size = dp_world_size * sp_size divides both the replication and the
+                # data-parallel averaging out in one step. (Before that gather the ranks held
+                # neither copies nor clean slices: paths reaching the router without crossing a
+                # sharded FFN were replicated while through-FFN paths were split, so no single
+                # divisor was right and the gradient DIRECTION was off -- cosine 0.98, not
+                # fixable with the LR. See _ScatterSequence.)
+                average_gradients(params, world_size)
 
             grad_norm = torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
             optimizer.step()
@@ -714,16 +825,21 @@ def main() -> int:
 
             window.append(accumulated)
             reached_max = bool(args.max_steps) and step + 1 >= args.max_steps
-            if step % args.log_every == 0 or step == args.total_steps - 1 or reached_max:
+            if will_log:
                 gate_scale = trainer.mean_gate_scale()
+                gate_sparsity = trainer.mean_gate_sparsity()
                 peak = torch.cuda.max_memory_allocated() / 1024**3
                 logger.info(
                     "step %4d/%d L=%-6d lm_loss %.4f (avg %.4f) |g| %.3f lr %.2e "
-                    "gate %.4f peak %.1f GiB %.1f s/step",
+                    "gate %.4f sparsity %s peak %.1f GiB %.1f s/step",
                     step, args.total_steps, seq_len, accumulated,
                     sum(window) / len(window), float(grad_norm),
                     lr_schedule.get_last_lr()[0],
                     gate_scale if gate_scale is not None else float("nan"),
+                    # Fraction of each row's history the gate effectively spreads over. 1.00 is a
+                    # flat gate (no selectivity learned, whatever gate_scale says); falling
+                    # towards 0 is the router concentrating, which is what eviction needs.
+                    f"{gate_sparsity:.3f}" if gate_sparsity is not None else "off",
                     peak, (time.time() - started) / (step - start_step + 1),
                 )
                 if metrics_handle:
@@ -745,10 +861,23 @@ def main() -> int:
                                 "gate_scales": {
                                     str(k): v for k, v in trainer.gate_scales.items()
                                 },
+                                # Gate participation ratio as a fraction of history length: the
+                                # readout on whether the router became SELECTIVE, which
+                                # gate_scale cannot answer -- a layer can lean hard on a router
+                                # that still spreads its mass over every key. ~1.0 = flat,
+                                # -> 0 = peaked. null when --gate-sparsity is off.
+                                "gate_sparsity_mean": gate_sparsity,
+                                "gate_sparsity": {
+                                    str(k): v for k, v in trainer.gate_sparsity.items()
+                                },
                                 "pin_mode": trainer.gate_pin_mode,
                                 "peak_gib": peak,
                                 "batch_size": args.batch_size,
-                                "tokens": args.batch_size * seq_len * dp_world_size,
+                                "accum_steps": args.accum_steps,
+                                # Sequences x seq_len actually consumed by this optimizer step.
+                                # Includes accum: the whole point of --global-batch-size is that
+                                # this figure does not move with --ffn-sp-size.
+                                "tokens": seqs_per_step * seq_len,
                             }
                         )
                         + "\n"

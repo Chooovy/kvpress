@@ -401,9 +401,29 @@ The one thing repeatedly flagged and **never measured**. Pinning's scarcity stre
 | **32768** | **−10.40 nats** |
 
 Suppression grows with context length, so **pinning may over-suppress history at 32K** — which is
-the target regime. SAS is block-level, so its `C` is only 256–512 and the effect is far milder.
+the target regime.
 
-This is route A's sole unknown, and it lands squarely on the intended use case.
+**Corrected (was: "SAS is block-level, so its `C` is only 256–512 and the effect is far milder").**
+That compared a block-level count against a token-level one. SAS's blocks hold ~64 tokens and the
+tokens within a block share the block's multiplier, so at 32K with `block=64`, `C=512`:
+
+| | competing units | per-unit multiplier | token-level suppression |
+|---|---|---|---|
+| SAS @32K | 512 blocks | 1/512 | `ln(512·64)` = **−10.40 nats** |
+| here @32K | 32764 tokens | 1/32764 | `ln(32764)` = **−10.40 nats** |
+
+Total suppression is set by how many tokens the normalizer covers, not by how they are grouped —
+**SAS is under the same suppression, and still reaches 54.4 against a 56.1 dense baseline.** So
+suppression alone is evidently survivable, and the residual risk here is narrower than first
+written: what block-level actually buys is a 512-way rather than 32764-way competition (stronger
+per-unit gradient) and local continuity, since tokens in a block share their fate while
+token-level granularity can keep one token and drop its neighbour. Neither shows up in a loss
+curve; needle-in-a-haystack at 32K is what would.
+
+This is route A's sole unknown, and it lands squarely on the intended use case. First 8K evidence
+after the `gate_scale` fp32 fix: sparsity falls 0.486 → 0.197 over 80 steps with loss back to
+backbone level, i.e. the router does learn a ranking under today's `B = 1`. See `TODO.md` for the
+budget ablation this suggests.
 
 ---
 
@@ -422,6 +442,12 @@ This is route A's sole unknown, and it lands squarely on the intended use case.
   `loss(boost true-top-8) = 3.4e-2`), so `λ → 0` was the correct answer, not a pathology. On an
   honest retrieval objective `λ` **rises** (0.32 → 1.45 with a weak backbone, 0.32 → 0.61 with a
   strong one). Fixed `λ` remains the prudent default, but not for the reason first given.
+- **A second retracted finding:** §9 claimed SAS's block-level normalizer made its scarcity "far
+  milder" than ours. **Unit error** — comparing 512 blocks against 32764 tokens. A block's ~64
+  tokens share its multiplier, so SAS's token-level suppression at 32K is `ln(512·64)` = −10.40
+  nats, identical to ours. Corrected in §9. This matters because it removed the main argument for
+  raising the gate budget above 1 (see `TODO.md`): SAS carries the same suppression and still
+  reaches 54.4/56.1.
 - **Unverified:** whether SeerAttention's AttnGate is bilinear (its score is what would decide
   whether it, too, could fold into concat); whether SparseK is also trained from scratch.
 

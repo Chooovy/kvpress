@@ -152,14 +152,20 @@ def pinned_mask(
     return pinned
 
 
-def _history_mask(
+def history_mask(
     pinned: torch.Tensor,
     causal_keep: torch.Tensor | None,
     q_len: int,
     k_len: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """``(Sq, Sk)`` bool: visible and not pinned. Plain causal when ``causal_keep`` is None."""
+    """
+    ``(Sq, Sk)`` bool: visible and not pinned. Plain causal when ``causal_keep`` is None.
+
+    Public because the gate's own diagnostics need the SAME notion of "history" the normalizer
+    uses -- see ``E2EIndexerTrainer._gate_participation``, which divides by this mask's row sums.
+    A second definition there could drift from this one and would silently rescale the metric.
+    """
     if causal_keep is None:
         q_pos = torch.arange(q_len, device=device).unsqueeze(-1) + (k_len - q_len)
         k_pos = torch.arange(k_len, device=device).unsqueeze(0)
@@ -322,7 +328,7 @@ def history_lse(
     """
     q_len, k_len = q_idx.shape[2], k_idx.shape[1]
     acc = accumulation_dtype(q_idx, k_idx)
-    history = _history_mask(pinned, causal_keep, q_len, k_len, q_idx.device)
+    history = history_mask(pinned, causal_keep, q_len, k_len, q_idx.device)
     scale = (
         gate_scale
         if isinstance(gate_scale, torch.Tensor)

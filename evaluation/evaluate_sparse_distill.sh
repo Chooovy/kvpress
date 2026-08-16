@@ -13,12 +13,12 @@
 # force_sink and block_k match the sparse training stage. Compare the numbers against
 # evaluate.sh's `no_press` row on the same dataset for the dense upper bound.
 set -euo pipefail
-
+export CUDA_VISIBLE_DEVICES=1,2
 DATASET="${DATASET:-ruler}"
 DATA_DIR="${DATA_DIR:-16384}"
 MODEL="${MODEL:-/apdcephfs_gy8/share_303843174/guhao/models/Qwen3-8B}"
-CKPT="${CKPT:-/apdcephfs_gy8/share_303843174/guhao/models/Qwen-3-8B-gqa_indexer_e2e/stage1/final.pt}"
-OUTPUT_DIR="${OUTPUT_DIR:-./results_sparse_e2e}"
+CKPT="${CKPT:-/apdcephfs_gy8/share_303843174/guhao/models/Qwen-3-8B-gqa_indexer/stage1/step600.pt}"
+OUTPUT_DIR="${OUTPUT_DIR:-./results_sparse}"
 
 FORCE_LOCAL="${FORCE_LOCAL:-64}"
 FORCE_SINK="${FORCE_SINK:-4}"

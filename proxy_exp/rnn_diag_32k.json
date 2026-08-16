@@ -1,0 +1,341 @@
+{
+  "layer8": {
+    "effective_rank": {
+      "d": 4096,
+      "participation_ratio": 1.715813724849843,
+      "entropy_rank": 8.823247169507555,
+      "rank_90pct_energy": 244,
+      "rank_99pct_energy": 2556,
+      "top1_energy_frac": 0.7632813308742633
+    },
+    "auc": {
+      "full attention (ceiling, O(L^2))": {
+        "auc_raw": 1.0,
+        "auc_pos_matched": 1.0,
+        "auc_late": 1.0
+      },
+      "no state: ||h_t|| (SparseK-like)": {
+        "auc_raw": 0.501571677426673,
+        "auc_pos_matched": 0.5007883776644024,
+        "auc_late": 0.5036417529294124
+      },
+      "EMA vector hl=64": {
+        "auc_raw": 0.6401797940404181,
+        "auc_pos_matched": 0.6461416040012613,
+        "auc_late": 0.658972752585583
+      },
+      "EMA vector hl=512": {
+        "auc_raw": 0.7008212402296264,
+        "auc_pos_matched": 0.7040399060509107,
+        "auc_late": 0.7205054746180417
+      },
+      "EMA vector hl=4096": {
+        "auc_raw": 0.7204073608542284,
+        "auc_pos_matched": 0.7377071251004055,
+        "auc_late": 0.759894801282959
+      },
+      "delta rule beta=1 decay=1": {
+        "auc_raw": 0.7935418881514149,
+        "auc_pos_matched": 0.7824522517511933,
+        "auc_late": 0.8237597096099898
+      },
+      "delta rule beta=1 decay=0.99": {
+        "auc_raw": 0.7879358295288679,
+        "auc_pos_matched": 0.7912296739891335,
+        "auc_late": 0.7920745160171268
+      },
+      "delta rule beta=1 decay=0.95": {
+        "auc_raw": 0.6769583780553752,
+        "auc_pos_matched": 0.679221308019998,
+        "auc_late": 0.6808379245781347
+      },
+      "delta rule beta=0.5 decay=0.99": {
+        "auc_raw": 0.7953967595491276,
+        "auc_pos_matched": 0.7993545707504661,
+        "auc_late": 0.8009480921449486
+      },
+      "linear attn outer decay=0.99": {
+        "auc_raw": 0.7557865907551535,
+        "auc_pos_matched": 0.7659802759330939,
+        "auc_late": 0.7655783989156715
+      },
+      "EMA multiscale, LDA (upper bnd)": {
+        "auc_raw": 0.2982714561096229,
+        "auc_pos_matched": 0.29134131779684885,
+        "auc_late": 0.29608758155535264
+      },
+      "control: position -t": {
+        "auc_raw": 0.5984002763908445,
+        "auc_pos_matched": 0.5318328063916523,
+        "auc_late": 0.4608705530816948
+      },
+      "control: random": {
+        "auc_raw": 0.49808246257797495,
+        "auc_pos_matched": 0.49854049883594154,
+        "auc_late": 0.5121699963389611
+      }
+    },
+    "saturation": {
+      "1.0": {
+        "windows": [
+          0.07871571183204651,
+          2.0923394572491816e-07,
+          1.9644939186491683e-07
+        ],
+        "bf16_distinct_frac_late": 0.0263671875
+      },
+      "0.999": {
+        "windows": [
+          0.21829825639724731,
+          0.1757645308971405,
+          0.17910434305667877
+        ],
+        "bf16_distinct_frac_late": 0.029541015625
+      },
+      "0.99": {
+        "windows": [
+          0.5859119892120361,
+          0.5712602138519287,
+          0.5759755373001099
+        ],
+        "bf16_distinct_frac_late": 0.023193359375
+      },
+      "0.95": {
+        "windows": [
+          0.8028357028961182,
+          0.7939167022705078,
+          0.7991408109664917
+        ],
+        "bf16_distinct_frac_late": 0.0167236328125
+      }
+    },
+    "n_redundant": 7783,
+    "n_novel": 7783
+  },
+  "layer18": {
+    "effective_rank": {
+      "d": 4096,
+      "participation_ratio": 1.2796755092615506,
+      "entropy_rank": 3.0286157052215734,
+      "rank_90pct_energy": 7,
+      "rank_99pct_energy": 1351,
+      "top1_energy_frac": 0.8839476842800449
+    },
+    "auc": {
+      "full attention (ceiling, O(L^2))": {
+        "auc_raw": 1.0,
+        "auc_pos_matched": 1.0,
+        "auc_late": 1.0
+      },
+      "no state: ||h_t|| (SparseK-like)": {
+        "auc_raw": 0.5025916676738189,
+        "auc_pos_matched": 0.5026783079590592,
+        "auc_late": 0.5031397160976656
+      },
+      "EMA vector hl=64": {
+        "auc_raw": 0.6152520634348553,
+        "auc_pos_matched": 0.6132684817459101,
+        "auc_late": 0.6594812706052992
+      },
+      "EMA vector hl=512": {
+        "auc_raw": 0.6614626022258094,
+        "auc_pos_matched": 0.6562608281380383,
+        "auc_late": 0.6935870564708693
+      },
+      "EMA vector hl=4096": {
+        "auc_raw": 0.6642225651538044,
+        "auc_pos_matched": 0.6630814845530042,
+        "auc_late": 0.6962358510346776
+      },
+      "delta rule beta=1 decay=1": {
+        "auc_raw": 0.7311144850319576,
+        "auc_pos_matched": 0.7344685491769292,
+        "auc_late": 0.8135363839143785
+      },
+      "delta rule beta=1 decay=0.99": {
+        "auc_raw": 0.8159315457217075,
+        "auc_pos_matched": 0.8158205363195501,
+        "auc_late": 0.8206999931714936
+      },
+      "delta rule beta=1 decay=0.95": {
+        "auc_raw": 0.7317466590928162,
+        "auc_pos_matched": 0.7301942568177351,
+        "auc_late": 0.7407205480952209
+      },
+      "delta rule beta=0.5 decay=0.99": {
+        "auc_raw": 0.81462598428869,
+        "auc_pos_matched": 0.8140396622318974,
+        "auc_late": 0.8250467550399233
+      },
+      "linear attn outer decay=0.99": {
+        "auc_raw": 0.6690313323353103,
+        "auc_pos_matched": 0.6670960739617987,
+        "auc_late": 0.703276909777955
+      },
+      "EMA multiscale, LDA (upper bnd)": {
+        "auc_raw": 0.3305891469676586,
+        "auc_pos_matched": 0.33299449174555146,
+        "auc_late": 0.302229374451053
+      },
+      "control: position -t": {
+        "auc_raw": 0.5618916218183353,
+        "auc_pos_matched": 0.5132475900115994,
+        "auc_late": 0.46258651016531727
+      },
+      "control: random": {
+        "auc_raw": 0.4996760797165317,
+        "auc_pos_matched": 0.49974131358325113,
+        "auc_late": 0.507477052023907
+      }
+    },
+    "saturation": {
+      "1.0": {
+        "windows": [
+          0.08752518892288208,
+          3.047119889743044e-07,
+          1.9012333041246166e-07
+        ],
+        "bf16_distinct_frac_late": 0.0216064453125
+      },
+      "0.999": {
+        "windows": [
+          0.23298488557338715,
+          0.19118428230285645,
+          0.19358080625534058
+        ],
+        "bf16_distinct_frac_late": 0.022216796875
+      },
+      "0.99": {
+        "windows": [
+          0.5678073167800903,
+          0.5592663288116455,
+          0.5595341324806213
+        ],
+        "bf16_distinct_frac_late": 0.0191650390625
+      },
+      "0.95": {
+        "windows": [
+          0.7407737970352173,
+          0.7407016754150391,
+          0.7382174730300903
+        ],
+        "bf16_distinct_frac_late": 0.015625
+      }
+    },
+    "n_redundant": 7783,
+    "n_novel": 7783
+  },
+  "layer28": {
+    "effective_rank": {
+      "d": 4096,
+      "participation_ratio": 10.664933802326397,
+      "entropy_rank": 215.6473310753556,
+      "rank_90pct_energy": 1247,
+      "rank_99pct_energy": 3322,
+      "top1_energy_frac": 0.3024726798279093
+    },
+    "auc": {
+      "full attention (ceiling, O(L^2))": {
+        "auc_raw": 1.0,
+        "auc_pos_matched": 1.0,
+        "auc_late": 1.0
+      },
+      "no state: ||h_t|| (SparseK-like)": {
+        "auc_raw": 0.5025657164119066,
+        "auc_pos_matched": 0.5021621202590288,
+        "auc_late": 0.5009078922037002
+      },
+      "EMA vector hl=64": {
+        "auc_raw": 0.6405992568991521,
+        "auc_pos_matched": 0.638120224023246,
+        "auc_late": 0.6616796230781017
+      },
+      "EMA vector hl=512": {
+        "auc_raw": 0.6577455627015257,
+        "auc_pos_matched": 0.6516577011871201,
+        "auc_late": 0.6634389345458177
+      },
+      "EMA vector hl=4096": {
+        "auc_raw": 0.6223413472822137,
+        "auc_pos_matched": 0.6302466136098871,
+        "auc_late": 0.6124607053144515
+      },
+      "delta rule beta=1 decay=1": {
+        "auc_raw": 0.7604531707745407,
+        "auc_pos_matched": 0.7726672548903462,
+        "auc_late": 0.8429384210523866
+      },
+      "delta rule beta=1 decay=0.99": {
+        "auc_raw": 0.8253229887949484,
+        "auc_pos_matched": 0.8248817449061931,
+        "auc_late": 0.8303562724498671
+      },
+      "delta rule beta=1 decay=0.95": {
+        "auc_raw": 0.7269848088873629,
+        "auc_pos_matched": 0.7252838154470106,
+        "auc_late": 0.7414148975982239
+      },
+      "delta rule beta=0.5 decay=0.99": {
+        "auc_raw": 0.819102222037181,
+        "auc_pos_matched": 0.8182284667897348,
+        "auc_late": 0.8273153957752761
+      },
+      "linear attn outer decay=0.99": {
+        "auc_raw": 0.6692829786845216,
+        "auc_pos_matched": 0.6686695165023727,
+        "auc_late": 0.7172908309560623
+      },
+      "EMA multiscale, LDA (upper bnd)": {
+        "auc_raw": 0.3385410296301835,
+        "auc_pos_matched": 0.3423571866987103,
+        "auc_late": 0.34423690471064394
+      },
+      "control: position -t": {
+        "auc_raw": 0.5651339447474852,
+        "auc_pos_matched": 0.5162400342543672,
+        "auc_late": 0.47347495518334287
+      },
+      "control: random": {
+        "auc_raw": 0.4985496513261417,
+        "auc_pos_matched": 0.49856292999395235,
+        "auc_late": 0.5117518122571241
+      }
+    },
+    "saturation": {
+      "1.0": {
+        "windows": [
+          0.08448813855648041,
+          2.4066710579973005e-07,
+          2.0805657641176367e-07
+        ],
+        "bf16_distinct_frac_late": 0.0235595703125
+      },
+      "0.999": {
+        "windows": [
+          0.23017245531082153,
+          0.18858744204044342,
+          0.19081394374370575
+        ],
+        "bf16_distinct_frac_late": 0.0260009765625
+      },
+      "0.99": {
+        "windows": [
+          0.5732371807098389,
+          0.5650216341018677,
+          0.5637153387069702
+        ],
+        "bf16_distinct_frac_late": 0.022216796875
+      },
+      "0.95": {
+        "windows": [
+          0.7473136782646179,
+          0.7483679056167603,
+          0.7421822547912598
+        ],
+        "bf16_distinct_frac_late": 0.0213623046875
+      }
+    },
+    "n_redundant": 7783,
+    "n_novel": 7783
+  }
+}

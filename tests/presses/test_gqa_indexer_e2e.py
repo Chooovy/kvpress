@@ -1273,3 +1273,242 @@ def test_unpinned_mode_warns(caplog):
     with caplog.at_level("WARNING"):
         E2EIndexerTrainer(press=press, pin_mode="none")
     assert any("no-op" in record.message for record in caplog.records)
+
+
+# ----------------------------------------------------------------------
+# gate_scale precision: the scalar must be trainable, not just present
+# ----------------------------------------------------------------------
+def _bf16_model_with_indexers(n_layers=3):
+    """A bf16 model with indexers attached, i.e. what the training script actually builds."""
+    model, config = tiny_model(n_layers=n_layers)
+    model = model.to(torch.bfloat16)
+    press = GQAIndexerPress(compression_ratio=0.5, gate_scale=True)
+    press.post_init_from_model(model)
+    return model, config, press
+
+
+def test_gate_scale_is_upcast_to_fp32_for_training():
+    """
+    ``freeze_backbone`` must leave every ``gate_scale`` in fp32, whatever the model's dtype.
+
+    ``post_init_from_model`` builds the indexer at the model dtype, so on a bf16 run the scalar
+    arrives with 8 mantissa bits. That is not enough to train it: see
+    ``test_bf16_gate_scale_cannot_be_trained_by_a_warmup_lr`` for the arithmetic. Asserting the
+    dtype here is what keeps the fix from being quietly undone -- nothing else about the run
+    would change if it were.
+    """
+    model, _, press = _bf16_model_with_indexers()
+    trainer = E2EIndexerTrainer(press=press)
+
+    scales = [layer.self_attn.indexer.gate_scale for layer in model.model.layers]
+    assert all(s.dtype == torch.bfloat16 for s in scales), "expected bf16 before the fix runs"
+
+    trainer.freeze_backbone(model)
+
+    for layer in model.model.layers:
+        gate_scale = layer.self_attn.indexer.gate_scale
+        assert gate_scale.dtype == torch.float32, "gate_scale must be fp32 to be trainable"
+        assert gate_scale.requires_grad, "the upcast must not drop requires_grad"
+        # The rest of the indexer stays at the model dtype: it is only the scalar that cannot
+        # survive bf16, and upcasting the projections would cost real memory for no reason.
+        assert layer.self_attn.indexer.w_q.weight.dtype == torch.bfloat16
+
+
+def test_upcast_gate_scales_is_idempotent_and_reported():
+    """A second call converts nothing, so the log line cannot claim work it did not do."""
+    model, _, press = _bf16_model_with_indexers()
+    trainer = E2EIndexerTrainer(press=press)
+
+    converted, values = trainer.upcast_gate_scales(model)
+    assert converted == 3 and len(values) == 3
+    assert converted, "expected the bf16 scalars to be converted"
+
+    converted_again, values_again = trainer.upcast_gate_scales(model)
+    assert converted_again == 0 and values_again == []
+
+
+def test_gate_scale_is_in_the_trainable_set_after_upcasting():
+    """
+    The replaced Parameter must be the one the optimizer gets.
+
+    ``upcast_gate_scales`` rebinds the attribute to a NEW leaf, so an optimizer built before it
+    ran would hold the discarded bf16 tensor and step that instead -- the scalar would then never
+    move no matter what dtype it reports. ``freeze_backbone`` calls the upcast first for exactly
+    this reason, and this pins the ordering.
+    """
+    model, _, press = _bf16_model_with_indexers()
+    trainer = E2EIndexerTrainer(press=press)
+    trainer.freeze_backbone(model)
+
+    params = trainer.indexer_parameters(model)
+    scales = [layer.self_attn.indexer.gate_scale for layer in model.model.layers]
+    by_id = {id(p) for p in params}
+    for scale in scales:
+        assert id(scale) in by_id, "the live gate_scale is not in indexer_parameters()"
+
+
+def test_bf16_gate_scale_cannot_be_trained_by_a_warmup_lr():
+    """
+    Documents WHY the upcast is required, in the arithmetic rather than in prose.
+
+    bf16 has 8 mantissa bits, so near the ``head_dim**-0.5`` init the representable values are
+    ~3.0e-4 apart. AdamW's step is ``lr * m_hat / (sqrt(v_hat) + eps)``, which for a steady
+    gradient has magnitude ~``lr``, so at a warmup ``lr`` of 1.3e-5 to 1.5e-4 every step rounds
+    back to where it started and the scalar never moves. This was observed on a real run:
+    ``gate_scale_mean`` identical to 8 decimal places across all 36 layers for 30 steps while the
+    loss fell 4.52 -> 2.42.
+
+    Asserting the *failure* as well as the fix is what makes this a regression test rather than a
+    restatement: if bf16 ever became sufficient the first half would break and this could go.
+    """
+    init = torch.tensor(128**-0.5)
+    warmup_lr = 1e-4
+
+    frozen = torch.nn.Parameter(init.clone().to(torch.bfloat16))
+    trainable = torch.nn.Parameter(init.clone())
+    for param in (frozen, trainable):
+        optimizer = torch.optim.AdamW([param], lr=warmup_lr)
+        start = param.item()
+        for _ in range(30):
+            param.grad = torch.full_like(param, 0.05)
+            optimizer.step()
+            optimizer.zero_grad()
+        moved = abs(param.item() - start)
+        if param is frozen:
+            assert moved == 0.0, (
+                f"bf16 gate_scale moved by {moved:.2e}; if bf16 is now sufficient this test and "
+                "the upcast in freeze_backbone can both go"
+            )
+        else:
+            assert moved > 1e-4, f"fp32 gate_scale should train, moved only {moved:.2e}"
+
+
+# ----------------------------------------------------------------------
+# gate sparsity: is the router actually selective?
+# ----------------------------------------------------------------------
+def _sparsity_at(gate_scale_value, *, seq_len=256, n_layers=2, pin_mode="sink"):
+    """Mean gate participation fraction with every layer's gate_scale pinned to a value."""
+    model, config = tiny_model(n_layers=n_layers)
+    press = GQAIndexerPress(compression_ratio=0.5, gate_scale=True)
+    press.post_init_from_model(model)
+    trainer = E2EIndexerTrainer(press=press, pin_mode=pin_mode, n_sink=2)
+    with torch.no_grad():
+        for layer in model.model.layers:
+            layer.self_attn.indexer.gate_scale.fill_(gate_scale_value)
+    trainer.measure_sparsity = True
+    torch.manual_seed(1)
+    input_ids = torch.randint(0, config.vocab_size, (1, seq_len))
+    with torch.no_grad():
+        e2e_indexer_training_step(model, trainer, input_ids=input_ids)
+    return trainer
+
+
+def test_flat_gate_reports_full_participation():
+    """
+    ``gate_scale = 0`` is an exactly flat gate, and must report a participation fraction of 1.
+
+    This is the anchor the whole metric hangs on. A flat gate is the no-op the router can reach
+    for free (see the module docstring on pinning), so "did we learn any sparsity at all" is
+    precisely the question of whether this number sits at 1.0 -- and ``gate_scale`` alone cannot
+    answer it, because a layer can carry a large scale on a router that still spreads its mass
+    over every key.
+    """
+    trainer = _sparsity_at(0.0)
+    assert trainer.mean_gate_sparsity() == pytest.approx(1.0, abs=1e-4)
+
+
+def test_participation_falls_monotonically_as_the_gate_sharpens():
+    """
+    The metric must be monotone in gate sharpness, or it cannot be read as "sparsity".
+
+    ``gate_scale`` is the right knob to sweep: it multiplies the score *after* ``IndexerNorm``,
+    which is the only place the gate's sharpness can be changed from outside. Scaling ``w_q``/
+    ``w_k`` instead does nothing at all -- the norm restores unit variance -- and a first attempt
+    at this test swept those and saw the metric sit still, which looked like a broken metric
+    rather than a broken test.
+    """
+    values = [_sparsity_at(gs).mean_gate_sparsity() for gs in (0.0, 0.01, 128**-0.5, 0.5, 2.0)]
+    assert all(a >= b - 1e-6 for a, b in zip(values, values[1:])), f"not monotone: {values}"
+    # And the sweep must actually span a useful range, not hover near 1.0 throughout.
+    assert values[0] > 0.95 and values[-1] < 0.2, f"range too narrow to be informative: {values}"
+
+
+def test_sparsity_is_per_layer_and_off_by_default():
+    """
+    Off unless asked, and populated per layer when asked.
+
+    Off by default because it costs a second streaming pass over the keys plus an ``(Sq, Sk)``
+    history mask -- 256 MiB at 16K -- on a path whose whole design is to avoid materializing
+    anything of that shape.
+    """
+    model, config = tiny_model(n_layers=3)
+    press = GQAIndexerPress(compression_ratio=0.5, gate_scale=True)
+    press.post_init_from_model(model)
+    trainer = E2EIndexerTrainer(press=press)
+    assert not trainer.measure_sparsity, "the diagnostic must be opt-in"
+
+    input_ids = torch.randint(0, config.vocab_size, (1, 32))
+    e2e_indexer_training_step(model, trainer, input_ids=input_ids)
+    assert trainer.gate_sparsity == {} and trainer.mean_gate_sparsity() is None
+
+    trainer.measure_sparsity = True
+    e2e_indexer_training_step(model, trainer, input_ids=input_ids)
+    assert set(trainer.gate_sparsity) == set(range(config.num_hidden_layers))
+    assert all(0.0 <= v <= 1.0 for v in trainer.gate_sparsity.values())
+
+
+def test_sparsity_state_resets_between_passes():
+    """
+    A pass with the diagnostic off must not report the previous pass's numbers.
+
+    ``reset`` clears it for the same reason it clears ``gate_scales``: a stale value read as
+    current would be a plausible-looking number attached to the wrong step.
+    """
+    trainer = _sparsity_at(0.5)
+    assert trainer.gate_sparsity, "expected the first pass to populate it"
+    trainer.reset()
+    assert trainer.gate_sparsity == {} and trainer.mean_gate_sparsity() is None
+
+
+def test_sparsity_is_not_reported_under_the_sparse_scope():
+    """
+    Returns ``None`` for stage 2 rather than a number against a different denominator.
+
+    Under the sparse scope the forward is already restricted to the router's own top-k, so the
+    gate is not normalized over a history and this ratio is not defined against the same
+    denominator. Emitting it anyway would invite a comparison between two different quantities.
+    """
+    model, config = tiny_model(n_layers=2)
+    press = GQAIndexerPress(compression_ratio=0.5, gate_scale=True)
+    press.post_init_from_model(model)
+    trainer = E2EIndexerTrainer(press=press, stage="sparse", topk=8, pin_mode="none")
+    trainer.measure_sparsity = True
+    input_ids = torch.randint(0, config.vocab_size, (1, 32))
+    e2e_indexer_training_step(model, trainer, input_ids=input_ids)
+    assert all(v is None for v in trainer.gate_sparsity.values())
+    assert trainer.mean_gate_sparsity() is None
+
+
+def test_participation_matches_the_direct_computation():
+    """
+    The streaming identity must equal the definition it claims to compute.
+
+    ``PR = 1 / sum_j p_j^2`` is computed as ``exp(2*lse - lse2)`` so it can reuse the ``O(L)``
+    streaming ``history_lse`` instead of materializing the ``(Sq, Sk)`` score matrix. That is an
+    identity, not an approximation, so it is worth checking against the explicit form on a shape
+    small enough to build it.
+    """
+    torch.manual_seed(0)
+    scores = torch.randn(4, 2, 16, 64, dtype=torch.float64) * 1.7
+    lse = torch.logsumexp(scores, dim=-1)
+    lse2 = torch.logsumexp(2 * scores, dim=-1)
+
+    probabilities = (scores - lse.unsqueeze(-1)).exp()
+    direct = 1.0 / probabilities.pow(2).sum(-1)
+    streamed = torch.exp(2 * lse - lse2)
+
+    assert torch.allclose(direct, streamed, rtol=1e-9), (
+        (direct - streamed).abs().max().item()
+    )
+    # And the probabilities really are a distribution, which is what makes PR meaningful.
+    assert torch.allclose(probabilities.sum(-1), torch.ones_like(lse), atol=1e-12)

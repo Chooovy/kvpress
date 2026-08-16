@@ -716,6 +716,21 @@ even though the reduction runs over queries.
 rounding rather than TF32's ~1e-3. That costs throughput on Ampere+; it is deliberate for a
 reference kernel whose job is to be trusted, and it is the first knob to turn once it is.
 
+**At inference it is turned.** `SparseAttentionContext` defaults to `precision="tf32"`, because
+`"ieee"` fp32 does not use tensor cores at all — it falls to FMA, which makes `M` (`BLOCK_G`,
+padded to 16 wherever `min_dot_m()` requires it) real work rather than lanes the MMA would have
+occupied regardless. Measured on an H20 at `L=8192, topk=2048`: **67.0 s per prefill under
+`"ieee"` against 9.4 s under `"tf32"`**, with `M` scaling the kernel ~linearly under `"ieee"`
+(1.89× for 2× `M`) and barely at all under `"tf32"` (1.09×). At 650 RULER samples that is the
+difference between ~1 h and ~12 h.
+
+For a bf16/fp16 model this costs *nothing*: tf32 keeps 10 mantissa bits against bf16's 8, so
+every upcast operand is exactly representable and `Q @ K^T` is bit-identical. Only the softmax
+weights in `P @ V` are genuinely fp32, and rounding them costs ~2e-4 relative — ~30× below the
+bf16 epsilon the output is stored at. Both paths measure the same 7.52e-3 against the fp32
+reference, i.e. bf16 store-rounding alone. `"ieee"` remains right for an fp32 caller and for the
+tests, which is why the kernel's own default is unchanged.
+
 fp64 is declined rather than demoted — `tl.dot` has no fp64 path, and quietly dropping to fp32
 would break the gradient tests that rely on fp64 to reach 1e-10.
 
@@ -762,6 +777,40 @@ kernel with no adapter. `-1` (Megatron/sglang's choice) rather than `Sk`-as-sent
 (tilelang's) because it is checkable without knowing `Sk` and cannot be mistaken for a real
 position.
 
+#### Selection, not attention, is the cost at length
+
+Measured per prefill on an H20 (`topk=2048`, bf16, `precision="tf32"`):
+
+| L | select | attend |
+|---|---|---|
+| 8K | 6.75 s | 1.68 s |
+| 16K | **26.67 s** (3.95× — `O(L²)`) | 3.35 s (2.00× — `O(L)`) |
+
+The Triton kernel is exactly linear in `L` at fixed `topk`, so it stops being the bottleneck
+almost immediately: at 16K selection is **89%** of the prefill. `streaming_topk_support` is
+`O(L²)` by nature — every query scores every key — but most of what it *spent* was avoidable.
+
+The running buffer is re-sorted against each key tile, so total work is
+`Sq · Sk · (1 + take/key_tile)`. Note that **`query_tile` cancels**: it costs scratch, never
+work. A fixed `key_tile = 512` against `take = 1980` therefore carried a 4.87× redundancy
+factor. `topk_tiles()` now sizes `key_tile` at ~2× `take` (~1.5× redundancy) and pays for the
+scratch by lowering `query_tile`, which is free:
+
+| `key_tile` | redundancy | select @16K |
+|---|---|---|
+| 512 (old fixed default) | 4.87× | 26.67 s |
+| 2048 | 1.97× | 9.22 s |
+| **4096 (adaptive default)** | **1.48×** | **6.54 s** (4.1×) |
+
+The measured 4.1× beats the 3.3× the work model predicts, because fewer and larger calls also
+amortize per-call overhead. Past 4096 the curve flattens (8192 buys a predicted 1.2× more) while
+scratch keeps growing, so that is the knee rather than the extreme. Tiling is result-invariant —
+verified identical support across every `(key_tile, query_tile)` combination — which is what
+licenses tuning it for speed.
+
+Beyond this, the remaining `O(L²)` is intrinsic to scoring every key from every query; removing
+it needs a blocked/hierarchical selector, not a better tiling.
+
 | | batched | varlen |
 |---|---|---|
 | entry point | `triton_sparse_gqa_attention` | `triton_sparse_gqa_attention_varlen` |
@@ -790,18 +839,26 @@ this implementation. The QK GEMM is therefore bandwidth-bound on the gather, whi
 regime that makes the approach worthwhile — but a configuration where `topk` approaches `Sk`
 will lose to a dense kernel.
 
-### `block_k` must be ≥ 16
+### `tl.dot` shape floors
 
-Triton's NVIDIA backend reports `min_dot_size = (M=1, N=1, K=16)` — only the **contraction**
-dim is constrained. Two consequences, and guessing wrong either way costs something:
+Triton's per-backend `min_dot_size` gives the `(M, N, K)` lower bounds, and it is **not** stable
+across releases: Triton 3.4+ on NVIDIA reports `(1, 1, 16)`, constraining only the contraction
+dim, while Triton 3.3 reports `(16, 16, 16)`. Two consequences, and guessing wrong either way
+costs something:
 
-- `M` needs no padding, so `BLOCK_G` rounds `group_size` to a power of two rather than to 16.
-  At `group_size=4` that is a 4× smaller fp32 accumulator and 4× fewer wasted QK lanes.
+- `M` is `BLOCK_G`, the group's query heads, and `group_size` is 4 or 8 on real GQA models —
+  below 16 either way. So the floor is *asked of the backend* at runtime by `min_dot_m()`:
+  hardcoding 1 fails to compile on Triton 3.3 (`Input shapes should have M >= 16`), and
+  hardcoding 16 quadruples the `[BLOCK_G, DV]` fp32 accumulator on every version that does not
+  need it. When there is no driver to ask, it errs high — a floor that is too large only wastes
+  padded lanes, one that is too small does not compile. Padding is correctness-neutral because
+  the extra lanes load `q` under `g_valid` and are masked out of both stores.
 - `block_k` **must** be ≥ 16, since `P @ V` contracts over it. This is validated eagerly
   because `TRITON_INTERPRET=1` does *not* apply the floor: `block_k=8` runs green on CPU and
   then fails to compile on the first GPU. `test_dot_shapes_are_legal_on_hardware` restates the
-  rule over every tile shape the launcher computes, which is what keeps an interpreter-only
-  test run honest about hardware.
+  rule over every tile shape the launcher computes, for both `M` floors, which is what keeps an
+  interpreter-only test run honest about hardware.
+
 
 ### Correctness
 
@@ -907,6 +964,29 @@ case, measured over 200 draws). That lands on `q`/`k` and the `head_dim`-long do
 amplifies it, so the score would inherit the error before its own fp32 GEMM begins. M3 builds this
 in unconditionally; Megatron exposes it as a flag. Parameter names and shapes match
 `nn.LayerNorm`, so checkpoints load unchanged.
+
+**It must not retain the upcast.** The obvious form, `layer_norm(x.to(fp32), …)`, makes autograd
+save the *widened* tensor — so a bf16 input is held at fp32 width for the whole backward. On the
+pairwise indexer that is invisible: both norms sit after `w_k`/`w_q`, so the tensor is `head_dim`
+wide. On `ScalarIndexer` it is fatal: `in_norm` is the **first** op, so it runs at full
+`hidden_size`, and the extra fp32 copy is 256 MiB per layer at `L=16384` — **4.5 GiB over 36
+layers**, which is why `sp=8` at 16K OOM'd on the scalar arm at a length the pairwise arm trains at
+comfortably. (Attention is not sharded under FFN-SP, so the indexer always sees the full `L`.)
+
+So the statistics are taken from an fp32 view without giving that view to autograd: `_Fp32LayerNorm`
+saves `x` in its own dtype plus the two `(…, 1)` statistics and recomputes the rest in its backward.
+Forward arithmetic is unchanged, and both are equally far from an fp64 reference (forward 1.560e-2,
+`d/dx` 1.558e-2, `d/dweight` 2.224e-1 — identical to three digits), so this is a pure memory win,
+not a precision trade. Measured retained bytes for `project_k` at `L=4096`, bf16:
+
+| | before | after |
+|---|---|---|
+| scalar, `mid_dim=0` | 96.1 MiB | **32.1 MiB** |
+| scalar, `mid_dim=256` | 106.1 MiB | **38.0 MiB** |
+| scalar, `mid_dim=1152` | 141.1 MiB | **59.0 MiB** |
+| pairwise | 34.0 MiB | 32.0 MiB |
+
+The residual scalar-over-pairwise gap is the `mid_dim` chain, which is intrinsic to having an MLP.
 
 ### Quantization
 

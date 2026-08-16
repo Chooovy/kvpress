@@ -21,6 +21,8 @@ The index tensor is :func:`~.sparse_support.sort_support`'s convention, so
 realistic one is wanted -- that keeps the selector and the kernel wired together under test.
 """
 
+from unittest import mock
+
 import pytest
 import torch
 
@@ -41,7 +43,13 @@ from kvpress.presses.gqa_indexer import (
 )
 
 from kvpress.presses.gqa_indexer.triton_fused_loss import block_pow2
-from kvpress.presses.gqa_indexer.triton_sparse_attention import MIN_BLOCK_K, check_block_k
+from kvpress.presses.gqa_indexer.sparse_support import TOPK_SCRATCH_BUDGET, topk_tiles
+from kvpress.presses.gqa_indexer.triton_sparse_attention import (
+    MIN_BLOCK_K,
+    _FALLBACK_MIN_DOT_M,
+    check_block_k,
+    min_dot_m,
+)
 
 requires_triton = pytest.mark.skipif(
     not HAS_TRITON or not (torch.cuda.is_available() or triton_interpret_enabled()),
@@ -280,6 +288,46 @@ def test_kernel_causal_flag_masks_future_keys():
 
 
 @requires_triton
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_tf32_costs_nothing_on_low_precision_inputs(dtype):
+    """
+    ``precision="tf32"`` must match ``"ieee"`` for bf16/fp16 inputs, which is why inference
+    defaults to it.
+
+    The claim is arithmetic, not empirical luck: tf32 keeps 10 mantissa bits and bf16 keeps 8,
+    so every bf16 operand the kernel loads is *exactly* representable after the fp32 upcast and
+    the QK dot is bit-identical. Only the PV dot has a genuine fp32 operand (the softmax
+    weights), and rounding those to 10 bits costs ~2e-4 relative -- well under the bf16 epsilon
+    (7.8e-3) the output is stored at.
+
+    This matters because ``"ieee"`` fp32 does not use tensor cores, which made ``BLOCK_G``'s
+    Triton-3.3 padding cost a measured 7x per prefill (67.0 s against 9.4 s at ``L=8192,
+    topk=2048`` on an H20). If this test ever fails, the inference default in
+    :class:`~.sparse_inference.SparseAttentionContext` needs revisiting -- not silencing.
+    """
+    q, k, v, indices = make_case(dim=64, dim_v=64, topk=32, k_len=64)
+    q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
+
+    ieee = triton_sparse_gqa_attention(q, k, v, indices, block_k=16, precision="ieee")
+    tf32 = triton_sparse_gqa_attention(q, k, v, indices, block_k=16, precision="tf32")
+    reference = sparse_gqa_attention_reference(q.float(), k.float(), v.float(), indices)
+
+    # Against each other: the same store-rounding error, so they agree far tighter than the
+    # dtype's own epsilon.
+    eps = torch.finfo(dtype).eps
+    assert (ieee[0].float() - tf32[0].float()).abs().max() <= eps, (
+        "tf32 diverged from ieee by more than one output ULP"
+    )
+    # And against the fp32 reference: neither is *worse*, which is the claim that licenses the
+    # default. Compared as a ratio so the assertion does not encode a hardware-specific number.
+    err_ieee = (ieee[0].float() - reference[0]).abs().max().item()
+    err_tf32 = (tf32[0].float() - reference[0]).abs().max().item()
+    assert err_tf32 <= max(err_ieee * 1.5, eps), (
+        f"tf32 error {err_tf32:.2e} materially exceeds ieee's {err_ieee:.2e}"
+    )
+
+
+@requires_triton
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_kernel_dtypes(dtype):
     """
@@ -514,23 +562,29 @@ def test_kernel_survives_many_rescaling_tiles():
 @pytest.mark.parametrize("group_size", [1, 2, 4, 8, 16, 32])
 @pytest.mark.parametrize("dim,dim_v", [(8, 8), (16, 16), (16, 8), (24, 24), (16, 12), (64, 64), (128, 128)])
 @pytest.mark.parametrize("block_k", [16, 32, 64, 128])
-def test_dot_shapes_are_legal_on_hardware(group_size, dim, dim_v, block_k):
+@pytest.mark.parametrize("m_min", [1, 16])
+def test_dot_shapes_are_legal_on_hardware(group_size, dim, dim_v, block_k, m_min):
     """
-    Every ``tl.dot`` this kernel emits must satisfy NVIDIA's ``min_dot_size`` of ``(1, 1, 16)``.
+    Every ``tl.dot`` this kernel emits must satisfy the backend's ``min_dot_size``.
 
     This exists because the whole suite can run under ``TRITON_INTERPRET=1``, which does *not*
     apply the shape floors -- so an illegal tile would be green here and fail to compile on the
     first GPU. Rather than trust that, the rule is restated over the tile shapes the launcher
     actually computes.
 
-    Both dots are covered, and the binding constraint differs between them: ``Q @ K^T``
-    contracts over the padded head dim (safe because ``block_pow2`` floors it at 16, which this
-    test is what pins down), while ``P @ V`` contracts over ``block_k`` (safe because
+    ``m_min`` is parametrized rather than fixed because Triton's answer is version-dependent:
+    3.3 requires ``M >= 16`` on NVIDIA and 3.4+ allows ``M = 1``. Pinning it at 1 is what let a
+    ``BLOCK_G`` of 4 pass here and then fail to compile on Triton 3.3, so both floors are
+    checked against the same expression the launcher uses.
+
+    The other two dots' binding constraints differ: ``Q @ K^T`` contracts over the padded head
+    dim (safe because ``block_pow2`` floors it at 16, which this test is what pins down), while
+    ``P @ V`` contracts over ``block_k`` (safe because
     :func:`~.triton_sparse_attention.check_block_k` rejects anything below 16).
     """
-    block_g = block_pow2(group_size, minimum=1)
+    block_g = block_pow2(group_size, minimum=m_min)
     block_d, block_dv = block_pow2(dim), block_pow2(dim_v)
-    m_min, n_min, k_min = 1, 1, 16  # triton/backends/nvidia/compiler.py::min_dot_size, non-fp8
+    n_min, k_min = 1, 16  # triton/backends/nvidia/compiler.py::min_dot_size, non-fp8
 
     # Q @ K^T : [BLOCK_G, BLOCK_D] @ [BLOCK_D, BLOCK_K]
     assert block_g >= m_min and block_k >= n_min and block_d >= k_min, (
@@ -550,6 +604,150 @@ def test_min_block_k_matches_the_hardware_floor():
             check_block_k(illegal)
     for legal in (16, 32, 64, 128):
         check_block_k(legal)
+
+
+# ----------------------------------------------------------------------------------------
+# Top-k tiling (the selection cost model)
+# ----------------------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "take,k_len,q_len",
+    [(1980, 16384, 16384), (1980, 8192, 8192), (32, 16384, 16384), (8192, 16384, 16384),
+     (5, 40, 9), (1, 1, 1), (2048, 65536, 65536)],
+)
+def test_topk_tiles_bound_redundancy_and_scratch(take, k_len, q_len):
+    """
+    The chosen tiling must cap redundant work *and* stay inside the scratch budget.
+
+    Both halves matter and pull opposite ways. The running buffer is re-sorted against every key
+    tile, so work carries ``(1 + take / key_tile)`` -- the old fixed ``key_tile = 512`` meant
+    4.87x at ``take = 1980``, which measured as 89% of a 16K prefill. Raising ``key_tile`` fixes
+    that but grows ``query_tile * (take + key_tile)`` scratch, so the budget is the counterweight.
+    """
+    key_tile, query_tile = topk_tiles(take, k_len, q_len)
+
+    assert 1 <= key_tile <= max(k_len, 1) and 1 <= query_tile <= max(q_len, 1), (
+        f"tiles {(key_tile, query_tile)} escape the real extents {(k_len, q_len)}"
+    )
+    # Redundancy: at most ~1.5x whenever the sequence is long enough to allow it.
+    if key_tile < k_len:
+        assert 1 + take / key_tile <= 2.0, (
+            f"key_tile={key_tile} leaves {1 + take / key_tile:.2f}x redundancy at take={take}"
+        )
+    # Scratch: within budget, unless a single query row already exceeds it (then nothing can).
+    scratch = query_tile * (take + key_tile)
+    assert scratch <= max(TOPK_SCRATCH_BUDGET, take + key_tile) * 1.05, (
+        f"scratch {scratch} exceeds the {TOPK_SCRATCH_BUDGET} budget"
+    )
+
+
+def test_topk_tiles_matches_the_measured_optimum():
+    """
+    The eval's configuration must land on the tiling that was actually measured fastest.
+
+    ``topk=2048`` with 68 forced slots gives ``take=1980``, where an H20 at ``L=16384`` measured
+    selection at 26.7 s (``key_tile=512``), 9.2 s (2048) and 6.5 s (4096). Pinning 4096 here is
+    what stops a future "tidy up the heuristic" from quietly walking back a 4.1x.
+    """
+    key_tile, _ = topk_tiles(take=1980, k_len=16384, q_len=16384)
+    assert key_tile == 4096, f"expected the measured optimum 4096, got {key_tile}"
+
+
+@pytest.mark.parametrize("topk,force_sink,force_local", [(12, 2, 3), (64, 4, 16), (17, 0, 0)])
+def test_tiling_never_changes_the_selected_support(topk, force_sink, force_local):
+    """
+    Tiling is an implementation detail: every ``(key_tile, query_tile)`` must select identically.
+
+    This is what licenses tuning the default for speed at all. The tiles interact with the forced
+    slots (which are per query tile) and with the running buffer (per key tile), so an off-by-one
+    in either loop would show up as a *different* support rather than as an error.
+    """
+    torch.manual_seed(0)
+    bsz, n_heads, q_len, k_len, dim = 2, 2, 37, 53, 16
+    q_idx = torch.randn(bsz, n_heads, q_len, dim, device=device())
+    k_idx = torch.randn(bsz, k_len, dim, device=device())
+
+    reference = None
+    for key_tile in (16, 64, 512, 4096, None):
+        for query_tile in (8, 64, 512, None):
+            support, valid = streaming_topk_support(
+                q_idx, k_idx, topk, force_sink=force_sink, force_local=force_local,
+                key_tile=key_tile, query_tile=query_tile,
+            )
+            assert torch.equal(valid, support >= 0)
+            if reference is None:
+                reference = support
+            else:
+                assert torch.equal(support, reference), (
+                    f"key_tile={key_tile}, query_tile={query_tile} changed the support"
+                )
+
+
+def test_tiling_rejects_nonpositive_overrides():
+    """An explicit 0 or negative tile is a caller bug, not a request for the default."""
+    q_idx = torch.randn(1, 1, 4, 8)
+    k_idx = torch.randn(1, 8, 8)
+    for kwargs in ({"key_tile": 0}, {"query_tile": -1}):
+        with pytest.raises(ValueError, match="tile sizes must be positive"):
+            streaming_topk_support(q_idx, k_idx, 4, **kwargs)
+
+
+def test_min_dot_m_is_a_usable_floor():
+    """
+    The probed ``M`` floor must be a power of two that ``block_pow2`` can floor at.
+
+    Deliberately does not assert a *value*: the correct answer is 1 on Triton 3.4+ and 16 on
+    3.3, and hardcoding either is the bug this replaced. What has to hold on every version is
+    that the result is usable as a block size and errs high when it cannot be determined.
+    """
+    m = min_dot_m()
+    assert m >= 1 and not (m & (m - 1)), f"min_dot_m returned {m}, not a power of two"
+    assert m <= _FALLBACK_MIN_DOT_M, f"min_dot_m returned {m}, above the conservative fallback"
+
+
+def test_min_dot_m_falls_back_when_the_backend_cannot_be_asked():
+    """
+    An unreachable backend must yield the conservative floor, not an exception.
+
+    The fallback direction is what matters: too high only wastes padded lanes, while too low
+    fails to compile. Simulated by pointing the probe at a driver that raises, which is what a
+    machine with no GPU actually does.
+    """
+    min_dot_m.cache_clear()
+    try:
+        with mock.patch("triton.runtime.driver") as driver:
+            type(driver).active = mock.PropertyMock(side_effect=RuntimeError("0 active drivers"))
+            assert min_dot_m() == _FALLBACK_MIN_DOT_M
+    finally:
+        min_dot_m.cache_clear()
+
+
+@pytest.mark.parametrize("reported,expected", [((1, 1, 16), 1), ((16, 16, 16), 16)])
+def test_min_dot_m_reads_the_backend_rather_than_guessing(reported, expected):
+    """
+    The probe must return what the backend reports, for both answers Triton has given.
+
+    Without this the fallback would mask a broken probe: a machine with no GPU returns 16 from
+    the ``except`` branch, which is also 3.3's correct answer, so a probe that never worked at
+    all would look right. Driving a stubbed ``min_dot_size`` through the real code path is what
+    separates "read the backend" from "returned the fallback".
+
+    Both the driver and the backend are stubbed because the probe needs a target before it can
+    ask for a floor, and a machine with no GPU (or the interpreter) has no active driver.
+    """
+    pytest.importorskip("triton")
+    min_dot_m.cache_clear()
+    try:
+        with (
+            mock.patch("triton.runtime.driver") as driver,
+            mock.patch("triton.compiler.compiler.make_backend") as make_backend,
+        ):
+            driver.active.get_current_target.return_value = object()
+            make_backend.return_value.get_codegen_implementation.return_value = {
+                "min_dot_size": lambda lhs, rhs: reported
+            }
+            assert min_dot_m() == expected
+    finally:
+        min_dot_m.cache_clear()
 
 
 # ----------------------------------------------------------------------------------------

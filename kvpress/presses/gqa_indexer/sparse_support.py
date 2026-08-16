@@ -151,6 +151,42 @@ def sort_support(support: torch.Tensor, k_len: int) -> tuple[torch.Tensor, torch
     return support.to(torch.int32), valid
 
 
+#: Scratch budget for the running top-k, in candidate elements per ``(batch, head)``. The
+#: default tiling is derived from this rather than fixed, so ``key_tile`` grows with ``take``
+#: instead of leaving a constant 512 to be re-sorted against a much larger buffer. 2M elements
+#: is ~1.3 M candidates at ``topk=2048``, which is what the previous ``(512, 512)`` default
+#: already used -- so the adaptive default is not a memory regression, it just spends the same
+#: scratch on a shape that does less redundant work.
+TOPK_SCRATCH_BUDGET = 2_000_000
+
+
+def topk_tiles(take: int, k_len: int, q_len: int, budget: int = TOPK_SCRATCH_BUDGET) -> tuple[int, int]:
+    """
+    Choose ``(key_tile, query_tile)`` for the running top-k.
+
+    The running buffer is re-sorted against every key tile, so total work is
+    ``Sq * Sk * (1 + take / key_tile)`` -- note that ``query_tile`` **cancels**. It costs
+    scratch, not work. That asymmetry is the whole basis of this function: push ``key_tile`` up
+    to shrink the ``take / key_tile`` redundancy, and pay for the resulting
+    ``query_tile * (take + key_tile)`` scratch by pushing ``query_tile`` down, which is free.
+
+    A fixed ``key_tile = 512`` against ``take = 1980`` carries a 4.87x redundancy factor;
+    measured on an H20 at ``L=16384``, raising it to 4096 cut selection from 26.7 s to 6.5 s
+    (4.1x, slightly better than the 3.3x the work model predicts, since fewer and larger calls
+    also amortize per-call overhead). ``key_tile`` is therefore sized at ~2x ``take``, putting
+    redundancy at ~1.5x: past that the curve is flat (4096 -> 8192 was predicted to buy only
+    another 1.2x) while scratch keeps growing, so it is the knee rather than the extreme.
+
+    Returns tiles that are capped at the real extents, so short sequences do not allocate for
+    length they do not have.
+    """
+    take = max(1, int(take))
+    # Round 2*take up to a power of two: ~1.5x redundancy, which measurement put at the knee.
+    key_tile = min(max(512, 1 << (2 * take - 1).bit_length()), max(k_len, 1))
+    query_tile = min(max(32, budget // max(take + key_tile, 1)), max(q_len, 1))
+    return key_tile, query_tile
+
+
 @torch.no_grad()
 def streaming_topk_support(
     q_idx: torch.Tensor,
@@ -161,8 +197,8 @@ def streaming_topk_support(
     query_offset: int | None = None,
     force_sink: int = 0,
     force_local: int = 0,
-    key_tile: int = 512,
-    query_tile: int = 512,
+    key_tile: int | None = None,
+    query_tile: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Pick each query row's top-``topk`` keys without materializing the score matrix.
@@ -183,8 +219,10 @@ def streaming_topk_support(
         Defaults to ``Sk - Sq`` (bottom-right alignment).
     force_sink, force_local : int
         Slots reserved for the leading and most-recent keys.
-    key_tile, query_tile : int
-        Tile sizes; peak scratch is ``O(query_tile * key_tile)``.
+    key_tile, query_tile : int, optional
+        Tile sizes; peak scratch is ``O(query_tile * (take + key_tile))``. Both default to
+        :func:`topk_tiles`, which sizes ``key_tile`` against ``take`` -- a constant ``key_tile``
+        makes the running buffer dominate the sort as ``topk`` grows. Pass them to override.
 
     Returns
     -------
@@ -197,7 +235,7 @@ def streaming_topk_support(
         raise ValueError(f"q_idx must be (B, h, Sq, D), got {tuple(q_idx.shape)}")
     if k_idx.dim() != 3:
         raise ValueError(f"k_idx must be (B, Sk, D), got {tuple(k_idx.shape)}")
-    if key_tile <= 0 or query_tile <= 0:
+    if (key_tile is not None and key_tile <= 0) or (query_tile is not None and query_tile <= 0):
         raise ValueError(f"tile sizes must be positive, got key_tile={key_tile}, query_tile={query_tile}")
 
     bsz, n_heads, q_len, _ = q_idx.shape
@@ -214,6 +252,14 @@ def streaming_topk_support(
             "would be silently truncated. Lower them, or raise topk / keep_ratio."
         )
     take = topk - n_forced
+
+    # Resolved here rather than in the signature because the useful tiling depends on `take`,
+    # which is only known after topk has been clamped to k_len.
+    default_key_tile, default_query_tile = topk_tiles(take, k_len, q_len)
+    if key_tile is None:
+        key_tile = default_key_tile
+    if query_tile is None:
+        query_tile = default_query_tile
 
     support = torch.full((bsz, n_heads, q_len, topk), -1, dtype=torch.long, device=device)
     k_index_all = torch.arange(k_len, device=device)

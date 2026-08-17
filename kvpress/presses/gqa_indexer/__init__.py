@@ -188,6 +188,11 @@ from kvpress.presses.gqa_indexer.train import (
     indexer_state_dict,
     load_indexer_state_dict,
 )
+from kvpress.presses.gqa_indexer.train import (
+    detect_scorer,
+    detect_scorer_from_keys,
+    infer_scalar_mid_dim,
+)
 from kvpress.presses.gqa_indexer.triton_fused_loss import (
     HAS_TRITON,
     decompose_mask,
@@ -248,6 +253,9 @@ __all__ = [
     "indexer_layer_loss",
     "indexer_state_dict",
     "load_indexer_state_dict",
+    "detect_scorer",
+    "detect_scorer_from_keys",
+    "infer_scalar_mid_dim",
     "fused_indexer_ce_rows",
     "fused_indexer_loss",
     "accumulation_dtype",

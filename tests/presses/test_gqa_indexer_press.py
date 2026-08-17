@@ -34,6 +34,11 @@ from kvpress.presses.gqa_indexer import (
     slice_rope_tables,
 )
 from kvpress.presses.gqa_indexer.indexer import MASK_NEG, apply_rotary, rotate_half
+from kvpress.presses.gqa_indexer.train import (
+    detect_scorer,
+    detect_scorer_from_keys,
+    infer_scalar_mid_dim,
+)
 from tests.fixtures import unit_test_model, unit_test_model_output_attention  # noqa: F401
 
 
@@ -706,6 +711,154 @@ def test_indexer_state_dict_roundtrip(unit_test_model):  # noqa: F811
 def test_load_indexer_state_dict_rejects_unrelated_dict(unit_test_model):  # noqa: F811
     with pytest.raises(ValueError, match="no 'indexer' keys"):
         load_indexer_state_dict(unit_test_model, {"model.embed_tokens.weight": torch.zeros(1)})
+
+
+# ----------------------------------------------------------------------------------------
+# Which scorer wrote a checkpoint
+# ----------------------------------------------------------------------------------------
+def test_detect_scorer_from_keys_separates_the_two_scorers():
+    """
+    The two scorers share only the ``indexer.`` prefix, so weight names identify them.
+
+    ``in_norm``/``w_out`` are the scalar discriminators rather than ``w_in``/``mid_norm``, because
+    the ``mid_dim=0`` linear ablation has no ``w_in`` at all -- keying on that would read the
+    ablation as pairwise and then fail to load it.
+    """
+    scalar = {
+        "m.0.self_attn.indexer.in_norm.weight": None,
+        "m.0.self_attn.indexer.w_out.weight": None,
+    }
+    linear_scalar = dict(scalar)  # mid_dim=0: no w_in, no mid_norm
+    pairwise = {
+        "m.0.self_attn.indexer.w_q.weight": None,
+        "m.0.self_attn.indexer.k_norm.weight": None,
+    }
+    assert detect_scorer_from_keys(scalar) == "scalar"
+    assert detect_scorer_from_keys(linear_scalar) == "scalar"
+    assert detect_scorer_from_keys(pairwise) == "pairwise"
+    # gate_scale is common to both, so it settles nothing -- None, not a guess.
+    assert detect_scorer_from_keys({"m.0.self_attn.indexer.gate_scale": None}) is None
+    assert detect_scorer_from_keys({**scalar, **pairwise}) is None
+
+
+def test_detect_scorer_prefers_the_recorded_config():
+    """
+    ``config["scorer"]`` is what the trainer actually ran, so it wins over inference.
+
+    Checkpoints written before the field existed have to fall back to the weights, which is why
+    both paths are exercised here rather than only the modern one.
+    """
+    scalar_keys = {"m.0.self_attn.indexer.in_norm.weight": None}
+    pairwise_keys = {"m.0.self_attn.indexer.w_q.weight": None}
+
+    assert detect_scorer(scalar_keys, {"scorer": "scalar"}) == "scalar"
+    assert detect_scorer(pairwise_keys, {"scorer": "pairwise"}) == "pairwise"
+    # No config: infer from the weights.
+    assert detect_scorer(scalar_keys, None) == "scalar"
+    assert detect_scorer(pairwise_keys, {}) == "pairwise"
+
+    with pytest.raises(ValueError, match="unknown scorer"):
+        detect_scorer(scalar_keys, {"scorer": "nonsense"})
+    with pytest.raises(ValueError, match="cannot tell which scorer"):
+        detect_scorer({"m.0.self_attn.indexer.gate_scale": None}, {})
+
+
+def test_infer_scalar_mid_dim_reads_the_weight_shape():
+    """
+    ``mid_dim`` comes from ``w_in``'s shape, since that is the value that must load.
+
+    Absent ``w_in`` is the ``mid_dim=0`` linear form -- a real configuration, not a missing key --
+    so it returns 0 rather than raising. A config claiming otherwise is a contradiction and does.
+    """
+    assert infer_scalar_mid_dim({"m.0.self_attn.indexer.w_in.weight": torch.zeros(256, 4096)}) == 256
+    assert infer_scalar_mid_dim({"m.0.self_attn.indexer.w_in.weight": torch.zeros(1152, 4096)}) == 1152
+    # The shape wins over a disagreeing config, because only the shape can load.
+    assert infer_scalar_mid_dim(
+        {"m.0.self_attn.indexer.w_in.weight": torch.zeros(256, 4096)}, {"scalar_mid_dim": 999}
+    ) == 256
+    assert infer_scalar_mid_dim({"m.0.self_attn.indexer.w_out.weight": torch.zeros(8, 4096)}) == 0
+    with pytest.raises(ValueError, match="holds no w_in"):
+        infer_scalar_mid_dim(
+            {"m.0.self_attn.indexer.w_out.weight": torch.zeros(8, 4096)}, {"scalar_mid_dim": 256}
+        )
+
+
+@pytest.fixture
+def restores_pairwise_indexer(unit_test_model):  # noqa: F811
+    """
+    Put a default pairwise indexer back on the shared model afterwards.
+
+    ``unit_test_model`` is session-scoped, so a test that attaches a *scalar* indexer leaves it
+    there for everything that follows -- and a scalar indexer reports ``rope_dim == 0``, which
+    silently breaks any later test asserting the fixture wants RoPE. Tests that swap the scorer
+    take this fixture so the leak cannot happen.
+    """
+    yield
+    GQAIndexerPress(compression_ratio=0.5).post_init_from_model(unit_test_model, force_reinit=True)
+
+
+@pytest.mark.parametrize("mid_dim", [0, 32])
+def test_scalar_checkpoint_round_trips_through_the_detected_scorer(
+    unit_test_model, restores_pairwise_indexer, mid_dim
+):  # noqa: F811
+    """
+    Detect -> build -> load must work for a scalar checkpoint, both MLP and linear forms.
+
+    This is the end-to-end version of the bug: the sparse eval built a pairwise indexer for every
+    checkpoint, so a scalar one failed with "216 indexer keys are absent from the model" -- one per
+    layer per scalar-only parameter. Detecting the scorer first is what makes the load succeed.
+
+    ``force_reinit`` is used throughout because the model fixture is session-scoped: the press has
+    to be able to replace whatever a previous test attached, or the geometry check rejects it.
+    """
+    press = GQAIndexerPress(
+        compression_ratio=0.0, gate_scale=True, scorer="scalar", scalar_mid_dim=mid_dim
+    )
+    press.post_init_from_model(unit_test_model, force_reinit=True)
+    saved = {k: v.clone() for k, v in indexer_state_dict(unit_test_model).items()}
+
+    # What the eval now does: read the scorer and mid_dim off the checkpoint.
+    assert detect_scorer(saved, {"scorer": "scalar"}) == "scalar"
+    assert detect_scorer(saved, None) == "scalar", "weight names alone must also identify it"
+    assert infer_scalar_mid_dim(saved) == mid_dim
+
+    # Perturb, then load the saved weights back through a freshly built scalar indexer.
+    module = get_attention_modules(unit_test_model)[0]
+    with torch.no_grad():
+        press.get_indexer(module).w_out.weight.add_(1.0)
+    rebuilt = GQAIndexerPress(
+        compression_ratio=0.0,
+        gate_scale=True,
+        scorer=detect_scorer(saved, None),
+        scalar_mid_dim=infer_scalar_mid_dim(saved),
+    )
+    rebuilt.post_init_from_model(unit_test_model, force_reinit=True)
+    load_indexer_state_dict(unit_test_model, saved)
+
+    for name, tensor in rebuilt.get_indexer(module).state_dict().items():
+        key = next(k for k in saved if k.endswith(f"layers.0.self_attn.indexer.{name}"))
+        torch.testing.assert_close(tensor.cpu(), saved[key].cpu())
+
+
+def test_scorer_mismatch_error_names_the_scorer(unit_test_model, restores_pairwise_indexer):  # noqa: F811
+    """
+    A wrong scorer must say *which* scorer, not just that keys are missing.
+
+    The raw message ("216 indexer keys are absent … Did the indexer geometry change?") is accurate
+    and unactionable: the geometry did not change, the scorer did. Since the two scorers share the
+    parameter prefix, every key is reported absent, which buries the cause.
+    """
+    scalar_press = GQAIndexerPress(
+        compression_ratio=0.0, gate_scale=True, scorer="scalar", scalar_mid_dim=32
+    )
+    scalar_press.post_init_from_model(unit_test_model, force_reinit=True)
+    scalar_sd = {k: v.clone() for k, v in indexer_state_dict(unit_test_model).items()}
+
+    GQAIndexerPress(compression_ratio=0.0, gate_scale=True).post_init_from_model(
+        unit_test_model, force_reinit=True
+    )
+    with pytest.raises(ValueError, match=r"holds a 'scalar' indexer .* built with a 'pairwise'"):
+        load_indexer_state_dict(unit_test_model, scalar_sd)
 
 
 def test_compute_indexer_loss_over_all_layers(unit_test_model_output_attention):  # noqa: F811

@@ -387,9 +387,92 @@ def load_indexer_state_dict(model: nn.Module, state_dict: dict, scorer_attr: str
     model_keys = set(model.state_dict().keys())
     missing = [k for k in filtered if k not in model_keys]
     if missing:
+        # A scorer mismatch is by far the most common cause and the least obvious from the raw
+        # key list: the two scorers share the parameter *prefix* and agree on no weight names, so
+        # every key is reported absent. Name it when the evidence is there rather than leaving
+        # "did the geometry change?" to be decoded.
+        hint = ""
+        wanted = detect_scorer_from_keys(filtered)
+        present = detect_scorer_from_keys({k: None for k in model_keys})
+        if wanted and present and wanted != present:
+            hint = (
+                f" The checkpoint holds a {wanted!r} indexer but the model was built with a "
+                f"{present!r} one -- pass scorer={wanted!r} when constructing the press."
+            )
         raise ValueError(
             f"{len(missing)} indexer keys are absent from the model "
-            f"(e.g. {missing[:3]}). Did the indexer geometry change?"
+            f"(e.g. {missing[:3]}). Did the indexer geometry change?{hint}"
         )
     model.load_state_dict(filtered, strict=False)
     logger.info("Loaded %d %s tensors", len(filtered), scorer_attr)
+
+
+#: Parameters only a scalar indexer has. ``in_norm``/``w_out`` rather than ``w_in``/``mid_norm``
+#: because the ``mid_dim=0`` linear ablation drops the latter, and would then read as pairwise.
+_SCALAR_ONLY_SUFFIXES = ("in_norm.weight", "in_norm.bias", "w_out.weight")
+#: Parameters only a pairwise indexer has.
+_PAIRWISE_ONLY_SUFFIXES = ("w_q.weight", "w_k.weight", "q_norm.weight", "k_norm.weight")
+
+
+def detect_scorer_from_keys(state_dict) -> str | None:
+    """
+    Which scorer these parameter names belong to, or ``None`` if they do not say.
+
+    The two scorers share only the ``indexer.`` prefix: a pairwise one has ``w_q``/``w_k``, a
+    scalar one has ``in_norm``/``w_out``. Returns ``None`` rather than guessing when both or
+    neither appear, so callers can fall back to a recorded config or ask the user.
+    """
+    names = [str(k) for k in state_dict]
+    is_scalar = any(n.endswith(_SCALAR_ONLY_SUFFIXES) for n in names)
+    is_pairwise = any(n.endswith(_PAIRWISE_ONLY_SUFFIXES) for n in names)
+    if is_scalar and not is_pairwise:
+        return "scalar"
+    if is_pairwise and not is_scalar:
+        return "pairwise"
+    return None
+
+
+def detect_scorer(state_dict, config: dict | None = None) -> str:
+    """
+    Which scorer wrote a checkpoint: ``"pairwise"`` or ``"scalar"``.
+
+    ``config["scorer"]`` is authoritative when present -- that is what the trainer actually ran.
+    Checkpoints written before the field existed fall back to
+    :func:`detect_scorer_from_keys`. Raises rather than guessing when neither settles it, since
+    building the wrong scorer either fails on every key or, worse, half-loads.
+    """
+    recorded = (config or {}).get("scorer")
+    if recorded in ("pairwise", "scalar"):
+        return recorded
+    if recorded is not None:
+        raise ValueError(f"checkpoint records an unknown scorer {recorded!r}")
+
+    detected = detect_scorer_from_keys(state_dict)
+    if detected is not None:
+        return detected
+    names = [str(k) for k in state_dict][:4]
+    raise ValueError(
+        "cannot tell which scorer wrote this checkpoint: it records no config['scorer'] and its "
+        f"weight names identify neither scorer unambiguously (e.g. {names}). Pass the scorer "
+        "explicitly."
+    )
+
+
+def infer_scalar_mid_dim(state_dict, config: dict | None = None) -> int:
+    """
+    A scalar indexer's ``mid_dim``, taken from ``w_in``'s shape.
+
+    Read from the weights rather than the config because it *is* a parameter shape: if the two
+    ever disagree, only the shape can load. No ``w_in`` means the ``mid_dim=0`` linear form
+    (SparseK's plain score), which is a real configuration rather than a missing key.
+    """
+    for name, tensor in state_dict.items():
+        if str(name).endswith("w_in.weight"):
+            return int(tensor.shape[0])
+    recorded = (config or {}).get("scalar_mid_dim")
+    if recorded not in (None, 0):
+        raise ValueError(
+            f"checkpoint records scalar_mid_dim={recorded} but holds no w_in weights, so it was "
+            "written by the mid_dim=0 linear form; the two disagree."
+        )
+    return 0

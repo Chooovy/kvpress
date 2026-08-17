@@ -54,6 +54,7 @@ from kvpress import (  # noqa: E402
     SparseAttentionContext,
     load_indexer_state_dict,
 )
+from kvpress.presses.gqa_indexer.train import detect_scorer, infer_scalar_mid_dim  # noqa: E402
 from kvpress.pipeline import KVPressTextGenerationPipeline  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,16 @@ class SparseEvaluationConfig:
     head_dim: Optional[int] = None
     rope_dim: Optional[int] = None
 
+    # Which scorer the checkpoint holds. None (default) reads it from the checkpoint -- its
+    # recorded config when present, otherwise its weight names, which are disjoint between the
+    # two scorers. Set it only to override that detection.
+    scorer: Optional[str] = None
+    # Scalar-scorer recency tilt. None takes the checkpoint's recorded value. Worth overriding
+    # only for a checkpoint written before the field existed: pos_slope is added to the score
+    # and never stored as a parameter, so a mismatch cannot be caught by weight loading.
+    # mid_dim is deliberately absent -- it is w_in's shape, so it is read from the weights.
+    scalar_pos_slope: Optional[float] = None
+
     # Dataset / generation
     fraction: float = 1.0
     max_new_tokens: Optional[int] = None
@@ -114,6 +125,9 @@ class SparseEvaluationConfig:
         assert 0.0 < self.fraction <= 1.0, f"fraction must be in (0, 1], got {self.fraction}"
         assert self.precision in ("ieee", "tf32"), (
             f"precision must be 'ieee' or 'tf32', got {self.precision!r}"
+        )
+        assert self.scorer in (None, "pairwise", "scalar"), (
+            f"scorer must be None, 'pairwise' or 'scalar', got {self.scorer!r}"
         )
         assert self.force_sink + self.force_local <= self.topk, (
             f"force_sink + force_local = {self.force_sink + self.force_local} exceeds topk="
@@ -226,26 +240,64 @@ class SparseEvaluationRunner:
         model = model.to(device).eval()
         logger.info("Backbone attention: %s", model.config._attn_implementation)
 
-        # Load the indexer. gate_scale is matched to what the checkpoint holds so an e2e checkpoint
-        # (which has the parameter) and a distilled one (which does not) both load.
+        # Load the indexer. Both the scorer and gate_scale are read from the checkpoint rather
+        # than configured here: a pairwise and a scalar indexer share the parameter *prefix* but
+        # agree on no weight names, so guessing wrong fails with "216 keys are absent from the
+        # model" rather than anything that names the real problem. gate_scale is matched the same
+        # way, so an e2e checkpoint (which has it) and a distilled one (which does not) both load.
         ckpt = torch.load(cfg.indexer_ckpt, map_location="cpu", weights_only=False)
         indexer_sd = ckpt.get("indexer", ckpt)
+        ckpt_config = ckpt.get("config") or {}
         has_gate = any(str(k).endswith("gate_scale") for k in indexer_sd)
+        try:
+            scorer = cfg.scorer or detect_scorer(indexer_sd, ckpt_config)
+        except ValueError as exc:
+            raise SystemExit(f"{exc} Use --scorer pairwise or --scorer scalar.") from exc
+
+        scorer_kwargs: dict = {}
+        if scorer == "scalar":
+            # mid_dim is recoverable from w_in's shape, but pos_slope is NOT a parameter -- it is
+            # added to the score at :meth:`ScalarIndexer.score_keys` and never stored. So a wrong
+            # value here mis-scores silently, with every weight loading cleanly. Prefer the
+            # checkpoint's record, and say so when falling back to the default.
+            scorer_kwargs["scalar_mid_dim"] = infer_scalar_mid_dim(indexer_sd, ckpt_config)
+            if cfg.scalar_pos_slope is not None:
+                scorer_kwargs["scalar_pos_slope"] = cfg.scalar_pos_slope
+            elif "scalar_pos_slope" in ckpt_config:
+                scorer_kwargs["scalar_pos_slope"] = float(ckpt_config["scalar_pos_slope"])
+            else:
+                logger.warning(
+                    "checkpoint records no scalar_pos_slope; using the ScalarIndexer default. "
+                    "pos_slope is not a parameter, so a mismatch against training cannot be "
+                    "detected by weight loading -- pass --scalar_pos_slope if training set it."
+                )
+            # The scalar score has no per-head q/k geometry, and the press rejects these rather
+            # than accepting and ignoring them.
+            if cfg.head_dim is not None or cfg.rope_dim is not None:
+                raise SystemExit(
+                    "--head_dim/--rope_dim do not apply to a scalar indexer (it has no q/k pair "
+                    "to shape or rotate). Drop them."
+                )
+        else:
+            scorer_kwargs["head_dim"] = cfg.head_dim
+            scorer_kwargs["rope_dim"] = cfg.rope_dim
+
         press = GQAIndexerPress(
             compression_ratio=0.0,
             gate_scale=has_gate,
             scorer_attr="indexer",
+            scorer=scorer,
             n_heads=cfg.n_heads,
-            head_dim=cfg.head_dim,
-            rope_dim=cfg.rope_dim,
+            **scorer_kwargs,
         )
         press.post_init_from_model(model)
         load_indexer_state_dict(model, indexer_sd, "indexer")
         logger.info(
-            "Loaded indexer from %s (gate_scale=%s, ckpt config=%s)",
+            "Loaded indexer from %s (scorer=%s, gate_scale=%s, ckpt config=%s)",
             cfg.indexer_ckpt,
+            scorer,
             has_gate,
-            ckpt.get("config"),
+            ckpt_config or None,
         )
 
         pipeline = SparseGenerationPipeline(model=model, tokenizer=tokenizer, device=model.device)

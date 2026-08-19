@@ -171,3 +171,13 @@ cython_debug/
 
 # IDE
 .vscode/
+
+# Router/eviction proxy experiments (proxy_exp) and a saved article copy.
+# Kept on disk but out of git: the diagnostics are one-off scripts plus their JSON
+# outputs, and §10-§13 of the HANDOFF found six bugs in them, so the numbers should
+# not be treated as reusable results. HANDOFF.md itself is NOT ignored -- it records
+# which conclusions survived and which instrument mistakes recurred, which is the part
+# worth carrying forward.
+proxy_exp/*
+!proxy_exp/HANDOFF.md
+FlashKL_zhihu/

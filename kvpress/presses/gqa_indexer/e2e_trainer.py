@@ -25,8 +25,8 @@ Pinning is not optional
 Adding the same number to every key of a row cancels in the softmax, so a gate that is **flat
 along the key axis** does nothing and the model falls back to the frozen dense backbone -- which
 is already strong. The router can reach that point at zero cost (``qi = 0``), satisfying the LM
-loss without having learned any ranking. ``pin_mode`` exempts some keys from the gate's
-normalizer, which makes a flat gate arithmetically impossible; see
+loss without having learned any ranking. Under a positive fixed or ratio budget, ``pin_mode``
+exempts some keys from the gate's normalizer, which makes a flat gate arithmetically impossible; see
 :mod:`~kvpress.presses.gqa_indexer.gate_pin` for the mechanism and
 ``test_pin_closes_the_no_op_hole`` for the property. This is the difference between 18.8 and
 54.4 in SAS's ablation, so ``pin_mode="none"`` warns.
@@ -90,6 +90,47 @@ logger = logging.getLogger(__name__)
 STAGES = {"dense": "full", "sparse": "sparse"}
 
 
+def _sink_history_attention_mass(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    row_lse: torch.Tensor,
+    *,
+    scaling: float | None,
+    n_sink: int,
+    query_offset: int | None = None,
+) -> float | None:
+    """Mean attention probability on non-sink history, without materializing ``(Sq, Sk)``."""
+    q_len, k_len = q.shape[2], k.shape[2]
+    if query_offset is None:
+        query_offset = k_len - q_len
+    sink_count = min(n_sink, k_len)
+    if sink_count == 0:
+        return None
+
+    with torch.no_grad():
+        group_size = q.shape[1] // k.shape[1]
+        sink_key = k[:, :, :sink_count]
+        if group_size > 1:
+            sink_key = sink_key.repeat_interleave(group_size, dim=1)
+        scale = q.shape[-1] ** -0.5 if scaling is None else float(scaling)
+        sink_logits = torch.einsum(
+            "bhqd,bhsd->bhqs", q.float(), sink_key.float()
+        ) * scale
+
+        q_pos = torch.arange(q_len, device=q.device) + query_offset
+        sink_pos = torch.arange(sink_count, device=q.device)
+        visible_sink = sink_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
+        sink_mass = torch.where(
+            visible_sink, torch.exp(sink_logits - row_lse.unsqueeze(-1)), 0.0
+        ).sum(-1)
+
+        visible_keys = (q_pos + 1).clamp(max=k_len)
+        valid = visible_keys > visible_sink.sum(-1)
+        if not bool(valid.any()):
+            return None
+        return float((1.0 - sink_mass)[..., valid].mean())
+
+
 @dataclass
 class E2EIndexerTrainer:
     """
@@ -115,10 +156,10 @@ class E2EIndexerTrainer:
     force_sink, force_local : int
         Support slots reserved per row for the leading keys and the row's own most recent keys.
     pin_mode : str
-        Which keys are exempt from the gate, so that a flat gate cannot become a no-op --
-        see :mod:`~kvpress.presses.gqa_indexer.gate_pin`. Applies to the dense stage only;
-        the sparse stage needs no pin because its forward pass is already restricted to the
-        selected keys, and leaving this at its default resolves to ``"none"`` there.
+        Which keys are exempt from a positive fixed or ratio budget, so that a flat gate cannot
+        become a no-op -- see :mod:`~kvpress.presses.gqa_indexer.gate_pin`. Applies to the dense
+        stage only; the sparse stage needs no pin because its forward pass is already restricted
+        to the selected keys, and leaving this at its default resolves to ``"none"`` there.
 
         ``"self"`` mirrors SAS's always-retained current block most closely; ``"sink"`` exempts
         the leading keys instead. Both run on the fused kernel
@@ -132,6 +173,12 @@ class E2EIndexerTrainer:
         Leading keys to pin under ``sink`` / ``self+sink``. Defaults to the press's own
         ``n_sink`` when left at ``None``, so the keys the press protects at inference are the
         keys the gate exempts during training.
+    gate_budget : float
+        ``0`` uses raw history gates. A positive value fixes history's total multiplier relative
+        to unit-gated pinned keys in the dense stage.
+    gate_budget_ratio : float, optional
+        Instead fix each query row's history multiplier budget to this ratio times the number of
+        history keys visible to that row.
     key_tile : int
         Key tile for the streaming history ``logsumexp``.
     select_grad : bool
@@ -158,6 +205,8 @@ class E2EIndexerTrainer:
     # sparse -- so `stage="sparse"` needs no second flag to say what the scope already implies.
     pin_mode: str | None = None
     n_sink: int | None = None
+    gate_budget: float = 1.0
+    gate_budget_ratio: float | None = None
     key_tile: int = 1024
 
     freeze: bool = True
@@ -172,9 +221,13 @@ class E2EIndexerTrainer:
     #: attention over everything. Only populated when :attr:`measure_sparsity` is on, since it
     #: costs a second streaming pass over the keys. See :meth:`_gate_participation`.
     gate_sparsity: dict[int, float] = field(default_factory=dict)
+    #: Layer index -> actual attention probability assigned to visible, non-pinned history.
+    #: Reuses the fused forward's row log-normalizer and scores only the pinned sink keys, so
+    #: collection is ``O(Sq * n_sink)`` rather than ``O(Sq * Sk)``.
+    history_attention_mass: dict[int, float | None] = field(default_factory=dict)
     #: Compute :attr:`gate_sparsity` on this forward. The driver turns it on only for the steps
-    #: it logs -- it is a diagnostic, not part of the objective, and it allocates an (Sq, Sk)
-    #: history mask (256 MiB at 16K) that the training path deliberately avoids.
+    #: it logs. This also collects :attr:`history_attention_mass` when the fused sink-pinned
+    #: full-scope path exposes its row log-normalizer.
     measure_sparsity: bool = field(default=False)
     #: Layer index -> number of layers that actually ran, as a wiring check.
     layers_gated: int = field(default=0, init=False)
@@ -246,6 +299,7 @@ class E2EIndexerTrainer:
         """Drop the per-pass state from the previous forward."""
         self.gate_scales = {}
         self.gate_sparsity = {}
+        self.history_attention_mass = {}
         self.layers_gated = 0
         self._hidden_states.clear()
         self._kwargs.clear()
@@ -444,7 +498,10 @@ class E2EIndexerTrainer:
                     attention_mask,
                 )
 
-        out = gated_attention(
+        measure_history_mass = (
+            self.measure_sparsity and self.scope == "full" and self.gate_pin_mode == "sink"
+        )
+        attention = gated_attention(
             query,
             key,
             value,
@@ -454,6 +511,8 @@ class E2EIndexerTrainer:
             indices=indices,
             scaling=scaling,
             gate_scale=gate_scale,
+            gate_budget=self.gate_budget,
+            gate_budget_ratio=self.gate_budget_ratio,
             # The sparse scope takes its masking from `indices`; the full scope needs the
             # layer's mask, and `None` there means plain causal.
             mask=None if self.scope == "sparse" else attention_mask,
@@ -461,7 +520,15 @@ class E2EIndexerTrainer:
             pin_mode="none" if self.scope == "sparse" else self.gate_pin_mode,
             n_sink=self.sink_count,
             key_tile=self.key_tile,
+            return_row_lse=measure_history_mass,
         )
+        if measure_history_mass:
+            out, row_lse = attention
+            self.history_attention_mass[layer_idx] = self._history_attention_mass(
+                query, key, row_lse, scaling
+            )
+        else:
+            out = attention
         # The attention interface contract is (B, Sq, H, D) -- the layer reshapes to
         # (B, Sq, H*D) itself. Our ops return (B, H, Sq, D).
         return out.transpose(1, 2).contiguous()
@@ -556,10 +623,9 @@ class E2EIndexerTrainer:
         """
         Mean **participation ratio** of the gate, as a fraction of each row's history length.
 
-        What it measures. On a history key the gate is ``s_j - lse`` where ``lse`` is the
-        logsumexp of ``s`` over that row's history, so ``p_j = exp(gate_j)`` sums to exactly 1
-        over the history -- the gate is a probability distribution over keys, which is precisely
-        the "fixed budget" that pinning makes non-trivial. Its participation ratio
+        What it measures. The diagnostic normalizes each row's raw history scores as
+        ``p_j = exp(s_j - lse)`` even when ``gate_budget=0`` leaves the training gate unnormalized.
+        Its participation ratio
         ``PR = 1 / sum_j p_j^2`` is the standard effective-support size of such a distribution:
         ``PR = n`` for a flat distribution over ``n`` keys, ``PR = 1`` when one key takes
         everything. Dividing by the history length gives a scale-free number:
@@ -615,8 +681,8 @@ class E2EIndexerTrainer:
 
             # Rows with no history get lse=lse2=0 (documented in history_lse), hence PR=1 against
             # a history of 0 -- meaningless, so they are excluded rather than counted as "flat".
-            # history_mask is the SAME function the normalizer uses, so the denominator here
-            # cannot drift from what the gate actually normalized over.
+            # history_mask is the SAME function the positive-budget normalizer uses, so the
+            # diagnostic's denominator cannot drift from that objective.
             history_len = history_mask(
                 pinned, causal_keep, q_idx.shape[2], k_len, q_idx.device
             ).sum(-1)
@@ -626,9 +692,30 @@ class E2EIndexerTrainer:
             fraction = pr / history_len.clamp(min=1).to(pr.dtype)
             return float(fraction[..., valid].mean())
 
+    def _history_attention_mass(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        row_lse: torch.Tensor | None,
+        scaling: float | None,
+    ) -> float | None:
+        """Actual non-pinned attention mass for the fused, sink-pinned full-scope path."""
+        if row_lse is None or self.gate_pin_mode != "sink":
+            return None
+        return _sink_history_attention_mass(
+            q, k, row_lse, scaling=scaling, n_sink=self.sink_count
+        )
+
     def mean_gate_sparsity(self) -> float | None:
         """Mean gate participation fraction over the layers that measured it."""
         values = [v for v in self.gate_sparsity.values() if v is not None]
+        if not values:
+            return None
+        return sum(values) / len(values)
+
+    def mean_history_attention_mass(self) -> float | None:
+        """Mean actual history attention mass over layers that exposed the fused row LSE."""
+        values = [v for v in self.history_attention_mass.values() if v is not None]
         if not values:
             return None
         return sum(values) / len(values)

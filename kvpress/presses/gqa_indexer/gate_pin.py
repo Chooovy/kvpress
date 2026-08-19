@@ -284,7 +284,8 @@ def history_lse(
     pinned: torch.Tensor,
     causal_keep: torch.Tensor | None = None,
     key_tile: int = 1024,
-) -> torch.Tensor:
+    return_history_count: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     ``logsumexp`` of the gate score over each row's **history**, ``(B, h, Sq)``.
 
@@ -320,11 +321,15 @@ def history_lse(
     key_tile : int
         Keys per streaming step. A pure memory/speed knob: the result is tile-invariant, and
         retention no longer grows as the tile shrinks.
+    return_history_count : bool
+        Also return each query row's number of visible, non-pinned history keys, computed from
+        the exact same mask as the logsumexp.
 
     Returns
     -------
-    torch.Tensor
-        ``(B, h, Sq)`` in at least fp32.
+    torch.Tensor or tuple[torch.Tensor, torch.Tensor]
+        The ``(B, h, Sq)`` logsumexp in at least fp32, optionally paired with ``(Sq,)`` history
+        counts.
     """
     q_len, k_len = q_idx.shape[2], k_idx.shape[1]
     acc = accumulation_dtype(q_idx, k_idx)
@@ -334,7 +339,10 @@ def history_lse(
         if isinstance(gate_scale, torch.Tensor)
         else torch.tensor(gate_scale, device=q_idx.device, dtype=acc)
     )
-    return _HistoryLSE.apply(q_idx, k_idx, scale, history, key_tile, acc)
+    lse = _HistoryLSE.apply(q_idx, k_idx, scale, history, key_tile, acc)
+    if return_history_count:
+        return lse, history.sum(dim=-1)
+    return lse
 
 
 def gate_from_score(

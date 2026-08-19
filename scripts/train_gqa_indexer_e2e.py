@@ -26,9 +26,10 @@ Pinning is not optional
 Adding the same number to every key of a row cancels in the softmax, so a gate that is flat
 along the key axis is a **no-op**: the model falls back to the frozen dense backbone, which is
 already strong, and the LM loss is satisfied with no ranking learned. The router reaches that
-point at zero cost. ``--pin-mode`` exempts some keys from the gate's normalizer, which makes a
-flat gate arithmetically impossible. This is SAS's 18.8-vs-54.4 ablation, so ``--pin-mode none``
-is accepted (it is the honest baseline) but warns.
+point at zero cost. Under a positive fixed or ratio budget, ``--pin-mode`` exempts some keys from
+the gate's normalizer, which makes a flat gate arithmetically impossible. ``--gate-budget 0`` is
+the raw-score ablation that restores this escape route. ``--pin-mode none`` remains the unpinned
+baseline and warns.
 
 ``sink`` is the default rather than ``self``: it is query-independent, so it folds into the
 concatenated QK and stays a single SDPA call at any length, whereas ``self`` needs an
@@ -134,6 +135,8 @@ def save(
             "stage": args.stage,
             "pin_mode": args.pin_mode,
             "n_sink": args.n_sink,
+            "gate_budget": args.gate_budget,
+            "gate_budget_ratio": args.gate_budget_ratio,
             "schedule": args.schedule,
             "subsets": list(args.subsets),
             "topk": args.topk,
@@ -430,13 +433,24 @@ def main() -> int:
     )
     gate.add_argument(
         "--pin-mode", choices=list(PIN_MODES), default="sink",
-        help="keys exempt from the gate, so a flat gate cannot become a no-op. 'sink' exempts the "
-        "leading keys; 'self' exempts each query's own token, matching SAS's current block; "
-        "'none' is the un-pinned ablation and warns. All run on the fused kernel at O(L).",
+        help="keys exempt from a positive-budget gate, so a flat gate cannot become a no-op. "
+        "'sink' exempts the leading keys; 'self' exempts each query's own token, matching SAS's "
+        "current block; 'none' is the un-pinned ablation and warns. All use O(L) memory.",
     )
     gate.add_argument(
         "--n-sink", type=int, default=None,
         help="leading keys to pin (default: --press-n-sink)",
+    )
+    budget = gate.add_mutually_exclusive_group()
+    budget.add_argument(
+        "--gate-budget", type=float, default=1.0,
+        help="full-scope gate mode: 0 uses raw history scores; a positive value fixes the "
+        "history multiplier budget. The 1.0 default preserves old experiment semantics only",
+    )
+    budget.add_argument(
+        "--gate-budget-ratio", type=float, default=None,
+        help="full-scope row-wise budget mode: for each query set B_q to this ratio times the "
+        "number of visible, non-pinned history keys",
     )
     gate.add_argument(
         "--key-tile", type=int, default=1024,
@@ -687,6 +701,8 @@ def main() -> int:
         stage=args.stage,
         pin_mode=args.pin_mode,
         n_sink=args.n_sink,
+        gate_budget=args.gate_budget,
+        gate_budget_ratio=args.gate_budget_ratio,
         key_tile=args.key_tile,
         topk=args.topk or None,
         force_sink=args.force_sink,
@@ -698,10 +714,17 @@ def main() -> int:
     params = trainer.indexer_parameters(model)
     trainable = sum(p.numel() for p in params)
     total_params = sum(p.numel() for p in model.parameters())
+    budget_label = (
+        f"ratio {trainer.gate_budget_ratio:g} * N_H(q)"
+        if trainer.gate_budget_ratio is not None
+        else "raw" if trainer.gate_budget == 0
+        else f"fixed {trainer.gate_budget:g}"
+    )
     logger.info(
-        "trainable %.2fM of %.2fB parameters (%.3f%%); objective = LM loss, gate pin=%s n_sink=%d",
+        "trainable %.2fM of %.2fB parameters (%.3f%%); objective = LM loss, gate pin=%s "
+        "n_sink=%d budget=%s",
         trainable / 1e6, total_params / 1e9, 100 * trainable / total_params,
-        trainer.gate_pin_mode, trainer.sink_count,
+        trainer.gate_pin_mode, trainer.sink_count, budget_label,
     )
     if world_size > 1:
         logger.info(
@@ -828,10 +851,11 @@ def main() -> int:
             if will_log:
                 gate_scale = trainer.mean_gate_scale()
                 gate_sparsity = trainer.mean_gate_sparsity()
+                history_attention_mass = trainer.mean_history_attention_mass()
                 peak = torch.cuda.max_memory_allocated() / 1024**3
                 logger.info(
                     "step %4d/%d L=%-6d lm_loss %.4f (avg %.4f) |g| %.3f lr %.2e "
-                    "gate %.4f sparsity %s peak %.1f GiB %.1f s/step",
+                    "gate %.4f sparsity %s history_mass %s peak %.1f GiB %.1f s/step",
                     step, args.total_steps, seq_len, accumulated,
                     sum(window) / len(window), float(grad_norm),
                     lr_schedule.get_last_lr()[0],
@@ -840,6 +864,8 @@ def main() -> int:
                     # flat gate (no selectivity learned, whatever gate_scale says); falling
                     # towards 0 is the router concentrating, which is what eviction needs.
                     f"{gate_sparsity:.3f}" if gate_sparsity is not None else "off",
+                    f"{history_attention_mass:.3f}"
+                    if history_attention_mass is not None else "off",
                     peak, (time.time() - started) / (step - start_step + 1),
                 )
                 if metrics_handle:
@@ -870,7 +896,17 @@ def main() -> int:
                                 "gate_sparsity": {
                                     str(k): v for k, v in trainer.gate_sparsity.items()
                                 },
+                                # Actual attention probability on non-pinned history. This is
+                                # distinct from the gate's multiplier budget and catches a raw
+                                # gate that restores dense attention without becoming selective.
+                                "history_attention_mass_mean": history_attention_mass,
+                                "history_attention_mass": {
+                                    str(k): v
+                                    for k, v in trainer.history_attention_mass.items()
+                                },
                                 "pin_mode": trainer.gate_pin_mode,
+                                "gate_budget": trainer.gate_budget,
+                                "gate_budget_ratio": trainer.gate_budget_ratio,
                                 "peak_gib": peak,
                                 "batch_size": args.batch_size,
                                 "accum_steps": args.accum_steps,

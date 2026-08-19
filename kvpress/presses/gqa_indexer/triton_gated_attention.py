@@ -514,7 +514,8 @@ def triton_gated_attention(
     block_m: int = 64,
     block_n: int = 64,
     precision: str = "ieee",
-) -> torch.Tensor:
+    return_row_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Gated attention with the gate computed inside the tile loop, ``O(L)`` memory.
 
@@ -527,14 +528,15 @@ def triton_gated_attention(
     :func:`~.gate_pin.history_lse`; pass zeros to gate without a budget (``pin_mode="none"``,
     where the normalizer is provably inert).
 
-    Returns ``(B, H, Sq, Dv)`` in ``q``'s dtype.
+    Returns ``(B, H, Sq, Dv)`` in ``q``'s dtype. With ``return_row_lse=True``, also
+    returns the fused forward's ``(B, H, Sq)`` fp32 attention log-normalizer for diagnostics.
     """
     if not HAS_TRITON:
         raise RuntimeError("triton_gated_attention needs Triton")
-    out, _ = _GatedAttention.apply(
+    out, row_lse = _GatedAttention.apply(
         q.contiguous(), k.contiguous(), v.contiguous(),
         q_idx.contiguous(), k_idx.contiguous(), lse.contiguous(),
         gate_scale, float(scaling), int(query_offset), int(n_sink), bool(pin_self),
         int(block_m), int(block_n), precision,
     )
-    return out
+    return (out, row_lse.detach()) if return_row_lse else out

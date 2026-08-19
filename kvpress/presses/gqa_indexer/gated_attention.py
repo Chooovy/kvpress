@@ -34,10 +34,10 @@ softmax -- so the model reverts to the frozen pretrained backbone and earns a go
 no ranking learned. With a raw score that point sits at ``s = 0``, reachable from anywhere at
 zero cost. This is SAS Table 1 row (6): 18.8 against 54.4 for the pinned form.
 
-``pin_mode`` exempts some keys from the gate's normalizer, which removes the flat solution: a
-pinned key sits at ``log 1 = 0`` while history shares a total multiplier budget of 1, so history
-can never match it. See :mod:`~kvpress.presses.gqa_indexer.gate_pin` for the mechanism and which
-pins are query-dependent.
+With a positive budget, ``pin_mode`` exempts some keys from the gate's normalizer, which removes
+the flat solution: a pinned key sits at ``log 1 = 0`` while history shares a fixed total
+multiplier, so history cannot recover the raw dense gate. ``gate_budget=0`` deliberately restores
+that raw-score ablation. See :mod:`~kvpress.presses.gqa_indexer.gate_pin` for the pin geometry.
 
 ``scope="sparse"`` needs none of this: a sparse training forward removes the dense fallback
 outright, which is also why DMA / SparseK / STE never needed it.
@@ -97,6 +97,7 @@ These are different objectives, not two implementations of one -- see :func:`gat
 from __future__ import annotations
 
 import logging
+import math
 
 import torch
 
@@ -210,6 +211,37 @@ def check_gate_shapes(
     return bsz, n_heads, n_kv_heads, n_heads // n_kv_heads, q_len, k_len, idx_dim
 
 
+def _gate_lse(
+    q_idx: torch.Tensor,
+    k_idx: torch.Tensor,
+    gate_scale: torch.Tensor | float,
+    gate_budget: float,
+    gate_budget_ratio: float | None,
+    pinned: torch.Tensor,
+    causal_keep: torch.Tensor | None,
+    key_tile: int,
+) -> torch.Tensor:
+    """Return the row shift for raw, fixed-budget, or row-wise ratio-budget gating."""
+    if gate_budget_ratio is None and gate_budget == 0:
+        return torch.zeros(
+            q_idx.shape[:3], device=q_idx.device, dtype=accumulation_dtype(q_idx, k_idx)
+        )
+
+    if gate_budget_ratio is None:
+        return history_lse(
+            q_idx, k_idx, gate_scale=gate_scale, pinned=pinned, causal_keep=causal_keep,
+            key_tile=key_tile,
+        ) - math.log(gate_budget)
+
+    lse, n_history = history_lse(
+        q_idx, k_idx, gate_scale=gate_scale, pinned=pinned, causal_keep=causal_keep,
+        key_tile=key_tile, return_history_count=True,
+    )
+    budget = n_history.to(lse.dtype) * gate_budget_ratio
+    log_budget = torch.where(n_history > 0, budget.log(), torch.zeros_like(budget))
+    return lse - log_budget
+
+
 def build_concat_qk(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -285,6 +317,8 @@ def gated_attention_reference(
     *,
     scaling: float | None = None,
     gate_scale: torch.Tensor | float = 1.0,
+    gate_budget: float = 1.0,
+    gate_budget_ratio: float | None = None,
     mask: torch.Tensor | None = None,
     query_offset: int | None = None,
     pin_mode: str = "none",
@@ -312,6 +346,10 @@ def gated_attention_reference(
         Attention softmax scale; defaults to ``D ** -0.5``.
     gate_scale : torch.Tensor or float
         Multiplier on the gate. A 0-dim Parameter keeps it learnable.
+    gate_budget : float
+        ``0`` uses the raw history gate. A positive value fixes history's total multiplier.
+    gate_budget_ratio : float, optional
+        Fix each row's history budget to this ratio times its visible history length.
     mask : torch.Tensor, optional
         Additive ``(B, 1, Sq, Sk)`` mask. ``None`` applies plain causal masking.
     query_offset : int, optional
@@ -346,8 +384,8 @@ def gated_attention_reference(
     if pinned is None:
         gate = score
     else:
-        lse = history_lse(
-            q_idx, k_idx, gate_scale=gate_scale, pinned=pinned,
+        lse = _gate_lse(
+            q_idx, k_idx, gate_scale, gate_budget, gate_budget_ratio, pinned,
             causal_keep=_visible(mask, q_len, k_len, q.device, query_offset),
             key_tile=key_tile,
         )
@@ -405,6 +443,8 @@ def gated_attention_full(
     *,
     scaling: float | None = None,
     gate_scale: torch.Tensor | float = 1.0,
+    gate_budget: float = 1.0,
+    gate_budget_ratio: float | None = None,
     mask: torch.Tensor | None = None,
     dropout_p: float = 0.0,
     query_offset: int | None = None,
@@ -413,7 +453,8 @@ def gated_attention_full(
     key_tile: int = 1024,
     block_m: int = 64,
     block_n: int = 64,
-) -> torch.Tensor:
+    return_row_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """
     Stage-1 gated attention over the **full** key axis.
 
@@ -433,11 +474,21 @@ def gated_attention_full(
     that distinction is load-bearing rather than cosmetic. When ``Sq == Sk`` the two agree and
     ``is_causal`` is taken instead, keeping the fast path for the common training shape.
 
-    ``pin_mode`` other than ``"none"`` exempts some keys from the gate so a flat gate can no
-    longer be a no-op -- see :mod:`~kvpress.presses.gqa_indexer.gate_pin`. A query-independent
-    pin (``sink``) folds into one extra concatenated dimension and stays a single SDPA call; a
-    query-dependent one (``self``) cannot fold and is routed to
+    With a positive budget, ``pin_mode`` other than ``"none"`` exempts some keys from the gate so
+    a flat gate can no longer be a no-op -- see :mod:`~kvpress.presses.gqa_indexer.gate_pin`. A
+    query-independent pin (``sink``) folds into one extra concatenated dimension and stays a
+    single SDPA call; a query-dependent one (``self``) cannot fold and is routed to
     :func:`gated_attention_pinned_self`.
+
+    ``gate_budget=0`` disables history normalization and uses the raw gate score. A positive
+    value fixes the history gate mass relative to unit-gated pinned keys. Alternatively,
+    ``gate_budget_ratio`` sets each row's budget to its visible, non-pinned history length times
+    that ratio. Neither budget changes the ranking within history, and neither has an effect
+    without pinning.
+
+    ``return_row_lse`` exposes the fused kernel's attention log-normalizer for lightweight
+    diagnostics. Non-fused paths return ``None`` in its place rather than materializing an
+    attention matrix solely to reconstruct it.
     """
     _, _, _, group_size, q_len, k_len, _ = check_gate_shapes(q, k, v, q_idx, k_idx)
     check_pin_mode(pin_mode)
@@ -450,8 +501,8 @@ def gated_attention_full(
     )
     lse = None
     if pinned is not None:
-        lse = history_lse(
-            q_idx, k_idx, gate_scale=gate_scale, pinned=pinned,
+        lse = _gate_lse(
+            q_idx, k_idx, gate_scale, gate_budget, gate_budget_ratio, pinned,
             causal_keep=_visible(mask, q_len, k_len, q.device, query_offset),
             key_tile=key_tile,
         )
@@ -475,14 +526,18 @@ def gated_attention_full(
             pin_self=pins_self(pin_mode),
             block_m=block_m,
             block_n=block_n,
+            return_row_lse=return_row_lse,
         )
 
     if is_query_dependent(pin_mode):
-        return gated_attention_pinned_self(
+        out = gated_attention_pinned_self(
             q, k, v, q_idx, k_idx,
-            scaling=scale, gate_scale=gate_scale, mask=mask, query_offset=query_offset,
+            scaling=scale, gate_scale=gate_scale, gate_budget=gate_budget,
+            gate_budget_ratio=gate_budget_ratio, mask=mask,
+            query_offset=query_offset,
             pin_mode=pin_mode, n_sink=n_sink, key_tile=key_tile,
         )
+        return (out, None) if return_row_lse else out
 
     query, key = build_concat_qk(
         q, k, q_idx, k_idx, scale=scale, gate_scale=gate_scale, group_size=group_size,
@@ -513,7 +568,8 @@ def gated_attention_full(
         dropout_p=dropout_p,
         enable_gqa=group_size != 1,
     )
-    return out[..., :dim_v]
+    out = out[..., :dim_v]
+    return (out, None) if return_row_lse else out
 
 
 def gated_attention_pinned_self(
@@ -525,6 +581,8 @@ def gated_attention_pinned_self(
     *,
     scaling: float | None = None,
     gate_scale: torch.Tensor | float = 1.0,
+    gate_budget: float = 1.0,
+    gate_budget_ratio: float | None = None,
     mask: torch.Tensor | None = None,
     query_offset: int | None = None,
     pin_mode: str = "self",
@@ -566,8 +624,8 @@ def gated_attention_pinned_self(
         raise ValueError(f"gated_attention_pinned_self needs a pinning mode, got {pin_mode!r}")
 
     visible = _visible(mask, q_len, k_len, q.device, query_offset)
-    lse = history_lse(
-        q_idx, k_idx, gate_scale=gate_scale, pinned=pinned, causal_keep=visible, key_tile=key_tile
+    lse = _gate_lse(
+        q_idx, k_idx, gate_scale, gate_budget, gate_budget_ratio, pinned, visible, key_tile
     )
     score = torch.einsum("bhqd,bkd->bhqk", q_idx.to(acc), k_idx.to(acc)) * _as_acc(gate_scale, acc)
     gate = gate_from_score(score, lse, pinned)
@@ -641,13 +699,16 @@ def gated_attention(
     indices: torch.Tensor | None = None,
     scaling: float | None = None,
     gate_scale: torch.Tensor | float = 1.0,
+    gate_budget: float = 1.0,
+    gate_budget_ratio: float | None = None,
     mask: torch.Tensor | None = None,
     query_offset: int | None = None,
     dropout_p: float = 0.0,
     pin_mode: str = "none",
     n_sink: int = 0,
     key_tile: int = 1024,
-) -> torch.Tensor:
+    return_row_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """
     Dispatch to :func:`gated_attention_full` or :func:`gated_attention_sparse`.
 
@@ -659,6 +720,10 @@ def gated_attention(
     *already* restricted to the router's own top-k, so a flat gate does not recover dense
     attention and there is no no-op to block -- the same reason DMA and SparseK need no pin. The
     combination is rejected rather than silently ignored.
+
+    Gate budgets are likewise full-scope quantities: ``gate_budget=0`` selects the raw gate, a
+    positive fixed value sets history's total multiplier, and ``gate_budget_ratio`` instead sets
+    it row-wise from the visible history length.
     """
     if scope not in SCOPES:
         raise ValueError(f"scope must be one of {SCOPES}, got {scope!r}")
@@ -671,8 +736,10 @@ def gated_attention(
             )
         return gated_attention_full(
             q, k, v, q_idx, k_idx,
-            scaling=scaling, gate_scale=gate_scale, mask=mask, dropout_p=dropout_p,
+            scaling=scaling, gate_scale=gate_scale, gate_budget=gate_budget,
+            gate_budget_ratio=gate_budget_ratio, mask=mask, dropout_p=dropout_p,
             query_offset=query_offset, pin_mode=pin_mode, n_sink=n_sink, key_tile=key_tile,
+            return_row_lse=return_row_lse,
         )
 
     if indices is None:
@@ -692,10 +759,11 @@ def gated_attention(
             "attention and there is no no-op to pin against. Use pin_mode='none' here, and pin "
             "in the full-scope stage."
         )
-    return gated_attention_sparse(
+    out = gated_attention_sparse(
         q, k, v, q_idx, k_idx, indices,
         scaling=scaling, gate_scale=gate_scale, query_offset=query_offset,
     )
+    return (out, None) if return_row_lse else out
 
 
 def _expand_kv(x: torch.Tensor, group_size: int) -> torch.Tensor:

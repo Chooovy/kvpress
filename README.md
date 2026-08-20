@@ -69,13 +69,17 @@ Proxy experiments on the real model (`proxy_exp/`, summarized in `HANDOFF.md`) p
 - Two attempts to feed the router extra history (a running state, a delta-rule reconstruction
   residual) both failed against their own shuffle controls.
 
-Hence **repeat / cross-replay loss** (`kvpress/presses/gqa_indexer/kvzip_repeat_loss.md`): keep the
+Hence **repeat / cross-replay loss** (design notes:
+`kvpress/presses/gqa_indexer/cross_replay_e2e.md`, motivation:
+`query_independent_indexer_cross_replay.md`): keep the
 LM loss, change the *query distribution it is taken over*. Replay the context against its own
-first-pass KV (`C' → KV(C)` but `C' ↛ KV(C')`) under a real compression budget, so supervision
+first-pass KV (`C' → KV(C)` but `C' ↛ KV(C')`), so supervision
 goes from a causal triangle to a full cross-context rectangle and every score is trained on the
 question "how valuable is this token to a shared cache serving many unknown queries?" Unlike
 Fast-KVzip this keeps the LM loss instead of regressing a per-key label. **This is the next thing
-to build.**
+to build.** Note that KVzip's own supervision is *block-diagonal*, not a rectangle — its
+`chunk_size` bounds the materialised scoring matrix, not the replay distance
+(`cross_replay_e2e.md` §7).
 
 > ⚠️ `proxy_exp/HANDOFF.md` is kept for its record of *which conclusions survived audit and which
 > instrument mistakes recurred*, not as a source of reusable numbers — adversarial audits (§10–§13)

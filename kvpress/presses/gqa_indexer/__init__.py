@@ -36,6 +36,13 @@ Two training objectives ship, and they are alternatives rather than stages of on
 
 Both expose a full-scope stage and a top-k-scope stage under the same ``stage`` names, so the
 two objectives can be compared at matched budget.
+
+A third, for the **query-independent** scorer only:
+
+* **Cross-replay** (:mod:`~kvpress.presses.gqa_indexer.cross_replay`) keeps the LM loss but
+  changes the query distribution it is taken over: the context is replayed against its own
+  first-pass KV, so every key is supervised by every replay query rather than only by its
+  successors. Design notes in ``cross_replay_e2e.md``.
 """
 
 from kvpress.presses.gqa_indexer.aggregate import (
@@ -56,6 +63,14 @@ from kvpress.presses.gqa_indexer.autotune import (
     is_shared_memory_limit,
     pick_best,
     profile_key,
+)
+from kvpress.presses.gqa_indexer.cross_replay import (
+    CrossReplayTrainer,
+    ReadOnlyCache,
+    cross_replay_training_step,
+    gate_participation,
+    rectangle_mask,
+    shuffled_scores,
 )
 from kvpress.presses.gqa_indexer.data import (
     SUBSETS,
@@ -268,6 +283,14 @@ __all__ = [
     "E2EIndexerTrainer",
     "e2e_indexer_training_step",
     "STAGES",
+    # Cross-replay training (query-independent scorer only)
+    "CrossReplayTrainer",
+    "cross_replay_training_step",
+    "ReadOnlyCache",
+    "rectangle_mask",
+    # The two diagnostics that distinguish a trained router from a trained-looking one.
+    "gate_participation",
+    "shuffled_scores",
     "SCOPES",
     "gated_attention",
     "gated_attention_full",

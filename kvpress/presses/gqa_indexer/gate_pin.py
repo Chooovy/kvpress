@@ -60,11 +60,11 @@ the single self key, merged by their log-sum-exps. Exact, verified to 6.7e-16, a
 one extra attention call.
 
 Both modes need the history ``logsumexp``, an extra streaming pass over ``qi . ki``. It
-recomputes its tiles in the backward pass rather than retaining them, so retention is ``O(L)``
-per layer and the cost is the recompute -- see :class:`_HistoryLSE`, and note that the *first*
-implementation got this wrong in a way that OOM'd. Inside the history branch the ``-LSE`` term
-cancels as a per-row constant, so it does not need to be applied there -- it only sets the weight
-*between* the two branches.
+recomputes its score tiles in the backward pass rather than retaining them. The common
+plain-causal sink path also rebuilds its mask per tile from ``n_sink`` and ``query_offset``, so
+its retention is ``O(L)`` per layer -- see :class:`_HistoryLSE`. Inside the history branch the
+``-LSE`` term cancels as a per-row constant, so it does not need to be applied there -- it only
+sets the weight *between* the two branches.
 
 Empty history
 -------------
@@ -189,10 +189,11 @@ class _HistoryLSE(torch.autograd.Function):
 
         d(lse) / d(s_k) = softmax(s)_k = exp(s_k - lse)
 
-    so given ``lse`` the per-tile weights can be rebuilt from ``q_idx``/``k_idx`` alone. Only
+    so given ``lse`` the per-tile weights can be rebuilt from ``q_idx``/``k_idx`` alone. On the
+    plain-causal sink path, visibility is rebuilt from two integers as well, so only
     ``(q_idx, k_idx, gate_scale, lse)`` are saved -- ``O(L)`` -- and the score tiles are formed
-    twice (once per pass) instead of being kept. Measured: 2.27 MiB retained, a 13x reduction,
-    and ~3.4 GiB at the 8B/8K/36-layer configuration above.
+    twice (once per pass) instead of being kept. An explicit arbitrary mask remains an input and
+    is retained unchanged so its exact pattern is preserved.
 
     That trade is the right one here: the extra pass is one ``Di``-wide GEMM over the same tiles
     the forward already walked, against a retention that made the configuration impossible to
@@ -200,7 +201,9 @@ class _HistoryLSE(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, q_idx, k_idx, gate_scale, history, key_tile, acc):
+    def forward(
+        ctx, q_idx, k_idx, gate_scale, history, key_tile, acc, n_sink, query_offset
+    ):
         bsz, n_heads, q_len, _ = q_idx.shape
         k_len = k_idx.shape[1]
         with torch.no_grad():
@@ -208,12 +211,18 @@ class _HistoryLSE(torch.autograd.Function):
                 (bsz, n_heads, q_len), -float("inf"), device=q_idx.device, dtype=acc
             )
             run_sum = torch.zeros_like(run_max)
+            q_pos = torch.arange(q_len, device=q_idx.device).unsqueeze(-1) + query_offset
             for start in range(0, k_len, key_tile):
                 stop = min(start + key_tile, k_len)
                 logits = torch.einsum(
                     "bhqd,bkd->bhqk", q_idx.to(acc), k_idx[:, start:stop].to(acc)
                 ) * gate_scale.to(acc)
-                logits = logits.masked_fill(~history[:, start:stop], -float("inf"))
+                if history is None:
+                    k_pos = torch.arange(start, stop, device=q_idx.device).unsqueeze(0)
+                    tile_history = (k_pos >= n_sink) & (k_pos <= q_pos)
+                else:
+                    tile_history = history[:, start:stop]
+                logits = logits.masked_fill(~tile_history, -float("inf"))
                 new_max = torch.maximum(run_max, logits.amax(dim=-1))
                 # A fully masked tile leaves new_max at -inf, and exp(-inf - -inf) is NaN, so
                 # the rescale is taken as 0 there. Same guard as teacher_lse_from_qk.
@@ -237,6 +246,7 @@ class _HistoryLSE(torch.autograd.Function):
 
         ctx.save_for_backward(q_idx, k_idx, gate_scale, lse)
         ctx.history, ctx.key_tile, ctx.acc, ctx.empty = history, key_tile, acc, empty
+        ctx.n_sink, ctx.query_offset = n_sink, query_offset
         return lse
 
     @staticmethod
@@ -253,12 +263,20 @@ class _HistoryLSE(torch.autograd.Function):
         # An empty-history row returned a constant 0, so it has no gradient path; zeroing the
         # incoming cotangent there keeps its (all -inf) weights from producing NaN below.
         grad = (grad_lse.to(acc) * ~ctx.empty).unsqueeze(-1)
+        q_pos = (
+            torch.arange(q_idx.shape[2], device=q_idx.device).unsqueeze(-1) + ctx.query_offset
+        )
 
         for start in range(0, k_len, key_tile):
             stop = min(start + key_tile, k_len)
             k_tile = k_idx[:, start:stop].to(acc)
             raw = torch.einsum("bhqd,bkd->bhqk", q_idx.to(acc), k_tile)
-            logits = (raw * scale).masked_fill(~history[:, start:stop], -float("inf"))
+            if history is None:
+                k_pos = torch.arange(start, stop, device=q_idx.device).unsqueeze(0)
+                tile_history = (k_pos >= ctx.n_sink) & (k_pos <= q_pos)
+            else:
+                tile_history = history[:, start:stop]
+            logits = (raw * scale).masked_fill(~tile_history, -float("inf"))
             # softmax over the FULL history axis, recovered from the saved lse -- which is why
             # the tiles do not need to be retained.
             weights = torch.nan_to_num(torch.exp(logits - lse.unsqueeze(-1)), 0.0) * grad
@@ -273,6 +291,8 @@ class _HistoryLSE(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
         )
 
 
@@ -281,10 +301,12 @@ def history_lse(
     k_idx: torch.Tensor,
     *,
     gate_scale: torch.Tensor | float,
-    pinned: torch.Tensor,
+    pinned: torch.Tensor | None,
     causal_keep: torch.Tensor | None = None,
     key_tile: int = 1024,
     return_history_count: bool = False,
+    n_sink: int | None = None,
+    query_offset: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     ``logsumexp`` of the gate score over each row's **history**, ``(B, h, Sq)``.
@@ -292,9 +314,10 @@ def history_lse(
     History means: visible (causal, and unmasked) but *not* pinned. This is the normalizer that
     turns the gate into a fixed budget -- see the module docstring.
 
-    Streamed over key tiles and **recomputed in the backward pass**, so retention is ``O(L)``
-    rather than ``O(Sq * Sk)``: see :class:`_HistoryLSE` for why the naive differentiable loop
-    is not enough and what the closed-form gradient buys. Differentiable, unlike
+    Streamed over key tiles and **recomputed in the backward pass**. With ``pinned=None`` and
+    ``n_sink`` set, the plain-causal sink geometry is also recomputed per tile, so retention is
+    ``O(L)`` rather than ``O(Sq * Sk)``. See :class:`_HistoryLSE` for why the naive
+    differentiable loop is not enough and what the closed-form gradient buys. Differentiable, unlike
     :func:`~.fused_loss.teacher_lse_from_qk` which serves a frozen teacher under ``no_grad`` --
     the gradient path through this term is part of what trains the router.
 
@@ -313,8 +336,9 @@ def history_lse(
     gate_scale : torch.Tensor or float
         Multiplier applied to the score before the logsumexp; must match what the attention
         applies, or the budget normalizes the wrong quantity.
-    pinned : torch.Tensor
-        ``(Sq, Sk)`` bool from :func:`pinned_mask`; pinned pairs are excluded.
+    pinned : torch.Tensor, optional
+        ``(Sq, Sk)`` bool from :func:`pinned_mask`; pinned pairs are excluded. ``None`` selects
+        the compact plain-causal sink path described by ``n_sink``.
     causal_keep : torch.Tensor, optional
         ``(Sq, Sk)`` bool of visible pairs. ``None`` derives plain causal visibility from the
         shapes (bottom-right aligned).
@@ -324,6 +348,11 @@ def history_lse(
     return_history_count : bool
         Also return each query row's number of visible, non-pinned history keys, computed from
         the exact same mask as the logsumexp.
+    n_sink : int, optional
+        Number of leading pinned keys for the compact plain-causal path. This avoids retaining
+        an ``(Sq, Sk)`` history mask in every layer.
+    query_offset : int, optional
+        Absolute position of query row 0; defaults to bottom-right alignment.
 
     Returns
     -------
@@ -333,15 +362,27 @@ def history_lse(
     """
     q_len, k_len = q_idx.shape[2], k_idx.shape[1]
     acc = accumulation_dtype(q_idx, k_idx)
-    history = history_mask(pinned, causal_keep, q_len, k_len, q_idx.device)
+    if n_sink is None:
+        history = history_mask(pinned, causal_keep, q_len, k_len, q_idx.device)
+        sink_stop = -1
+    else:
+        history = None
+        sink_stop = min(n_sink, k_len)
+    if query_offset is None:
+        query_offset = k_len - q_len
     scale = (
         gate_scale
         if isinstance(gate_scale, torch.Tensor)
         else torch.tensor(gate_scale, device=q_idx.device, dtype=acc)
     )
-    lse = _HistoryLSE.apply(q_idx, k_idx, scale, history, key_tile, acc)
+    lse = _HistoryLSE.apply(
+        q_idx, k_idx, scale, history, key_tile, acc, sink_stop, query_offset
+    )
     if return_history_count:
-        return lse, history.sum(dim=-1)
+        if history is not None:
+            return lse, history.sum(dim=-1)
+        q_pos = torch.arange(q_len, device=q_idx.device) + query_offset
+        return lse, (q_pos - sink_stop + 1).clamp(min=0, max=k_len - sink_stop)
     return lse
 
 

@@ -76,7 +76,6 @@ from torch import nn
 from kvpress.presses.gqa_indexer.gate_pin import (
     check_pin_mode,
     history_lse,
-    history_mask,
     pinned_mask,
     pins_self,
 )
@@ -652,10 +651,11 @@ class E2EIndexerTrainer:
         if self.scope == "sparse":
             return None
 
-        pinned = pinned_mask(
+        compact_causal = attention_mask is None and self.gate_pin_mode in ("none", "sink")
+        pinned = None if compact_causal else pinned_mask(
             self.gate_pin_mode, q_idx.shape[2], k_len, q_idx.device, n_sink=self.sink_count
         )
-        if pinned is None:
+        if pinned is None and not compact_causal:
             # pin_mode="none": every visible key is history. history_lse still needs a mask
             # tensor, so build the all-false one it expects.
             pinned = torch.zeros(
@@ -672,8 +672,16 @@ class E2EIndexerTrainer:
                 causal_keep = build_indexer_mask(
                     q_idx.shape[2], k_len, q_idx.device, attention_mask=attention_mask
                 ) == 0
-            common = dict(pinned=pinned, causal_keep=causal_keep, key_tile=self.key_tile)
-            lse = history_lse(q_idx, k_idx, gate_scale=gate_scale, **common)
+            common = dict(
+                pinned=pinned,
+                causal_keep=causal_keep,
+                key_tile=self.key_tile,
+                n_sink=(self.sink_count if self.gate_pin_mode == "sink" else 0)
+                if compact_causal else None,
+            )
+            lse, history_len = history_lse(
+                q_idx, k_idx, gate_scale=gate_scale, return_history_count=True, **common
+            )
             lse2 = history_lse(q_idx, k_idx, gate_scale=2.0 * gate_scale, **common)
 
             # sum p^2 = exp(lse2 - 2*lse), so PR = exp(2*lse - lse2).
@@ -681,11 +689,8 @@ class E2EIndexerTrainer:
 
             # Rows with no history get lse=lse2=0 (documented in history_lse), hence PR=1 against
             # a history of 0 -- meaningless, so they are excluded rather than counted as "flat".
-            # history_mask is the SAME function the positive-budget normalizer uses, so the
-            # diagnostic's denominator cannot drift from that objective.
-            history_len = history_mask(
-                pinned, causal_keep, q_idx.shape[2], k_len, q_idx.device
-            ).sum(-1)
+            # The count comes from the SAME call as the normalizer, so the diagnostic's
+            # denominator cannot drift from that objective.
             valid = history_len > 0
             if not bool(valid.any()):
                 return None

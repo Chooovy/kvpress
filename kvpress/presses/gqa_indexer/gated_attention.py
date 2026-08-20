@@ -159,7 +159,6 @@ def causal_mask_bottom_right(
     return mask.masked_fill_((k_pos > q_pos).view(1, 1, q_len, k_len), -float("inf"))
 
 
-
 def check_gate_shapes(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -217,9 +216,11 @@ def _gate_lse(
     gate_scale: torch.Tensor | float,
     gate_budget: float,
     gate_budget_ratio: float | None,
-    pinned: torch.Tensor,
+    pinned: torch.Tensor | None,
     causal_keep: torch.Tensor | None,
     key_tile: int,
+    n_sink: int | None = None,
+    query_offset: int | None = None,
 ) -> torch.Tensor:
     """Return the row shift for raw, fixed-budget, or row-wise ratio-budget gating."""
     if gate_budget_ratio is None and gate_budget == 0:
@@ -230,12 +231,13 @@ def _gate_lse(
     if gate_budget_ratio is None:
         return history_lse(
             q_idx, k_idx, gate_scale=gate_scale, pinned=pinned, causal_keep=causal_keep,
-            key_tile=key_tile,
+            key_tile=key_tile, n_sink=n_sink, query_offset=query_offset,
         ) - math.log(gate_budget)
 
     lse, n_history = history_lse(
         q_idx, k_idx, gate_scale=gate_scale, pinned=pinned, causal_keep=causal_keep,
-        key_tile=key_tile, return_history_count=True,
+        key_tile=key_tile, return_history_count=True, n_sink=n_sink,
+        query_offset=query_offset,
     )
     budget = n_history.to(lse.dtype) * gate_budget_ratio
     log_budget = torch.where(n_history > 0, budget.log(), torch.zeros_like(budget))
@@ -496,15 +498,20 @@ def gated_attention_full(
     if query_offset is None:
         query_offset = k_len - q_len
 
-    pinned = pinned_mask(
+    compact_sink = pin_mode == "sink" and mask is None
+    pinned = None if compact_sink else pinned_mask(
         pin_mode, q_len, k_len, q.device, n_sink=n_sink, query_offset=query_offset
     )
     lse = None
-    if pinned is not None:
+    if pin_mode != "none":
         lse = _gate_lse(
             q_idx, k_idx, gate_scale, gate_budget, gate_budget_ratio, pinned,
-            causal_keep=_visible(mask, q_len, k_len, q.device, query_offset),
+            causal_keep=None if compact_sink else _visible(
+                mask, q_len, k_len, q.device, query_offset
+            ),
             key_tile=key_tile,
+            n_sink=n_sink if compact_sink else None,
+            query_offset=query_offset,
         )
 
     # The fused kernel is the only path with O(L) memory. SDPA cannot provide it here: the
@@ -539,17 +546,23 @@ def gated_attention_full(
         )
         return (out, None) if return_row_lse else out
 
+    if compact_sink:
+        history = torch.arange(k_len, device=q.device) >= min(n_sink, k_len)
+    else:
+        history = None if pinned is None else ~pinned[0]
     query, key = build_concat_qk(
         q, k, q_idx, k_idx, scale=scale, gate_scale=gate_scale, group_size=group_size,
-        lse=lse, history=None if pinned is None else ~pinned[0],
+        lse=lse, history=history,
     )
 
     is_causal = False
     if mask is None:
-        if q_len == k_len:
+        if q_len == k_len and query_offset == 0:
             is_causal = True  # top-left == bottom-right here, so take SDPA's own fast path
         else:
-            mask = causal_mask_bottom_right(q_len, k_len, q.device, query.dtype)
+            mask = causal_mask_bottom_right(
+                q_len, k_len, q.device, query.dtype, query_offset
+            )
 
     # V is widened to the concatenated query width so flash/mem-efficient stay eligible; without
     # it SDPA drops to the math backend and retains the whole attention matrix. See
@@ -624,6 +637,10 @@ def gated_attention_pinned_self(
         raise ValueError(f"gated_attention_pinned_self needs a pinning mode, got {pin_mode!r}")
 
     visible = _visible(mask, q_len, k_len, q.device, query_offset)
+    if visible is None:
+        visible = causal_mask_bottom_right(
+            q_len, k_len, q.device, torch.float32, query_offset
+        )[0, 0] == 0
     lse = _gate_lse(
         q_idx, k_idx, gate_scale, gate_budget, gate_budget_ratio, pinned, visible, key_tile
     )
@@ -777,9 +794,10 @@ def _visible(
     k_len: int,
     device: torch.device,
     query_offset: int | None,
-) -> torch.Tensor:
+) -> torch.Tensor | None:
     """
-    ``(Sq, Sk)`` bool of which pairs the attention can see, for the history normalizer.
+    ``(Sq, Sk)`` bool of which pairs the attention can see, for the history normalizer. ``None``
+    represents unmodified causal visibility without materializing its quadratic mask.
 
     The gate's budget must be normalized over exactly the keys the row actually attends to. A
     key that is masked out but counted in the ``logsumexp`` would consume budget that no key
@@ -790,17 +808,20 @@ def _visible(
     with ``all`` over the batch: the normalizer is shared across the batch here, so the
     conservative choice is to count a key only where every sequence can see it.
     """
+    if mask is None and query_offset in (None, k_len - q_len):
+        return None
     causal = causal_mask_bottom_right(q_len, k_len, device, torch.float32, query_offset)
     keep = causal[0, 0] == 0
-    if mask is not None:
-        if mask.dtype == torch.bool:
-            extra = mask
-        else:
-            extra = mask > (torch.finfo(mask.dtype).min / 2)
-        extra = extra.reshape(-1, extra.shape[-2], extra.shape[-1]).all(dim=0)
-        if extra.shape[-2] == 1:
-            extra = extra.expand(q_len, k_len)
-        keep = keep & extra
+    if mask is None:
+        return keep
+    if mask.dtype == torch.bool:
+        extra = mask
+    else:
+        extra = mask > (torch.finfo(mask.dtype).min / 2)
+    extra = extra.reshape(-1, extra.shape[-2], extra.shape[-1]).all(dim=0)
+    if extra.shape[-2] == 1:
+        extra = extra.expand(q_len, k_len)
+    keep = keep & extra
     return keep
 
 

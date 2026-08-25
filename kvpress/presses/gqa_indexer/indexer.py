@@ -304,12 +304,22 @@ class GQAIndexer(nn.Module):
             q = apply_rotary(q, cos, sin)
         return q
 
-    def project_k(self, hidden_states: torch.Tensor, cos=None, sin=None) -> torch.Tensor:
+    def project_k(
+        self,
+        hidden_states: torch.Tensor,
+        cos=None,
+        sin=None,
+        *,
+        value_states: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Project and rotate the single shared indexer key -> (B, Sk, D).
 
         One key head (MQA) keeps the indexer's own KV cache at ``head_dim`` per token
         instead of ``n_heads * head_dim``; the heads differ on the query side only.
+
+        ``value_states`` is accepted for the scorer protocol and intentionally unused. The
+        pairwise indexer is defined on hidden states; value-based scorers consume it instead.
         """
         bsz, k_len, _ = hidden_states.shape
         k = self.w_k(hidden_states).view(bsz, k_len, 1, self.head_dim)

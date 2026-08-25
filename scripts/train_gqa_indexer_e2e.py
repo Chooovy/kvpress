@@ -346,7 +346,7 @@ def main() -> int:
     model_group.add_argument("--n-heads", type=int, default=None)
     model_group.add_argument(
         "--scorer",
-        choices=("pairwise", "scalar", "prefix"),
+        choices=("pairwise", "scalar", "prefix", "dma"),
         default="pairwise",
         help="which router to train. 'pairwise' scores every (query, key) pair -- query-aware, "
         "and O(t) per decode step, which at 128K makes the router 32x the cost of the sparse "
@@ -358,9 +358,11 @@ def main() -> int:
         "so still able to evict, but its view of a key is the prefix rather than the single "
         "vector h_j. It is a strict superset of 'scalar': with --prefix-zero-init (the default) "
         "the score starts bit-identical, so a prefix-vs-scalar A/B has exactly one variable. "
-        "All three share this script, the loss, the schedule and the checkpoint format, which is "
+        "'dma' scores each key from the concatenated post-v_proj value heads as "
+        "exp(A * softplus(W_dt(V))); it is also query-independent and emits one score per KV "
+        "head. All four share this script, the loss, the schedule and the checkpoint format, which is "
         "what makes them comparable; --head-dim and --rope-dim apply only to 'pairwise' and are "
-        "rejected with the other two.",
+        "rejected with the other three.",
     )
     model_group.add_argument(
         "--scalar-mid-dim",

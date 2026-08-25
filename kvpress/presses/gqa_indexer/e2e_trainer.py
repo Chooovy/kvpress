@@ -394,21 +394,26 @@ class E2EIndexerTrainer:
     # ------------------------------------------------------------------
     # Gating
     # ------------------------------------------------------------------
-    def indexer_qk(self, module: nn.Module, hidden_states: torch.Tensor, kwargs: dict) -> tuple:
+    def indexer_qk(
+        self,
+        module: nn.Module,
+        hidden_states: torch.Tensor,
+        kwargs: dict,
+        *,
+        value_states: torch.Tensor | None = None,
+    ) -> tuple:
         """
         The indexer's ``(q_idx, k_idx)`` for this layer, with gradients.
 
-        Built from the same ``hidden_states`` and the same RoPE tables the layer itself is
-        using, via the press's own :meth:`~.press.GQAIndexerPress.get_rope_tables` -- so the
-        gate is scored by exactly the function the press will score with at inference. That
-        shared path is the invariant worth protecting: a divergence here trains the router for
-        a scoring function it never runs under, and nothing downstream would flag it.
+        Hidden-state scorers use the same ``hidden_states`` and RoPE tables as the layer. A
+        value-based scorer receives the layer's actual post-projection ``value_states``. In both
+        cases this is exactly the input the press uses at inference.
         """
         indexer = self.press.get_indexer(module)
         cos, sin = self.press.get_rope_tables(indexer, kwargs)
         return (
             indexer.project_q(hidden_states, cos, sin),
-            indexer.project_k(hidden_states, cos, sin),
+            indexer.project_k(hidden_states, cos, sin, value_states=value_states),
             indexer.require_gate_scale(),
         )
 
@@ -477,7 +482,9 @@ class E2EIndexerTrainer:
             )
         kwargs = self._kwargs.pop(layer_idx, {})
 
-        q_idx, k_idx, gate_scale = self.indexer_qk(module, hidden_states, kwargs)
+        q_idx, k_idx, gate_scale = self.indexer_qk(
+            module, hidden_states, kwargs, value_states=value
+        )
         self.gate_scales[layer_idx] = float(gate_scale.detach())
         self.layers_gated += 1
 

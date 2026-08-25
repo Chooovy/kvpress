@@ -57,6 +57,7 @@ from kvpress.presses.gqa_indexer.data import (
     shard_paths,
     wsd_lr_lambda,
 )
+from kvpress.presses.gqa_indexer.dma_indexer import DMAIndexer, DMAIndexerConfig
 from kvpress.presses.gqa_indexer.e2e_trainer import (
     STAGES,
     E2EIndexerTrainer,
@@ -222,6 +223,8 @@ __all__ = [
     "GQAIndexer",
     "GQAIndexerConfig",
     "IndexerNorm",
+    "DMAIndexer",
+    "DMAIndexerConfig",
     "ScalarIndexer",
     "ScalarIndexerConfig",
     "PrefixIndexer",

@@ -417,6 +417,8 @@ _PAIRWISE_ONLY_SUFFIXES = ("w_q.weight", "w_k.weight", "q_norm.weight", "k_norm.
 #: ``_SCALAR_ONLY_SUFFIXES`` entry too -- without this a prefix checkpoint would read as
 #: ``"scalar"`` and then half-load, silently dropping the entire prefix branch.
 _PREFIX_ONLY_SUFFIXES = ("w_pq.weight", "w_pk.weight", "w_pv.weight", "w_a.weight")
+#: Parameters only a DMA value scorer has.
+_DMA_ONLY_SUFFIXES = ("dt_proj.weight", "A")
 
 
 def detect_scorer_from_keys(state_dict) -> str | None:
@@ -424,15 +426,18 @@ def detect_scorer_from_keys(state_dict) -> str | None:
     Which scorer these parameter names belong to, or ``None`` if they do not say.
 
     The scorers share only the ``indexer.`` prefix: a pairwise one has ``w_q``/``w_k``, a scalar
-    one has ``in_norm``/``w_out``, and a prefix one has the scalar set **plus** ``w_pq``/``w_a``.
-    The prefix test therefore comes first -- it is a superset of the scalar one, so ordering is
-    what keeps a prefix checkpoint from reading as scalar. Returns ``None`` rather than guessing
-    when the names are contradictory or silent, so callers can fall back to a recorded config.
+    one has ``in_norm``/``w_out``, a prefix one has the scalar set **plus** ``w_pq``/``w_a``, and
+    a DMA one has ``dt_proj``/``A``. The prefix test therefore comes before scalar -- it is a
+    superset of the scalar one. Returns ``None`` rather than guessing when the names are
+    contradictory or silent, so callers can fall back to a recorded config.
     """
     names = [str(k) for k in state_dict]
     is_prefix = any(n.endswith(_PREFIX_ONLY_SUFFIXES) for n in names)
     is_scalar = any(n.endswith(_SCALAR_ONLY_SUFFIXES) for n in names)
     is_pairwise = any(n.endswith(_PAIRWISE_ONLY_SUFFIXES) for n in names)
+    is_dma = any(n.endswith(_DMA_ONLY_SUFFIXES) for n in names)
+    if is_dma:
+        return "dma" if not (is_pairwise or is_scalar or is_prefix) else None
     if is_pairwise:
         return "pairwise" if not (is_scalar or is_prefix) else None
     if is_prefix:
@@ -446,7 +451,7 @@ def detect_scorer_from_keys(state_dict) -> str | None:
 
 def detect_scorer(state_dict, config: dict | None = None) -> str:
     """
-    Which scorer wrote a checkpoint: ``"pairwise"``, ``"scalar"`` or ``"prefix"``.
+    Which scorer wrote a checkpoint: ``"pairwise"``, ``"scalar"``, ``"prefix"`` or ``"dma"``.
 
     ``config["scorer"]`` is authoritative when present -- that is what the trainer actually ran.
     Checkpoints written before the field existed fall back to
@@ -454,7 +459,7 @@ def detect_scorer(state_dict, config: dict | None = None) -> str:
     building the wrong scorer either fails on every key or, worse, half-loads.
     """
     recorded = (config or {}).get("scorer")
-    if recorded in ("pairwise", "scalar", "prefix"):
+    if recorded in ("pairwise", "scalar", "prefix", "dma"):
         return recorded
     if recorded is not None:
         raise ValueError(f"checkpoint records an unknown scorer {recorded!r}")

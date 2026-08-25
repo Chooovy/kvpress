@@ -716,9 +716,9 @@ def test_load_indexer_state_dict_rejects_unrelated_dict(unit_test_model):  # noq
 # ----------------------------------------------------------------------------------------
 # Which scorer wrote a checkpoint
 # ----------------------------------------------------------------------------------------
-def test_detect_scorer_from_keys_separates_the_two_scorers():
+def test_detect_scorer_from_keys_separates_the_scorers():
     """
-    The two scorers share only the ``indexer.`` prefix, so weight names identify them.
+    The scorers share only the ``indexer.`` prefix, so weight names identify them.
 
     ``in_norm``/``w_out`` are the scalar discriminators rather than ``w_in``/``mid_norm``, because
     the ``mid_dim=0`` linear ablation has no ``w_in`` at all -- keying on that would read the
@@ -733,10 +733,15 @@ def test_detect_scorer_from_keys_separates_the_two_scorers():
         "m.0.self_attn.indexer.w_q.weight": None,
         "m.0.self_attn.indexer.k_norm.weight": None,
     }
+    dma = {
+        "m.0.self_attn.indexer.dt_proj.weight": None,
+        "m.0.self_attn.indexer.A": None,
+    }
     assert detect_scorer_from_keys(scalar) == "scalar"
     assert detect_scorer_from_keys(linear_scalar) == "scalar"
     assert detect_scorer_from_keys(pairwise) == "pairwise"
-    # gate_scale is common to both, so it settles nothing -- None, not a guess.
+    assert detect_scorer_from_keys(dma) == "dma"
+    # gate_scale alone does not identify a scorer, so it settles nothing -- None, not a guess.
     assert detect_scorer_from_keys({"m.0.self_attn.indexer.gate_scale": None}) is None
     assert detect_scorer_from_keys({**scalar, **pairwise}) is None
 
@@ -750,12 +755,15 @@ def test_detect_scorer_prefers_the_recorded_config():
     """
     scalar_keys = {"m.0.self_attn.indexer.in_norm.weight": None}
     pairwise_keys = {"m.0.self_attn.indexer.w_q.weight": None}
+    dma_keys = {"m.0.self_attn.indexer.dt_proj.weight": None}
 
     assert detect_scorer(scalar_keys, {"scorer": "scalar"}) == "scalar"
     assert detect_scorer(pairwise_keys, {"scorer": "pairwise"}) == "pairwise"
+    assert detect_scorer(dma_keys, {"scorer": "dma"}) == "dma"
     # No config: infer from the weights.
     assert detect_scorer(scalar_keys, None) == "scalar"
     assert detect_scorer(pairwise_keys, {}) == "pairwise"
+    assert detect_scorer(dma_keys, {}) == "dma"
 
     with pytest.raises(ValueError, match="unknown scorer"):
         detect_scorer(scalar_keys, {"scorer": "nonsense"})

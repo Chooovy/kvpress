@@ -212,10 +212,12 @@ def test_batch_greater_than_one_is_refused():
 
 def test_scalar_indexer_declares_query_independence():
     """The fast path must be selected by a declared capability, not an isinstance check."""
+    from kvpress.presses.gqa_indexer.dma_indexer import DMAIndexer
     from kvpress.presses.gqa_indexer.indexer import GQAIndexer
     from kvpress.presses.gqa_indexer.scalar_indexer import ScalarIndexer
 
     assert ScalarIndexer.is_query_independent is True
+    assert DMAIndexer.is_query_independent is True
     assert GQAIndexer.is_query_independent is False
 
 

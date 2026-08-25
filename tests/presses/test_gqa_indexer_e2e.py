@@ -976,6 +976,26 @@ def test_lm_loss_reaches_every_indexer_parameter(stage):
         assert param.grad.abs().max() > 0, "an indexer parameter received a zero gradient"
 
 
+def test_dense_sink_lm_loss_trains_dma():
+    """One real-model step reaches both parameters in DMA's value-score formula."""
+    torch.manual_seed(0)
+    model, config = tiny_model(n_layers=1)
+    press = GQAIndexerPress(scorer="dma", gate_scale=True)
+    trainer = E2EIndexerTrainer(press=press, stage="dense", pin_mode="sink")
+    input_ids = torch.randint(0, config.vocab_size, (1, 16))
+
+    loss = e2e_indexer_training_step(model, trainer, input_ids=input_ids)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert trainer.layers_gated == 1
+    indexer = press.get_indexer(model.model.layers[0].self_attn)
+    for gradient in (indexer.dt_proj.weight.grad, indexer.A.grad):
+        assert gradient is not None
+        assert torch.isfinite(gradient).all()
+        assert gradient.abs().max() > 0
+
+
 def test_backbone_is_frozen_and_indexers_are_not():
     """Only the indexers train, so the comparison against distillation is at matched capacity."""
     model, _ = tiny_model()

@@ -61,8 +61,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from benchmarks.needle_in_haystack.utils import insert_needle_in_haystack  # noqa: E402
 from evaluate_registry import DATASET_REGISTRY, SCORER_REGISTRY  # noqa: E402
+
 from kvpress import GQAIndexerPress, load_indexer_state_dict  # noqa: E402
 from kvpress.pipeline import KVPressTextGenerationPipeline  # noqa: E402
+from kvpress.presses.gqa_indexer import detect_scorer  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +198,8 @@ class IndexerPressEvaluationRunner:
 
         ckpt = torch.load(cfg.indexer_ckpt, map_location="cpu", weights_only=False)
         indexer_sd = ckpt.get("indexer", ckpt)
+        ckpt_config = ckpt.get("config") or {}
+        scorer = detect_scorer(indexer_sd, ckpt_config)
         # An end-to-end checkpoint carries gate_scale and a distilled one does not; the press must be
         # built to match or load_indexer_state_dict rejects the extra key. Eviction never reads the
         # gate -- only the score's ranking matters -- so this is purely about loading cleanly.
@@ -205,6 +209,7 @@ class IndexerPressEvaluationRunner:
             compression_ratio=cfg.compression_ratio,
             gate_scale=has_gate,
             scorer_attr="indexer",
+            scorer=scorer,
             n_heads=cfg.n_heads,
             head_dim=cfg.head_dim,
             rope_dim=cfg.rope_dim,
@@ -221,11 +226,12 @@ class IndexerPressEvaluationRunner:
         press.post_init_from_model(model)
         load_indexer_state_dict(model, indexer_sd, "indexer")
         logger.info(
-            "Loaded indexer from %s (gate_scale=%s, ckpt step=%s, ckpt config=%s)",
+            "Loaded indexer from %s (scorer=%s, gate_scale=%s, ckpt step=%s, ckpt config=%s)",
             cfg.indexer_ckpt,
+            scorer,
             has_gate,
             ckpt.get("step"),
-            ckpt.get("config"),
+            ckpt_config or None,
         )
 
         self.press = press

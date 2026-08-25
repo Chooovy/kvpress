@@ -44,7 +44,8 @@ Related work, split by how the score is *trained* rather than how it is shaped:
 
 | | score form | training signal |
 |---|---|---|
-| SparseK, DMA | linear / MLP on `h` | end-to-end |
+| SparseK | linear on `h` | end-to-end |
+| DMA | `exp(A · softplus(W_dt([v_1; ...; v_Hkv])))` | end-to-end |
 | KVzip | attention during context reconstruction | — (inference-time, 2–3× prefill) |
 | Fast-KVzip | `q_i · k_i` + sink margin | **distills KVzip's score** |
 | this repo (`scalar`) | MLP on `h` | end-to-end LM loss |

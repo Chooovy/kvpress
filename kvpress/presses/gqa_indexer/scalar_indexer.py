@@ -418,12 +418,22 @@ class ScalarIndexer(nn.Module):
             dtype=hidden_states.dtype,
         )
 
-    def project_k(self, hidden_states: torch.Tensor, cos=None, sin=None) -> torch.Tensor:
+    def project_k(
+        self,
+        hidden_states: torch.Tensor,
+        cos=None,
+        sin=None,
+        *,
+        value_states: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """The per-key score as an indexer key, ``(B, Sk, Di)`` in the input's dtype.
 
         ``key_offset`` is deliberately not exposed here: this is the training/prefill entry
         point, where ``hidden_states`` starts at position 0. Decode and chunked prefill must
         call :meth:`gate_key` with the right offset, or the recency tilt restarts per chunk.
+
+        ``value_states`` is accepted for the scorer protocol and intentionally unused. This
+        scorer is defined on hidden states; value-based scorers consume it instead.
         """
         self._reject_rope(cos, sin)
         return self.gate_key(hidden_states, dtype=hidden_states.dtype)

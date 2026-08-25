@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from typing import cast
 
 import torch
 from torch import nn
 
 from kvpress.presses.gqa_indexer.aggregate import aggregate_chunk_scores, reduce_queries
+from kvpress.presses.gqa_indexer.dma_indexer import DMAIndexer, DMAIndexerConfig
 from kvpress.presses.gqa_indexer.indexer import (
     MASK_NEG,
     GQAIndexer,
@@ -38,6 +40,7 @@ _SCORER_CLASSES = {
     "pairwise": GQAIndexer,
     "scalar": ScalarIndexer,
     "prefix": PrefixIndexer,
+    "dma": DMAIndexer,
 }
 
 
@@ -92,7 +95,8 @@ class GQAIndexerPress(ScorerPress):
         Give each indexer the learnable ``gate_scale`` scalar that end-to-end (gated-attention)
         training needs. Off by default: distillation never reads it, so a distillation
         checkpoint stays free of the extra parameter. Required by
-        :class:`~kvpress.presses.gqa_indexer.e2e_trainer.E2EIndexerTrainer`.
+        :class:`~kvpress.presses.gqa_indexer.e2e_trainer.E2EIndexerTrainer`. DMA instead uses
+        the per-head ``A`` in its score and fixes this outer multiplier to one.
     scorer : str
         Which scorer to attach. ``"pairwise"`` is :class:`~.indexer.GQAIndexer`, which scores
         every ``(query, key)`` pair -- query-aware, and ``O(t)`` per decode step.
@@ -104,8 +108,8 @@ class GQAIndexerPress(ScorerPress):
         can evict, but its view of a key is the prefix rather than the single vector ``h_j``. It
         is a strict superset of ``"scalar"`` -- with ``prefix_zero_init`` (the default) the score
         starts bit-identical -- so the A/B against it is single-variable. Prefill-time only.
-        All three satisfy the same protocol, so everything downstream (this press, the trainers,
-        the gate) is unchanged.
+        ``"dma"`` is :class:`~.dma_indexer.DMAIndexer`, which applies DMA's query-independent
+        sampling formula directly to the cached value vectors.
     scalar_mid_dim : int
         MLP width for ``scorer="scalar"`` and ``scorer="prefix"``. ``0`` is SparseK's plain linear
         score; the arm's capacity knob otherwise. See
@@ -168,9 +172,10 @@ class GQAIndexerPress(ScorerPress):
             raise ValueError("n_sink and n_local must be non-negative")
         if self.chunk_size < 0:
             raise ValueError("chunk_size must be non-negative")
-        if self.scorer not in ("pairwise", "scalar", "prefix"):
+        if self.scorer not in ("pairwise", "scalar", "prefix", "dma"):
             raise ValueError(
-                f"scorer must be 'pairwise', 'scalar' or 'prefix', got {self.scorer!r}"
+                "scorer must be 'pairwise', 'scalar', 'prefix' or 'dma', "
+                f"got {self.scorer!r}"
             )
 
     # ------------------------------------------------------------------
@@ -179,7 +184,7 @@ class GQAIndexerPress(ScorerPress):
     def build_indexer_config(self, model: nn.Module, module: nn.Module):
         """Derive indexer geometry from the model, honouring any explicit overrides.
 
-        Returns a config for whichever scorer :attr:`scorer` names. Both configs report
+        Returns a config for whichever scorer :attr:`scorer` names. All scorer configs report
         ``rope_dim`` and ``n_heads``, which is all the press and the trainers read off them.
         """
         config = model.config
@@ -188,6 +193,20 @@ class GQAIndexerPress(ScorerPress):
         # One indexer head per KV head: that is the granularity at which GQA holds
         # physically separate caches, so it is the granularity at which eviction can differ.
         n_heads = self.n_heads or text_config.num_key_value_heads
+
+        if self.scorer == "dma":
+            model_n_heads = text_config.num_key_value_heads
+            model_head_dim = getattr(
+                module, "head_dim", text_config.hidden_size // text_config.num_attention_heads
+            )
+            if n_heads != model_n_heads or self.head_dim not in (None, model_head_dim):
+                raise ValueError(
+                    "scorer='dma' is defined on the model's actual value tensor, so n_heads and "
+                    "head_dim must match its KV geometry"
+                )
+            if self.rope_dim not in (None, 0):
+                raise ValueError("scorer='dma' scores values directly and does not use RoPE")
+            return DMAIndexerConfig(n_heads=model_n_heads, head_dim=model_head_dim)
 
         if self.scorer in ("scalar", "prefix"):
             # No head_dim and no rope_dim: the score is one number per (key, head), derived from
@@ -424,7 +443,20 @@ class GQAIndexerPress(ScorerPress):
         protection and the ragged tail keep working unchanged.
         """
         k_len = keys.shape[2]
-        scores = self.token_scores(module, hidden_states, kwargs, k_len)
+        if self.scorer == "dma":
+            key_mask = None
+            if kwargs.get("attention_mask") is not None:
+                key_mask = build_indexer_mask(
+                    1,
+                    k_len,
+                    values.device,
+                    attention_mask=kwargs["attention_mask"],
+                    query_offset=k_len - 1,
+                )[:, 0, 0] > (MASK_NEG / 2)
+            indexer = cast(DMAIndexer, self.get_indexer(module))
+            scores = indexer.score_values(values, mask=key_mask)
+        else:
+            scores = self.token_scores(module, hidden_states, kwargs, k_len)
 
         if scores.shape[-1] != k_len:
             raise RuntimeError(

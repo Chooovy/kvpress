@@ -9,6 +9,7 @@
 #   scripts/train_gqa_indexer_e2e.sh stage2     # sparse scope @ 64K, from stage 1's checkpoint
 #   scripts/train_gqa_indexer_e2e.sh ablate     # stage1 with pinning OFF, the baseline
 #   scripts/train_gqa_indexer_e2e.sh stage1_16k  # 16K context, 600 steps, 8-way FFN-SP
+#   SCORER=dma OUT=/path/to/dma scripts/train_gqa_indexer_e2e_gy.sh stage1_16k
 #
 # Tokenize with the DISTILLATION script -- `scripts/train_gqa_indexer.sh tokenize` -- and share
 # the corpus. Both objectives read the same shards, and tokenizing twice would only invite the
@@ -95,6 +96,7 @@ LIGER="${LIGER:-1}"
 FFN_SP="${FFN_SP:-8}"
 
 # Gate configuration.
+SCORER="${SCORER:-pairwise}"
 PIN_MODE="${PIN_MODE:-sink}"
 N_SINK="${N_SINK:-4}"
 COMPRESSION_RATIO="${COMPRESSION_RATIO:-0.5}"
@@ -152,6 +154,7 @@ case "$MODE" in
     # NGPU=1 still falls back to plain python, in which case FFN_SP must be 1.
     exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer_e2e \
       --data-root "$DATA_ROOT" --model "$MODEL" \
+      --scorer "$SCORER" \
       --subsets 8k_32k --schedule "${SCHEDULE:-16384:10}" \
       --stage dense --pin-mode "$PIN_MODE" --n-sink "$N_SINK" $(liger_arg) $(ffn_sp_arg) \
       --num-workers 0 --log-every 1 --save-every 0 \
@@ -175,6 +178,7 @@ case "$MODE" in
     # leaves the 8K stage partly idle.
     exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer_e2e \
       --data-root "$DATA_ROOT" --model "$MODEL" $(data_args) \
+      --scorer "$SCORER" \
       --schedule "${SCHEDULE:-8192:300,16384:300,32768:900}" \
       ${MAX_STEPS:+--max-steps $MAX_STEPS} \
       --stage dense --pin-mode "$PIN_MODE" --n-sink "$N_SINK" $(liger_arg) $(ffn_sp_arg) \
@@ -206,6 +210,7 @@ case "$MODE" in
     # FFN_SP=4 would give 2 replicas (accum 4) at ~2x the per-rank memory; use it if 16K fits.
     exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer_e2e \
       --data-root "$DATA_ROOT" --model "$MODEL" $(data_args) \
+      --scorer "$SCORER" \
       --schedule "${SCHEDULE:-8192:300,16384:300,32768:900}" \
       --max-steps "${MAX_STEPS:-600}" \
       --stage dense --pin-mode "$PIN_MODE" --n-sink "$N_SINK" $(liger_arg) \
@@ -227,6 +232,7 @@ case "$MODE" in
     # Watch gate_scales in the metrics -- a collapse there is the tell the loss curve hides.
     exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer_e2e \
       --data-root "$DATA_ROOT" --model "$MODEL" $(data_args) \
+      --scorer "$SCORER" \
       --schedule "${SCHEDULE:-8192:300,16384:300,32768:300}" \
       ${MAX_STEPS:+--max-steps $MAX_STEPS} \
       --stage dense --pin-mode none $(liger_arg) $(ffn_sp_arg) \
@@ -262,6 +268,7 @@ case "$MODE" in
     fi
     exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer_e2e \
       --data-root "$DATA_ROOT" --model "$MODEL" "${EXTRA[@]}" \
+      --scorer "$SCORER" \
       --subsets 2e16 2e17 \
       --schedule "65536:${STEPS:-600}" \
       --stage sparse --topk "${TOPK:-512}" \

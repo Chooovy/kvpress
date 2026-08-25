@@ -82,15 +82,50 @@ pure token scorer and chunking remains a swappable policy.
 
 ## Training
 
-Two objectives ship. They are alternatives, not stages of one recipe:
+Four objectives ship. They are alternatives, not stages of one recipe:
 
 - **Distillation** (`FusedIndexerTrainer`) — match the frozen model's own attention weights.
-  The score never enters the forward pass.
-- **End-to-end** (`E2EIndexerTrainer`) — add the score inside the attention softmax so the LM
-  loss trains it directly. See [End-to-end training](#end-to-end-training-gated-attention).
+  The score never enters the forward pass, so the supervision is a surrogate: it teaches the router
+  where the dense model *attends*, not which keys its prediction *needs*.
+- **End-to-end, gated** (`E2EIndexerTrainer`) — add the score inside the attention softmax so the LM
+  loss trains it directly. A gate that goes flat along the key axis is inert, so this one needs
+  `pin_mode` to make the no-op unreachable.
+  See [End-to-end training](#end-to-end-training-gated-attention).
+- **End-to-end, exact-K subset** (`ExactKIndexerTrainer`) — replace attention with a sampled
+  `K`-of-`M` chunk subset, differentiated through the exact inclusion marginals. The forward commits
+  to exactly `K` chunks, so the no-op does not exist and nothing needs pinning.
+  See [exact-K chunk subset](#end-to-end-training-exact-k-chunk-subset).
+- **End-to-end, two-level (HSA)** (`HSAIndexerTrainer`) — weight each chunk's *own* softmax by
+  `softmax(s)_c`, so the router's weight **is** the chunk's attention mass. No pinning, no candidate
+  pool, and the trained quantity is the one inference ranks on.
+  See [two-level chunk attention](#end-to-end-training-two-level-hsa-chunk-attention).
 
-Both expose a full-scope stage and a top-k-scope stage under the same `stage` names, so they
-can be compared at matched budget.
+The one criterion that separates them is whether the router can score well *without* learning a
+ranking — `ROUTER_LEARNABILITY.md` is the analysis. Distillation sidesteps the question by not being
+on the forward path; the gated arm manufactures scarcity with a pin; exact-K and HSA get it
+structurally.
+
+Measured on 8K RULER at `topk=2048` (fraction 0.1, sharded over 8 GPUs), against a **recency-only**
+control that spends the identical budget on the most recent keys — `force_local = topk - force_sink`
+makes `take = 0` in `streaming_topk_support`, so the same code path runs with the score ignored:
+
+| | 8K RULER mean |
+|---|---|
+| dense (no selection) | 93.69 |
+| gated e2e | **87.06** |
+| exact-K subset | 68.29 |
+| **recency only** | **38.03** |
+
+That control matters more than it looks. An earlier attention-mass-recall probe on an 8-layer
+truncation put recency (0.302) *above* both routers (0.298 / 0.237), which nearly reversed the reading
+of this whole line of work; the full-model metric says gated is **+49.0** over recency. Recall proxies
+are blind to retrieval, and retrieval is exactly where recency fails — `niah_single_1/2/3` is
+100/100/100 for gated against 21/24/21 for recency, while on aggregation the two are level (`fwe` 86.7
+vs 88.0). Run the real eval before believing a proxy.
+
+The first two expose a full-scope stage and a top-k-scope stage under the same `stage` names, so they
+can be compared at matched budget. Exact-K has no such split — its forward is always sparse. HSA is
+always full-scope on the *chunk* axis (that is the point) and takes its budget at inference.
 
 ### Distillation
 
@@ -406,6 +441,335 @@ router, which is the point.
 
 `gate_scale=False` (the default) keeps the parameter out of the state dict entirely, so
 distillation checkpoints stay byte-compatible with what they were before this feature existed.
+
+## End-to-end training (exact-K chunk subset)
+
+The third objective, and the one that closes the no-op hole *structurally* rather than patching it.
+`exact_k_subset.py` / `exact_k_attention.py` / `exact_k_trainer.py`, launched by
+`scripts/train_gqa_indexer_exact_k_gy.sh`.
+
+Where the gated arm adds the score inside the softmax and then has to stop it going flat, this arm
+replaces attention with a genuine `K`-of-`M` chunk subset, sampled in the forward and differentiated
+through the **exact inclusion marginals**:
+
+```
+mu  = P(z_i = 1 | sum z = K)          exact, from an O(MK) log-domain DP
+z   ~ the exactly-K distribution      discrete, by ancestral sampling
+g   = (z - mu).detach() + mu          straight-through
+out = (g * exp(a)) / sum(g * exp(a)) @ v
+```
+
+This is SIMPLE (Ahmed et al., ICLR 2023) as adopted by ProbMoE — discrete forward, exact-marginal
+backward, **no relaxation anywhere**. The forward commits to exactly `K` chunks, so no configuration
+of the scores reproduces dense attention: there is nothing to pin, because the scarcity is structural.
+See `ROUTER_LEARNABILITY.md` §7 — this is the "train-time forward is already sparse" column, which is
+why DMA / SparseK / STE never needed the machinery SAS needs.
+
+### Why the normalizer runs over the whole pool
+
+`g` multiplies the exponentiated logits and the sum runs over the **entire candidate pool**, not the
+selected `K`. Those are numerically identical in the forward (`g` is 0 off the subset; verified
+1.1e-16 in fp64 against a masked softmax) and very different in the backward:
+
+| form | mean grad, selected | mean grad, unselected |
+|---|---|---|
+| gather the `K` | 7.05e-02 | 1.61e-03 |
+| **full pool** | 1.22e-01 | **1.18e-01** |
+
+Gathering only the `K` leaves unselected candidates with **73× less** gradient — reached only
+indirectly, through the selected chunks' marginals. Normalizing over the pool puts each unselected
+candidate's own `g_j` in the graph, which is what lets a chunk *outside* the current selection be
+promoted. On the adversarial toy in `HANDOFF_exact_k_subset.md` §3 that is the difference between
+0.0% and 93.8% recall.
+
+The candidate pool itself needs exploration for the same reason one level up: a chunk outside top-`M`
+appears nowhere in the graph and gets *exactly* zero gradient. `build_candidates` mixes top-`M` with
+random and structural (sink / local) slots; `--explore-frac 0` is the ablation.
+
+### Pad slots must be `-1`, never a repeated chunk
+
+Near the diagonal a query block cannot see `M` chunks — **48% of blocks at 8K** with `chunk_size=64,
+query_block=128, M=64`. Filling the shortfall by repeating a chunk is *wrong*, not harmlessly
+redundant: the subset's cardinality is over **slots**, so the DP happily spends two of its `K` on one
+chunk and the row attends to `K−1` distinct chunks while reporting a budget of `K`. Verified — the two
+spellings give different outputs. `-1` slots get a saturated-but-finite score and are masked out;
+because `sum(mu) == K` is exact, the budget then lands entirely on the real chunks, and correctly falls
+back to "all visible chunks" when fewer than `K` exist. `effective_topk` reports that shortfall.
+
+### Cost: the DP is launch-bound, so it does not scale with rows
+
+`HANDOFF_exact_k_subset.md` §4 extrapolated from CPU timings that this was "dead on arrival" at
+~1690 s/layer/step. Measured on an H20 that is wrong by ~4 orders of magnitude, and wrong
+*structurally* — 1024 rows and 131072 rows both cost ~95 ms, because each DP step is a CUDA **launch**
+rather than real work. Cost is linear in `M` alone; `K` is nearly free. So query-block sharing is a
+modelling choice here, not a performance requirement, and `query_block=1` is affordable.
+
+What actually binds is **memory**: the frozen Qwen3-8B backbone peaks at 89.6 GiB of 95 at 16K, so
+this arm is capped at 8K and the DP, the score tiles and the attention tiles all recompute in the
+backward. At 8K it runs at **14.6 s/step against the gated arm's 148** — see §2/§3/§8 of the handoff.
+
+### What to watch, because the loss will not tell you
+
+`marginal_entropy` is this arm's equivalent of `gate_sparsity`. At init the marginals are uniform at
+`K/M`, so it sits at its maximum and falls as the router commits. **A run whose loss descends while
+entropy stays flat has learned to *use* whatever random subset it is handed rather than to *choose*
+one** — the exact-K analogue of the flat-gate no-op, and the one failure this design does not rule out
+structurally. `effective_topk` catches an unreachable budget; `jaccard` says whether the stochastic
+forward destabilizes selection.
+
+### Does the gradient mean anything? The swap oracle
+
+`exact_k_diagnostics.py` implements the handoff's §7 diagnostic: for boundary pairs `(i in S, j not
+in S)`, compare the true `dL = L(S − i + j) − L(S)` — a genuine double forward, with the subset
+forced — against the estimator's `g_j − g_i`. Measured on exact-K: **Spearman +0.69, Pearson +0.82**.
+
+Read the **rank** statistics, not the raw sign accuracy, which comes out at 0.25. That is not a
+contradiction: the selected and unselected gradient populations are offset (`+2.8e-3` vs `-9.2e-4`),
+while 85% of real swaps *hurt*, so signs disagree nearly everywhere while the ordering is right. A
+constant added to every gradient cannot change which chunk wins a comparison, and comparisons are all
+the router makes — so `SwapOracleResult` reports the bias and a centered sign accuracy alongside the
+raw one.
+
+## End-to-end training (two-level HSA chunk attention)
+
+`hsa_attention.py` + `HSAIndexerTrainer`. Each chunk gets its **own** softmax, and the router
+distributes mass between chunks:
+
+```
+out = Σ_c  w_c · softmax_within-chunk-c(q k^T) @ v_c        w = softmax(s)
+```
+
+`ROUTER_LEARNABILITY.md` §5–§6 singles this out as the structurally sound option, and the reason is
+one line: **the within-chunk softmax already sums to 1, so `w_c` *is* chunk `c`'s share of the
+output.** Verified to 5.6e-17. Everything else follows.
+
+### Three things this removes
+
+| | measured |
+|---|---|
+| flat (or zeroed) router → gap to dense | **0.44** — so a flat router is *not* a no-op, and nothing needs pinning |
+| `w = true chunk mass` → gap to dense | 2.2e-16 — the ceiling is dense, so the objective is achievable |
+| gradient on every visible `(query, chunk)` pair | yes — **no candidate pool** |
+
+The third is why this arm was built. Exact-K's measured bottleneck was its pool: 11–15% of
+oracle-best chunks never entered `M=32`, and a chunk outside the pool appears nowhere in the graph, so
+*no* backward estimator can reach it. Here the softmax runs over every chunk. It is affordable
+because the score matrix is chunk-pooled — `(B, Hkv, Sq, n_chunk)` is 34 MiB at 8K, against the
+`(B, Hkv, Sq, Sk)` token logits' 2 GiB.
+
+Contrast the additive gate, whose optimum is `g* = log(mass) − LSE_c` — a **constant** for a frozen
+backbone, hence carrying no ranking at all, while inference top-k's on it anyway. HSA's score is the
+mass itself, so what is trained is what inference ranks on.
+
+### The equivalent additive form, and why it is not the implementation
+
+Verified in fp64 to 3.9e-16, **gradients included**:
+
+```
+two-level(s)  ==  softmax(q k^T + g) @ v      with  g_c = s_c − LSE_c
+```
+
+This identity is the rigorous version of the no-pinning claim: a flat `s` still leaves `−LSE_c`
+behind, which is not constant along the key axis, so it cannot cancel. It is also a cross-check the
+tests are written against.
+
+It is not the implementation because `LSE_c` must stay **attached**. Detaching it leaves `ds` and `dv`
+exact but puts `dq` 3.3e-2 and `dk` 4.4e-2 off — and q/k is the path the LM loss takes to every layer
+below. Computing `LSE_c` with gradient needs one pass to normalize and another to attend, which is
+strictly more work than taking the per-chunk softmax once.
+
+### The trap: shift per chunk, not per row
+
+The within-chunk softmax must subtract each **chunk's** max. A global row max is *algebraically*
+identical — the shift cancels — so **every fp64 test passes with that mutation in place**. In fp32 it
+is a real bug: a chunk whose logits sit ~120 nats below the recent chunk's has every weight underflow
+to 0, so its `sum` is 0 and its contribution disappears **while `w_c` is unchanged**. That deletes
+precisely the long-range term the router exists to restore. Measured: per-chunk shift gives that
+chunk a distribution summing to 1.0, global shift gives 0.0.
+
+`test_shift_is_per_chunk_not_per_row_in_fp32` is therefore deliberately **not** in fp64, unlike every
+other test in that file. When a property is exact-arithmetic-invariant, an exact-arithmetic test
+cannot check that the implementation picked the numerically safe form.
+
+### What to watch, because the loss will not tell you
+
+`chunk_entropy`, normalized to `[0, 1]`. This objective's one failure mode is a router that learns to
+*use* a near-uniform mixture rather than to *choose* — uniform mixing is a legitimate operator, so the
+LM loss can descend that way. Entropy pinned near 1.0 with a falling loss is that failure, and it is
+the analogue of the gated arm's flat gate and exact-K's flat `H(μ)`.
+
+`score_lse_corr` has **no counterpart in any other arm**, and it is the practical reason to prefer
+this objective for diagnosis. §6 proves the optimal score for a frozen backbone *is* the chunk's own
+log-sum-exp, up to a per-query constant — so the target is known in **closed form** and the Spearman
+against it is measurable directly on real text. No oracle, no forced replay, no second forward pass.
+The exact-K arm needed a 75-forward swap-oracle script to answer the same question. Spearman rather
+than Pearson because only the ranking is determined, and ranking is what a top-k eval consumes.
+
+`mass_topquarter` estimates what the eval's `--topk` truncation will retain. A run with high entropy
+*and* low `mass_topquarter` will evaluate badly however good the loss looks, because there is no
+concentrated mass to keep.
+
+### What is deliberately absent
+
+No `pin_mode` (nothing to pin), no `n_candidate` / `explore_frac` / `topk_chunk` (no pool, no
+sampling — the budget is an *inference* parameter here), no `query_block` (selection is per query;
+exact-K shared a subset across a block as a memory concession the GPU measurement later showed was
+unnecessary), and no `hard` (the forward is deterministic). `detach_score_input` *is* shared, and for
+the reason measured on exact-K: the score's gradient path back into `hidden_states` is a per-layer
+feedback loop that drove `grad_norm` to `nan` at 36 layers.
+
+`gate_scale` exists on the indexer but is unused — asserted `None`-grad in the tests, so that a future
+change which starts reading it fails loudly instead of passing quietly.
+
+## Utility self-distillation (unmodified forward)
+
+`utility_loss.py` + `UtilityIndexerTrainer`. The fifth arm, and the only one whose **forward pass is
+untouched** — plain dense attention, verified bit-identical to the unhooked model. The router is
+supervised by a target read out of the backbone's own *backward*
+(`differentiable_topk_for_sparse_attention.md` §31):
+
+```
+u_j = −∂L/∂b_j = −α_j · ⟨∂L/∂o, v_j − o⟩          b_j = an additive bias on key j's logit
+loss = mean over sampled pairs of  w_ij · softplus(s_j − s_i)     where u_i ≥ u_j
+```
+
+`u_j` is the **first-order marginal utility** of key `j`. One backward assigns one to *every* key —
+no key has to be selected first, which is exactly the candidate-pool dead end exact-K hit.
+
+### It is a distillation arm, not an end-to-end one
+
+Since the forward is unmodified, the router is not on it, so `∂L_LM/∂θ_router` is **`None`** — absent,
+not small. `loss = loss_rank` is the entire objective. That places this beside `fused_trainer.py`
+rather than beside the gated arm; what it changes is the **teacher**:
+
+| teacher | Spearman vs the true single-key drop effect |
+|---|---|
+| `α` — what attention-KL distillation teaches | **+0.037** |
+| `u` — this arm | **+0.991** |
+
+`α` is nearly *uninformative* about which keys matter: a key can hold a lot of attention while its
+value already sits at the row's output, and `u`'s `v_j − o` factor is precisely that correction. This
+is the mechanism behind SAS's 96.8% attention mass at 79.5% accuracy.
+
+### The measured ceiling — the reason to run it, and what it will say
+
+`u` factors into `α_j` (a function of `q·k`, **reachable**) times `⟨∂L/∂o, v_j − o⟩` (a function of the
+**value** and of the loss direction — a `q·k` scorer sees neither). Measured on Qwen3-8B:
+
+| | Spearman with `u` |
+|---|---|
+| `α` / raw `q·k` logit — what the router CAN reach | **+0.03 to +0.32** |
+| the value term — what it CANNOT | **+0.752** |
+| best construction that also uses `v` magnitude | **+0.24** — so values do not rescue it |
+
+So `score_corr` has a ceiling well below 1, and it is a property of the **hypothesis class** rather
+than of the loss. A plateau near +0.3 means tuning the loss further is wasted and the next move is
+architectural; a correlation that climbs past it means the probes were measured on too shallow a
+truncation — which has already inverted one conclusion in this investigation, so it is a live outcome
+rather than a hedge. Either way the run answers the question, which is why it is worth running despite
+the recorded caveat.
+
+### One caveat on the target that looks like a result
+
+`u` contains `∂L/∂o`, computed from the **label**. Selecting top-K by `u` beats *dense attention
+itself* — 15.3 against 18.66 row loss at K=32 of 511 keys, and it does not degrade down to K=4, so the
+"first-order utility may not extrapolate to a large perturbation" concern is **not** what limits this.
+The leakage is: legitimate for a teacher, but it means `u`'s absolute quality is not an achievable
+bound and whatever part of its ranking exists only because it knows the answer is unlearnable in
+principle.
+
+### Per-row weight normalization is not optional
+
+`u ∝ α_j` (`~1/Sq`) times `∂L/∂o` (carrying the LM loss's `1/(B·Sq)` mean), so **`|u| ~ 1/Sq²`**.
+Measured mean `|u|` falls almost exactly 4× per doubling — 5.2e-7 at 256 tokens, 8.3e-9 at 2048,
+**3.5e-10 at 8K on Qwen3-8B**, with a router gradient norm of ~3e-8. Two things break there, and
+neither shows in the loss curve:
+
+| gradient magnitude | AdamW's realized step, vs its scale-invariant ideal |
+|---|---|
+| 1e-3 | 100% |
+| 1e-6 | 96.6% |
+| 1e-8 | **42.9%** |
+| 1e-9 | **8.8%** |
+| 1e-10 | **1.0%** |
+
+AdamW's denominator is `sqrt(v̂) + eps` with `eps = 1e-8`, so below that the update becomes
+*proportional* to the gradient again; and `grad_clip` is an absolute threshold, so it never fires.
+Both scale with `Sq`, making the **effective learning rate a function of the curriculum stage** — 16×
+between 8K and 32K, silently. Normalizing each row's weights to mean 1 fixes it, and is correct rather
+than a workaround: only *relative* weights within a row carry information, the same argument that makes
+this a ranking loss instead of a regression. `--no-normalize-weights` reproduces the failure.
+
+### Why the pair sampler draws a narrow band
+
+A row of 8192 keys has 34M pairs. Uniform sampling spends nearly all of its budget on pairs that
+**cannot matter**: top-k depends only on the order *across* the K-th boundary, so a pair at ranks 3 and
+7000 is already ordered right by any usable router (§23.3). The band is taken around the **router's
+own** current ranking, not the teacher's, which makes the sampler self-correcting — it tracks where the
+router is still uncertain. `wide_band` in the launcher is the ablation.
+
+### What to watch
+
+`score_corr` = Spearman(score, `u`). **The** number. `rank_loss` is weighted by `|u_i − u_j|`, so it
+falls when the *batch gets easier* and cannot say whether the router is learning; `score_corr` is
+against a fixed quantity, and reads directly against the ceiling above.
+
+`|u|` is the teacher's scale. If it collapses, every weight goes to 0 and `rank_loss` falls to 0 while
+the router learns nothing — which reads exactly like convergence.
+
+Measured: on a **repeated batch** `score_corr` climbs +0.013 → **+0.61** and recall 0.357 → 0.65 over
+120 steps, which is what establishes that the wiring and the gradient direction are right. A flat
+curve on *real* data is then about the ceiling or the step count, not a bug —
+`test_the_router_learns_to_rank_by_utility` pins the single-batch version for exactly that reason.
+
+### The result: it does not generalize, and the ceiling is depth-dependent
+
+| setup | score_corr | recall@budget |
+|---|---|---|
+| **repeated** batch, 120 steps | +0.013 → **+0.61** | 0.357 → 0.65 |
+| fresh data, band=32 (12% row coverage) | −0.000 → −0.002 | 0.352 → 0.348 |
+| fresh data, band=128 (50%) | −0.000 → +0.004 | 0.352 → 0.348 |
+| fresh data, band=512 (100%) | −0.000 → −0.010 | 0.352 → 0.348 |
+| **Qwen3-8B, 600 steps, 8K, 8 GPUs** | −0.001 → **+0.016** | 0.349 → 0.360 (random ≈0.35) |
+
+The repeated-batch run rules out a wiring or gradient-direction bug; sweeping `band` over a 16×
+coverage range rules out the sampler. What remains is that `(q_i, k_j) → u_j` **does not generalize** —
+the behavioural form of the +0.03…+0.32 representability probe. `rank_loss` never moved
+(0.64985 → 0.64988), confirming it is useless as a progress signal, exactly as its `|u_i − u_j|`
+weighting predicts.
+
+**The one positive signal is the depth structure**, and it is systematic rather than noise:
+
+| layers | start | end | Δ |
+|---|---|---|---|
+| L0–11 (early) | −0.003 | +0.003 | +0.006 |
+| L12–23 (middle) | −0.001 | +0.003 | +0.003 |
+| **L24–35 (deep)** | +0.002 | **+0.042** | **+0.040** |
+
+Deepest four: L32 +0.085, L33 +0.027, L34 +0.078, **L35 +0.130** — monotone with depth, with ~all the
+learning in the last third. So `u`'s router-reachable fraction is *larger* in deep layers, plausibly
+because deep-layer `v_j` is more collinear with the direction `∂L/∂o` points along, leaving the
+unreachable value term less independent ranking to carry. That makes a depth-selective variant (train
+only the last third, or weight by depth) the cheap next experiment, rather than abandoning the arm or
+giving every layer's indexer value access.
+
+### Cost, and what is deliberately absent
+
+One forward and one backward of the **unmodified** backbone — the cheapest arm here, 5.7 s/step at 8K
+on 8 GPUs at 53.2 GiB peak. Two things keep it there: the ranking loss is built and backwarded *inside*
+the tensor hook that delivers `∂L/∂o`, so nothing is stashed across layers (`∂L/∂o` for all 36 layers
+is 2.4 GiB at 8K), and `α` is recomputed for `n_rows` rows only, never materialized (`(B, H, Sq, Sk)`
+fp32 is 8 GiB per layer at 16K).
+
+No `stage` / `pin_mode` / `gate_budget` (the forward is dense and ungated — there is no gate to
+flatten, so nothing to pin), no `n_candidate` / `explore_frac` (**no pool, by construction**), no
+`chunk_size` (selection is per token). `n_rows` is *not* a pool: the utility is exact for every **key**
+of a sampled row, and only the set of **queries** supervising the router is thinned — 16 rows × 36
+layers × 8 KV heads is ~4600 full rankings per step, all sharing one set of parameters.
+
+`gate_scale` is created for checkpoint compatibility but never trained, and that is correct rather
+than an oversight: the loss reads only score *order*, so a single positive multiplier on all scores is
+unidentifiable. `test_gate_scale_is_deliberately_untrained` states it.
 
 ## Correctness notes
 

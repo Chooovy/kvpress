@@ -1,0 +1,42 @@
+{
+  "ckpt": "/apdcephfs_gy8/share_303843174/guhao/models/Qwen-3-8B-gqa_indexer_exact_k/stage1/step200.pt",
+  "step": 200,
+  "layers": {
+    "0": {
+      "sign_accuracy": 0.5087719298245614,
+      "centered_sign_accuracy": 0.40350877192982454,
+      "bias": -2.8368506523363356e-18,
+      "pearson": -0.007716837558430514,
+      "spearman": -0.007498710443611344,
+      "n_pairs": 64,
+      "mean_abs_true": 0.0009214133024215698
+    },
+    "2": {
+      "sign_accuracy": 0.6166666666666667,
+      "centered_sign_accuracy": 0.6333333333333333,
+      "bias": 0.0,
+      "pearson": 0.311741663992296,
+      "spearman": 0.299157842598034,
+      "n_pairs": 64,
+      "mean_abs_true": 0.000959247350692749
+    },
+    "5": {
+      "sign_accuracy": 0.6610169491525424,
+      "centered_sign_accuracy": 0.6440677966101694,
+      "bias": 2.500580259724828e-16,
+      "pearson": 0.1628038436413479,
+      "spearman": 0.3801223171541792,
+      "n_pairs": 64,
+      "mean_abs_true": 0.0010119080543518066
+    },
+    "7": {
+      "sign_accuracy": 0.6,
+      "centered_sign_accuracy": 0.65,
+      "bias": -1.921238846764303e-15,
+      "pearson": 0.2635513778061388,
+      "spearman": 0.31508846845192345,
+      "n_pairs": 64,
+      "mean_abs_true": 0.0017144829034805298
+    }
+  }
+}

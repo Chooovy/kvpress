@@ -30,7 +30,9 @@ from kvpress.presses.gqa_indexer.cross_replay import (
     CrossReplayTrainer,
     ReadOnlyCache,
     cross_replay_training_step,
+    gate_participation,
     rectangle_mask,
+    replay_horizon_mask,
 )
 from kvpress.presses.gqa_indexer.gate_pin import pinned_mask
 from kvpress.presses.gqa_indexer.press import GQAIndexerPress
@@ -538,16 +540,21 @@ def test_broadcast_gate_equals_an_explicit_one():
 # The gate itself
 # ----------------------------------------------------------------------
 def test_gate_pins_sinks_and_normalizes_the_rest():
-    """Pinned keys take gate 0; gated keys sum to a total multiplier of 1."""
-    trainer = _trainer(n_sink=2)
+    """Pinned keys take gate 0; the gated keys' multipliers sum to the budget ``B``.
+
+    Was written asserting a total of 1, which is the ``B = 1`` special case that turned out to be the
+    degenerate end of the range (``cross_replay_e2e.md`` §2.5). The invariant is ``sum exp(g) = B``.
+    """
+    budget = 8.0
+    trainer = _trainer(n_sink=2, log_budget=math.log(budget))
     torch.manual_seed(0)
     trainer._scores = {0: torch.randn(1, N_KV_HEADS, 12, dtype=torch.float64)}
     gate = trainer.gate(0, N_KV_HEADS)
 
     assert (gate[..., :2] == 0).all(), "sink keys must be pinned at log-space 0"
     total = gate[..., 2:].exp().sum(-1)
-    assert torch.allclose(total, torch.ones_like(total), atol=1e-12), (
-        "gated keys must share a fixed total multiplier of 1"
+    assert torch.allclose(total, torch.full_like(total, budget), rtol=1e-9), (
+        f"gated keys must share a total multiplier of B={budget}, got {total.flatten()[0]}"
     )
 
 
@@ -563,28 +570,110 @@ def test_gate_is_invariant_to_a_global_score_shift():
     assert torch.allclose(a, b, atol=1e-12)
 
 
-def test_budget_constant_would_not_change_the_ranking():
-    """Why no ``+log K`` term exists: it is invisible to the ranking inference uses.
+def test_budget_leaves_the_gated_ranking_alone_but_not_the_sink_ratio():
+    """The budget is invisible *within* the gated set and decisive *against* the sinks.
 
-    Documents the retraction in ``cross_replay_e2e.md`` §2 as an executable fact, so the constant is
-    not reintroduced on the belief that it constrains the cache.
+    The first half was measured correctly and then over-read: because ``log B`` does not change the
+    gated ranking or the conditional distribution over gated keys, the term was dropped as "a
+    gradient-scale knob". That inference is invalid -- it holds the parameters fixed, while
+    concentration is a property of where training *converges*. The second half is the part that was
+    missing, and it is why the term is back: against a pinned sink, ``log B`` does not cancel.
+
+    See ``cross_replay_e2e.md`` §2.5.
     """
     torch.manual_seed(0)
+    n_gated = 62
     scores = torch.randn(1, N_KV_HEADS, 64, dtype=torch.float64)
     gated = torch.arange(64) >= 2
     lse = torch.logsumexp(scores.masked_fill(~gated, -float("inf")), -1, keepdim=True)
     base = torch.where(gated, scores - lse, torch.zeros_like(scores))
 
-    for k in (4.0, 256.0, 2048.0):
-        shifted = base + torch.where(gated, math.log(k), 0.0)
-        # Ranking among gated keys is untouched...
-        assert torch.equal(
-            base[..., 2:].argsort(-1), shifted[..., 2:].argsort(-1)
-        ), f"log K = {k} changed the gated ranking"
-        # ...and so is the conditional distribution over them.
-        pa = torch.softmax(base[..., 2:], -1)
-        pb = torch.softmax(shifted[..., 2:], -1)
-        assert torch.allclose(pa, pb, atol=1e-12)
+    for budget in (4.0, 256.0, 2048.0):
+        # dtype spelled out: `torch.where(gated, math.log(budget), 0.0)` with bare python floats
+        # silently produces an fp32 tensor, which costs 1.5e-08 relative here and would make the
+        # tolerance below look like the code's error rather than the test's.
+        log_b = torch.where(
+            gated, torch.tensor(math.log(budget), dtype=torch.float64), torch.zeros((), dtype=torch.float64)
+        )
+        shifted = base + log_b
+
+        # Within the gated set: nothing moves. Both assertions were true before and remain true.
+        assert torch.equal(base[..., 2:].argsort(-1), shifted[..., 2:].argsort(-1))
+        assert torch.allclose(
+            torch.softmax(base[..., 2:], -1), torch.softmax(shifted[..., 2:], -1), atol=1e-12
+        )
+
+        # Against the pinned sinks: everything moves. sum(exp(gate)) over the gated keys IS B, i.e.
+        # the history is worth exactly B sink-equivalents -- which is what sets the concentration
+        # the router must reach to be audible at all.
+        total = shifted[..., 2:].exp().sum(-1)
+        assert torch.allclose(
+            total, torch.full_like(total, budget), rtol=1e-12
+        ), f"sum exp(gate) should equal B={budget}, got {total.flatten()[0]}"
+
+    # And the flat-gate no-op point is B = n_gated, not B = 1.
+    flat = torch.zeros(1, N_KV_HEADS, 64, dtype=torch.float64)
+    lse_flat = torch.logsumexp(flat.masked_fill(~gated, -float("inf")), -1, keepdim=True)
+    no_op = torch.where(gated, flat - lse_flat + math.log(n_gated), torch.zeros_like(flat))
+    assert torch.allclose(no_op, torch.zeros_like(no_op), atol=1e-12), (
+        "a flat score with B = n_gated must give gate 0 everywhere -- the dense no-op"
+    )
+
+
+def test_budget_enters_the_gate_and_sets_the_history_total():
+    """``CrossReplayTrainer.gate`` must apply ``log B``, not just document it."""
+    torch.manual_seed(0)
+    scores = torch.randn(1, N_KV_HEADS, 32, dtype=torch.float64)
+    n_gated = 32 - 2
+
+    for budget in (1.0, 8.0, 512.0):
+        trainer = _trainer(n_sink=2, log_budget=math.log(budget))
+        trainer._scores = {0: scores}
+        gate = trainer.gate(0, N_KV_HEADS)
+        assert (gate[..., :2] == 0).all(), "sinks stay pinned at 0 whatever the budget"
+        total = gate[..., 2:].exp().sum(-1)
+        assert torch.allclose(total, torch.full_like(total, budget), rtol=1e-9)
+
+    # Unset resolves to the no-op point, which is log(n_gated) -- and warns (see the next test).
+    trainer = _trainer(n_sink=2)
+    assert trainer.resolve_log_budget(n_gated) == pytest.approx(math.log(n_gated))
+
+
+def test_degenerate_budgets_warn(caplog):
+    """The genuinely degenerate end must be surfaced; the recommended end must be quiet.
+
+    **Updated after the 2x2 grid (§15.3).** This test used to assert that ``B = 1`` *warns* and
+    ``B = 2048`` does not, encoding the since-retracted advice "set B to the inference top-k". The
+    measurement inverted it: ``B=1`` scores 48.20 on RULER 8K against ``B=2048``'s 20.43, so ``B=topk``
+    costs 27.8 points and ``B=1`` is the best measured setting. Warning on the recommended value would
+    only teach the reader to ignore the log.
+
+    What remains a real silent failure, and is still asserted: **unset** resolves to ``B = n_gated``,
+    the flat-gate no-op, where the loss can be satisfied with no ranking learned at all.
+    """
+    # B = 1 is the recommendation now, so it must NOT warn.
+    with caplog.at_level("WARNING"):
+        _trainer(log_budget=0.0)
+    assert caplog.text == "", f"B=1 is the measured-best setting and must not warn: {caplog.text}"
+
+    # Unset -> the flat-gate no-op. Still a silent failure, still warned.
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        _trainer()
+    assert "NO-OP" in caplog.text, caplog.text
+
+    # B < 1 is unmeasured territory: noted at INFO, not WARNING.
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        _trainer(log_budget=-1.0)
+    assert "B<1" in caplog.text, caplog.text
+
+    # B = topk no longer warrants a warning: it is a bad setting, but the docstring and the launcher
+    # carry that, and warning here would fire on every legacy-reproduction run.
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        _trainer(log_budget=math.log(2048))
+    assert "NO-OP" not in caplog.text, caplog.text
 
 
 # ----------------------------------------------------------------------
@@ -1270,4 +1359,388 @@ def test_driver_scales_the_loss_by_accum_steps_not_after_the_fact():
     assert "/ args.accum_steps).backward()" not in source, (
         "the returned loss is DETACHED -- scaling it after the fact leaves the gradients "
         "accum_steps times too large, with a perfectly normal-looking loss"
+    )
+
+
+def test_chunking_error_shrinks_with_precision_so_the_logic_is_sound():
+    """Chunking must be exact in *math*; bf16 coarseness is a separate thing.
+
+    The distinction this pins down, per ``cross_replay_e2e.md`` §11.4: on the production bf16 +
+    ``flex_attention`` path, chunking is **not** bit-identical (measured 1e-3 on the loss at
+    ``query_chunk=512``, ~9e-03 relative on gradients), which flatly contradicts §6.1's "exact" as
+    someone would read it. The question is whether the *decomposition* is wrong or the *arithmetic* is
+    coarse, and the discriminator is precision: a logic error would not shrink when dtype widens.
+
+    Asserted as a monotone trend across fp32/fp64 rather than as an absolute bound, because the bound
+    is what varies with hardware and dtype while the trend is what says the math is right.
+
+    Runs on CPU + SDPA (fp64 is unsupported by flex_attention's lowering anyway), so this checks the
+    decomposition, not the kernel. The bf16 numbers in §11.4 are the kernel's contribution and are not
+    reproducible without a GPU.
+    """
+    ids = torch.randint(0, 128, (1, 16))
+
+    def deviation(dtype):
+        results = {}
+        for chunk in (None, 8, 4):
+            torch.manual_seed(0)
+            model = _model().to(dtype)
+            trainer = _trainer(query_chunk=chunk)
+            with trainer.hooks(model):
+                cross_replay_training_step(model, trainer, input_ids=ids)
+            results[chunk] = {
+                name: p.grad.detach().double().clone()
+                for name, p in model.named_parameters()
+                if p.grad is not None and "indexer" in name
+            }
+        worst = 0.0
+        for chunk in (8, 4):
+            for name, ref in results[None].items():
+                magnitude = ref.abs().max().item()
+                if magnitude < 1e-8:
+                    # in_norm.bias's gradient is numerically zero for this input; a relative measure
+                    # there reports ratios of ~9 while differing by 6e-11. §6.1 flags the same case.
+                    continue
+                worst = max(worst, (results[chunk][name] - ref).abs().max().item() / magnitude)
+        return worst
+
+    fp32, fp64 = deviation(torch.float32), deviation(torch.float64)
+    assert fp64 < fp32, (
+        f"chunking deviation did not shrink with precision (fp32 {fp32:.2e} -> fp64 {fp64:.2e}). That "
+        "is the signature of a WRONG DECOMPOSITION rather than rounding: reassociating a sum in wider "
+        "arithmetic must converge, so a flat or growing error means the chunks are not computing the "
+        "same quantity. Check that every chunk still attends to the whole key axis."
+    )
+    assert fp64 < 1e-5, (
+        f"fp64 chunking deviation {fp64:.2e} is too large to be floating-point reassociation; at this "
+        "precision the chunked and unchunked gradients should agree to ~1e-7"
+    )
+
+
+@pytest.mark.parametrize("budget", [1.0, 64.0, 2048.0])
+def test_participation_is_budget_invariant(budget):
+    """A flat gate must read ~1.0 whatever the budget is.
+
+    Without normalizing, ``sum(exp(gate)) = B`` rather than 1, so the participation ratio comes out
+    scaled by ``1/B^2``. That agrees with the truth at ``B = 1`` and only at ``B = 1``, which is why
+    the bug survived until the budget term was added -- and then the ``B=2048`` run logged
+    ``participation = 0.0000`` from step 0, reading as total collapse when the real trajectory was
+    0.927 -> 0.062. A metric used to compare runs at different budgets has to be invariant to the
+    budget.
+    """
+    n_sink, n_gated = 4, 60
+    flat = torch.zeros(1, N_KV_HEADS, n_sink + n_gated, dtype=torch.float64)
+    lse = torch.logsumexp(flat[..., n_sink:], -1, keepdim=True)
+    gate = torch.cat(
+        [
+            torch.zeros(1, N_KV_HEADS, n_sink, dtype=torch.float64),
+            flat[..., n_sink:] - lse + math.log(budget),
+        ],
+        dim=-1,
+    )
+    assert gate_participation(gate, n_sink) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_participation_detects_concentration_at_any_budget():
+    """One key taking everything must read ~1/n_gated, again independent of the budget."""
+    n_sink, n_gated = 4, 60
+    for budget in (1.0, 2048.0):
+        scores = torch.full((1, N_KV_HEADS, n_sink + n_gated), -30.0, dtype=torch.float64)
+        scores[..., n_sink] = 30.0                      # a single winner
+        lse = torch.logsumexp(scores[..., n_sink:], -1, keepdim=True)
+        gate = torch.cat(
+            [
+                torch.zeros(1, N_KV_HEADS, n_sink, dtype=torch.float64),
+                scores[..., n_sink:] - lse + math.log(budget),
+            ],
+            dim=-1,
+        )
+        assert gate_participation(gate, n_sink) == pytest.approx(1.0 / n_gated, rel=1e-6)
+
+
+# ----------------------------------------------------------------------
+# §16 follow-ups: the replay horizon, and max-style demand aggregation
+# ----------------------------------------------------------------------
+def test_replay_horizon_mask_defaults_to_the_rectangle():
+    """``lookahead=None`` must be the untouched rectangle, tag included.
+
+    The default has to stay bit-identical to :func:`rectangle_mask`: every measured arm trained on it,
+    and the ``_kvpress_all_zero`` tag is what lets ``_attention`` drop the mask instead of adding it
+    (a broadcast add measured 73.1 GiB at 8K). A default that silently became a real mask would also
+    disqualify the flex path and cost 46.7 GiB.
+    """
+    plain = rectangle_mask(6, 10, torch.device("cpu"), torch.float32)
+    horizon = replay_horizon_mask(6, 10, torch.device("cpu"), torch.float32, lookahead=None)
+    assert getattr(horizon, "_kvpress_all_zero", False) is True
+    assert torch.equal(plain, horizon)
+
+
+@pytest.mark.parametrize("lookahead", [0, 1, 4])
+def test_replay_horizon_mask_visibility_and_offset(lookahead):
+    """Row ``j`` sees exactly keys ``<= j + lookahead``, and ``query_offset`` shifts the horizon.
+
+    The offset is the load-bearing part: ``cross_replay_training_step`` chunks the replay, so chunk
+    ``[start, stop)`` must index the same key axis the unchunked pass would. Without it every chunk's
+    horizon would restart at 0 and later chunks would see far less than intended -- a silent change to
+    the objective that no loss curve would report.
+    """
+    q_len, k_len, offset = 5, 16, 7
+    mask = replay_horizon_mask(
+        q_len, k_len, torch.device("cpu"), torch.float32,
+        query_offset=offset, lookahead=lookahead,
+    )
+    assert mask.shape == (1, 1, q_len, k_len)
+    visible = mask[0, 0] == 0
+    for j in range(q_len):
+        expected = torch.arange(k_len) <= (offset + j + lookahead)
+        assert torch.equal(visible[j], expected), f"row {j} visibility wrong"
+    # A real mask must NOT be tagged, or _attention would drop it and silently restore the rectangle.
+    assert getattr(mask, "_kvpress_all_zero", False) is False
+
+
+def test_lookahead_zero_reproduces_causal_visibility():
+    """``lookahead=0`` is the causal triangle the e2e LM loss trains on.
+
+    This is the point of the knob (§16.3): it lets the two objectives' supervision *shapes* be
+    compared with everything else held fixed.
+    """
+    n = 12
+    mask = replay_horizon_mask(n, n, torch.device("cpu"), torch.float32, lookahead=0)
+    causal = torch.arange(n).view(n, 1) >= torch.arange(n).view(1, n)
+    assert torch.equal(mask[0, 0] == 0, causal)
+
+
+def test_negative_lookahead_is_rejected():
+    """A negative horizon would hide the query's own position; no objective here wants that."""
+    with pytest.raises(ValueError, match="non-negative"):
+        replay_horizon_mask(4, 8, torch.device("cpu"), torch.float32, lookahead=-1)
+    with pytest.raises(ValueError, match="non-negative"):
+        _trainer(lookahead=-1)
+
+
+def test_demand_reduce_is_validated():
+    """An unknown reduction must fail at construction, not run as ``sum``."""
+    with pytest.raises(ValueError, match="demand_reduce"):
+        _trainer(demand_reduce="median")
+
+
+def test_demand_reduce_max_needs_more_than_one_chunk():
+    """With one query chunk the reduction is inert, so it must raise rather than pretend.
+
+    A single demand group makes ``max`` and ``sum`` arithmetically identical. Accepting it would give
+    a knob that looks configured, trains cleanly, and does nothing -- the exact failure shape this
+    module's history is full of.
+    """
+    model = _model()
+    press = _press()
+    trainer = _trainer(press, query_chunk=None, demand_reduce="max")
+    ids = torch.randint(0, 128, (1, 16))
+    with trainer.hooks(model):
+        with pytest.raises(ValueError, match="at least 2 query chunks"):
+            cross_replay_training_step(model, trainer, input_ids=ids)
+
+
+def test_demand_reduce_max_changes_the_indexer_gradient():
+    """``max`` must produce a *different* gradient from ``sum`` -- the mutation test for the knob.
+
+    Runs the identical step twice, same model, same tokens, same seed, differing only in
+    ``demand_reduce``, and compares the accumulated indexer gradients. A knob that reduced to ``sum``
+    would pass every other test here while changing nothing.
+
+    ``mean`` is the null control: it is ``sum / n_chunks``, so each parameter's gradient must stay
+    *parallel* to ``sum``'s and differ only in scale. That separates "the reduction changed the
+    direction" from "the reduction changed the effective learning rate".
+
+    Checked **per parameter**, not on the concatenation, because ``gate_scale`` is deliberately
+    outside the reduction: it is applied inside each chunk's own graph, so its gradient accumulates
+    directly and keeps summing whatever the reduction is (see ``cross_replay_training_step``'s Notes).
+    Concatenating a ``1.0``-scaled ``gate_scale`` with ``1/n_chunks``-scaled weights tilts the pooled
+    vector and reads as a direction change that is not one -- measured cos 0.9981 on the concatenation
+    against 1.000000 for every individual tensor.
+    """
+    ids = torch.randint(0, 128, (1, 32))
+
+    def grads_for(reduce: str):
+        torch.manual_seed(0)
+        model = _model()
+        trainer = _trainer(_press(), query_chunk=8, demand_reduce=reduce)
+        with trainer.hooks(model):
+            cross_replay_training_step(model, trainer, input_ids=ids)
+        return {
+            name: p.grad.detach().clone()
+            for name, p in model.named_parameters()
+            if p.grad is not None and ".indexer." in name
+        }
+
+    g_sum, g_max, g_mean = grads_for("sum"), grads_for("max"), grads_for("mean")
+    assert g_sum, "the sum baseline produced no indexer gradient at all"
+
+    # `max` must differ in DIRECTION on the weights the reduction actually reaches. A rescaled sum
+    # would be a no-op dressed up as a knob.
+    weight_names = [n for n in g_sum if not n.endswith("gate_scale")]
+    assert weight_names, "no non-gate_scale indexer parameters received a gradient"
+    changed = [
+        n
+        for n in weight_names
+        if F.cosine_similarity(g_sum[n].reshape(-1), g_max[n].reshape(-1), dim=0) < 0.999
+    ]
+    assert changed, (
+        "demand_reduce='max' is indistinguishable from 'sum' on every indexer weight: "
+        + ", ".join(
+            f"{n} cos="
+            f"{F.cosine_similarity(g_sum[n].reshape(-1), g_max[n].reshape(-1), dim=0):.6f}"
+            for n in weight_names
+        )
+    )
+
+    # `mean` must be parallel per parameter, and scaled by exactly 1/n_chunks (32 tokens at
+    # query_chunk=8 -> 4 chunks) on the weights the reduction reaches.
+    for name in weight_names:
+        cos = F.cosine_similarity(g_sum[name].reshape(-1), g_mean[name].reshape(-1), dim=0)
+        assert cos > 0.999, f"'mean' should be parallel to 'sum' for {name}, got cos={cos:.6f}"
+        ratio = (g_mean[name].norm() / g_sum[name].norm()).item()
+        assert abs(ratio - 0.25) < 1e-6, f"{name}: expected 1/4 scaling, got {ratio:.4f}"
+
+
+def test_lookahead_changes_the_indexer_gradient():
+    """A bounded horizon must actually change what the router is trained on."""
+    ids = torch.randint(0, 128, (1, 24))
+
+    def grads_for(lookahead):
+        torch.manual_seed(0)
+        model = _model()
+        trainer = _trainer(_press(), lookahead=lookahead)
+        with trainer.hooks(model):
+            cross_replay_training_step(model, trainer, input_ids=ids)
+        return torch.cat(
+            [
+                p.grad.reshape(-1)
+                for p in trainer.indexer_parameters(model)
+                if p.grad is not None
+            ]
+        )
+
+    g_rect, g_causal = grads_for(None), grads_for(0)
+    assert g_rect.norm() > 0
+    cos = F.cosine_similarity(g_rect, g_causal, dim=0)
+    assert cos < 0.999, f"lookahead=0 did not change the gradient (cos={cos:.6f})"
+
+
+def test_lookahead_flex_and_sdpa_paths_agree():
+    """The horizon expressed in ``score_mod`` must equal the horizon expressed as an ``attn_mask``.
+
+    ``_attention`` deliberately routes a bounded-lookahead run through ``score_mod`` rather than
+    letting the real mask reach SDPA: a real mask disqualifies every fused backend and lands on the
+    1288 MiB MATH row (§6.3), and keeping flex is what lets the ablation run at arm D's own
+    ``query_chunk`` -- i.e. what keeps it single-variable. The cost of that choice is a *second*
+    expression of the same predicate, so the two must be pinned together or the flex and non-flex runs
+    would silently train different objectives.
+
+    Tolerance is fp32 on ``dL/dgate`` for the reason the sibling test documents: ``score_keys`` returns
+    ``.float()``, so that gradient floors at fp32 epsilon.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("flex_attention is CUDA-only")
+    from torch.nn.attention.flex_attention import flex_attention
+
+    torch.manual_seed(0)
+    b, h_q, h_kv, s_q, s_k, dim = 1, 8, 2, 128, 256, 64
+    group = h_q // h_kv
+    lookahead, query_offset = 3, 64
+
+    q = torch.randn(b, h_q, s_q, dim, device="cuda", dtype=torch.float64, requires_grad=True)
+    k = torch.randn(b, h_kv, s_k, dim, device="cuda", dtype=torch.float64)
+    v = torch.randn(b, h_kv, s_k, dim, device="cuda", dtype=torch.float64)
+    gate = torch.randn(b, h_kv, s_k, device="cuda", dtype=torch.float32, requires_grad=True)
+    cotangent = torch.randn(b, h_q, s_q, dim, device="cuda", dtype=torch.float64)
+
+    # SDPA reference: gate as a broadcast bias PLUS the real horizon mask, which is what the non-flex
+    # branch of `_attention` builds.
+    horizon_mask = replay_horizon_mask(
+        s_q, s_k, torch.device("cuda"), torch.float64,
+        query_offset=query_offset, lookahead=lookahead,
+    )
+    bias = gate.to(q.dtype).repeat_interleave(group, dim=1).unsqueeze(2)
+    reference = F.scaled_dot_product_attention(
+        q, k, v, attn_mask=bias + horizon_mask.to(bias.dtype), scale=dim**-0.5, enable_gqa=True
+    )
+    ref_dq, ref_dgate = torch.autograd.grad(reference, (q, gate), cotangent)
+
+    # Flex: the same predicate inside score_mod, as `_flex_attention` builds it.
+    def score_mod(score, batch, head, q_idx, kv_idx):
+        gated = score + gate[batch, head // group, kv_idx].to(score.dtype)
+        visible = kv_idx <= q_idx + (query_offset + lookahead)
+        return torch.where(visible, gated, torch.full_like(gated, float("-inf")))
+
+    out = flex_attention(q, k, v, score_mod=score_mod, scale=dim**-0.5, enable_gqa=True)
+    dq, dgate = torch.autograd.grad(out, (q, gate), cotangent)
+
+    assert (out - reference).abs().max() < 1e-12, "horizon: flex and SDPA disagree in the forward"
+    assert (dq - ref_dq).abs().max() < 1e-12, "horizon: flex and SDPA disagree on dL/dq"
+    assert (dgate - ref_dgate).abs().max() < 1e-5, "horizon: flex and SDPA disagree on dL/dgate"
+    assert dgate.abs().max() > 0, "no gradient reached the gate at all"
+
+
+def test_horizon_mask_carries_its_parameters_for_the_flex_path():
+    """The horizon mask must expose ``lookahead``/``query_offset``, and the rectangle must not.
+
+    ``_attention`` keys the flex horizon off these attributes. If the rectangle grew them it would
+    apply a bound to the unbounded objective; if the horizon mask lost them the run would fall to
+    SDPA MATH and change ``query_chunk``'s memory profile without saying so.
+    """
+    horizon = replay_horizon_mask(
+        4, 8, torch.device("cpu"), torch.float32, query_offset=5, lookahead=2
+    )
+    assert horizon._kvpress_lookahead == 2
+    assert horizon._kvpress_query_offset == 5
+
+    rect = replay_horizon_mask(4, 8, torch.device("cpu"), torch.float32, lookahead=None)
+    assert not hasattr(rect, "_kvpress_lookahead")
+    assert getattr(rect, "_kvpress_all_zero", False) is True
+
+
+def test_lookahead_does_not_trip_the_flex_recompile_limit():
+    """A chunked lookahead run must stay on the *compiled* flex path.
+
+    The horizon bound is passed into ``score_mod`` as a 0-d tensor rather than a Python int on purpose.
+    As an int it is a compile-time constant, so each chunk's distinct ``query_offset`` becomes its own
+    dynamo cache entry; past ``recompile_limit`` (8) dynamo stops compiling and ``flex_attention``
+    **falls back to its eager reference implementation**, which materializes the full score matrix --
+    18730 MiB against 40 MiB per layer, i.e. the 460x regression ``compiled_flex_attention``'s
+    docstring exists to warn about.
+
+    It arrives as nothing but a ``UserWarning``, so this test watches for that warning. Measured before
+    the fix: 16 chunks produced the fallback; after, zero.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("flex_attention is CUDA-only")
+    import warnings
+
+    torch.manual_seed(0)
+    config = Qwen3Config(
+        vocab_size=256,
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=2,
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        head_dim=32,
+        max_position_embeddings=8192,
+        attn_implementation="sdpa",
+    )
+    model = Qwen3ForCausalLM(config).eval().to("cuda", torch.bfloat16)
+    # 16 chunks: twice dynamo's recompile_limit, so a per-chunk guard cannot survive it.
+    trainer = _trainer(_press(n_sink=4), query_chunk=128, lookahead=0, log_budget=0.0)
+    ids = torch.randint(0, 256, (1, 2048), device="cuda")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with trainer.hooks(model):
+            cross_replay_training_step(model, trainer, input_ids=ids)
+        fell_back = [w for w in caught if "without torch.compile" in str(w.message)]
+
+    assert not fell_back, (
+        "flex_attention fell back to its eager reference implementation over 16 chunks: the horizon "
+        "bound is being traced as a compile-time constant, which costs 460x memory. Pass it as a "
+        f"tensor. First warning: {str(fell_back[0].message)[:120]}"
     )

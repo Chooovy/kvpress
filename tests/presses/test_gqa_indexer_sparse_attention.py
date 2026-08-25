@@ -644,12 +644,22 @@ def test_topk_tiles_matches_the_measured_optimum():
     """
     The eval's configuration must land on the tiling that was actually measured fastest.
 
-    ``topk=2048`` with 68 forced slots gives ``take=1980``, where an H20 at ``L=16384`` measured
-    selection at 26.7 s (``key_tile=512``), 9.2 s (2048) and 6.5 s (4096). Pinning 4096 here is
-    what stops a future "tidy up the heuristic" from quietly walking back a 4.1x.
+    ``topk=2048`` with 68 forced slots gives ``take=1980``. History, all on an H20 at
+    ``L=16384``: ``key_tile=512`` measured 26.7 s, 2048 -> 9.2 s, 4096 -> 6.5 s, which is why 4096
+    was pinned here. Raising ``TOPK_SCRATCH_BUDGET`` to 16M then made a *single pass* over the key
+    axis affordable, and re-measuring the same shape gave 4096 -> 4.02 s against 16384 -> 2.37 s
+    (**1.70x**); at ``L=8030`` it is 1.07 s against 0.82 s (1.30x). Single-pass also removes the
+    tournament merge entirely, so redundancy is exactly 1.0x rather than 1.48x.
+
+    Pinning the whole key axis here is what stops a future "tidy up the heuristic" -- or a revert
+    of the budget -- from quietly walking that back.
     """
     key_tile, _ = topk_tiles(take=1980, k_len=16384, q_len=16384)
-    assert key_tile == 4096, f"expected the measured optimum 4096, got {key_tile}"
+    assert key_tile == 16384, f"expected a single pass over the key axis, got {key_tile}"
+
+    # And the fallback must still be the old knee when the budget genuinely cannot hold one pass.
+    narrow, _ = topk_tiles(take=1980, k_len=16384, q_len=16384, budget=2_000_000)
+    assert narrow == 4096, f"expected the 2M-budget knee 4096, got {narrow}"
 
 
 @pytest.mark.parametrize("topk,force_sink,force_local", [(12, 2, 3), (64, 4, 16), (17, 0, 0)])

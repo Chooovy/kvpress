@@ -49,16 +49,26 @@ so each is checked rather than trusted:
 3. ``d_max = 2N - 1`` can exceed the model's trained position range, putting replay queries at
    positions never seen in pretraining. Warned in :meth:`CrossReplayTrainer.hooks`.
 
-No budget constant is applied. ``+log K`` on the gated keys is added to *every* gated key, so it
-cancels inside the gated softmax and is invisible to the ``TopK(s)`` that inference performs -- it
-moves gradient *magnitude*, not the ranking. See ``cross_replay_e2e.md`` §2, which retracts an
-earlier recommendation to add one.
+The gate carries a **budget** term, ``log B`` on the gated keys, and it is load-bearing: the identity
+``sum_{j gated} exp(g_j) = B`` makes ``B`` the number of sink-equivalents the whole history is worth.
+It cancels *within* the gated softmax -- so at fixed parameters it changes neither the ranking nor the
+participation -- but not against the pinned sinks, so it decides how concentrated the gate becomes at
+convergence. **Leave it at 1**: "set it to the inference top-k" was this module's advice and is
+retracted -- measured, ``B=topk`` costs 27.8 RULER points against ``B=1``. See
+:attr:`CrossReplayTrainer.log_budget` and ``cross_replay_e2e.md`` §15.3.
+
+Two knobs exist for §16's follow-ups, both defaulting to today's behaviour:
+:attr:`~CrossReplayTrainer.demand_reduce` (how the replay queries' demands on one key combine into
+``dL/ds`` -- ``max`` approximates KVzip's max-attention label) and
+:attr:`~CrossReplayTrainer.lookahead` (a bound on how far past its own position a replay row may see,
+where ``0`` is the causal triangle the e2e loss trains on). See ``cross_replay_e2e.md`` §17.
 """
 
 from __future__ import annotations
 
 import functools
 import logging
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -238,6 +248,72 @@ def rectangle_mask(
     return mask
 
 
+def replay_horizon_mask(
+    q_len: int,
+    k_len: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    query_offset: int = 0,
+    lookahead: int | None = None,
+) -> torch.Tensor:
+    """
+    The replay mask with a bounded **lookahead**: row ``j`` sees keys ``<= j + lookahead``.
+
+    Generalises :func:`rectangle_mask`, which is the ``lookahead=None`` (unbounded) case and stays the
+    default everywhere. This exists to test §16.3's mechanism: the full rectangle makes every replay
+    row choose among all ``N`` keys from step 0, so one ``s_i`` must satisfy ``N`` heterogeneous
+    demands under a ``sum exp(g) = B`` constraint, and the cheapest solution is to concentrate on the
+    few keys every query wants. Every cross-replay arm converged that way (participation 0.007-0.062)
+    against the causal e2e arm's 0.165, across 26x capacity and 2048x budget -- see §16.3's table.
+
+    ``lookahead`` interpolates between the two objectives' supervision shapes:
+
+    * ``None``  -- the full rectangle. Today's cross-replay. Row ``j`` sees all ``k_len`` keys.
+    * ``0``     -- row ``j`` sees ``[0, j]``, i.e. the causal triangle the e2e LM loss trains on.
+      Note the target ``C'[j+1]`` then lies outside the visible set, matching e2e exactly.
+    * ``m > 0`` -- ``[0, j + m]``. A ramp: the candidate set still grows with ``j``, so the
+      difficulty curriculum §16.3 identifies is preserved, but each row sees ``m`` keys of context
+      beyond its own position.
+
+    ``query_offset`` is the absolute position of row 0 within ``C'``, needed because
+    :func:`cross_replay_training_step` chunks the replay: chunk ``[start, stop)`` has
+    ``query_offset=start``, so its rows index the same key axis the unchunked pass would.
+
+    Returns an additive ``(1, 1, q_len, k_len)`` mask. Unlike :func:`rectangle_mask` this one carries
+    real ``-inf`` entries, so it is **not** tagged ``_kvpress_all_zero`` and
+    :meth:`CrossReplayTrainer._attention` will not drop it -- which also means it disqualifies the
+    flex path (``flex_fallback_reason`` refuses a non-rectangle mask) and lands on SDPA MATH. That is
+    the 46.7 GiB retention path, so a bounded-lookahead run needs a smaller ``query_chunk``; the
+    alternative is to express the horizon inside ``score_mod``, which is the follow-up if the ablation
+    proves worth keeping.
+    """
+    if lookahead is None:
+        return rectangle_mask(q_len, k_len, device, dtype)
+    if lookahead < 0:
+        raise ValueError(
+            f"lookahead must be non-negative or None, got {lookahead}: a negative horizon would "
+            "hide keys at and before the query's own position, which no objective here wants"
+        )
+    rows = torch.arange(query_offset, query_offset + q_len, device=device).view(q_len, 1)
+    keys = torch.arange(k_len, device=device).view(1, k_len)
+    visible = keys <= rows + lookahead
+    if not bool(visible.any()):
+        raise ValueError(
+            f"lookahead={lookahead} at query_offset={query_offset} leaves some row with no visible "
+            "keys; every replay row must see at least its own position"
+        )
+    mask = torch.zeros((1, 1, q_len, k_len), device=device, dtype=dtype)
+    mask.masked_fill_(~visible.view(1, 1, q_len, k_len), torch.finfo(dtype).min)
+    # Carry the horizon so :meth:`CrossReplayTrainer._attention` can reproduce it inside
+    # ``score_mod`` and keep the flex path, instead of letting a real mask force SDPA MATH (46.7 GiB,
+    # §6.3). The mask itself stays the single source of truth: the flex branch recomputes exactly
+    # this predicate, and ``test_lookahead_flex_and_sdpa_paths_agree`` pins the two together.
+    mask._kvpress_lookahead = int(lookahead)
+    mask._kvpress_query_offset = int(query_offset)
+    return mask
+
+
 @dataclass
 class CrossReplayTrainer:
     """
@@ -275,6 +351,83 @@ class CrossReplayTrainer:
 
         Peak activation is ``O(query_chunk)`` instead of ``O(N)``: on Qwen3-8B at 16K, ~10 GiB at
         ``query_chunk=1024`` against ~65 GiB unchunked.
+    log_budget : float, optional
+        ``log B`` in the gate ``s_j - LSE(s) + log B``, applied to the gated keys only.
+
+        Sets **how concentrated the gate is at convergence**, which is a different thing from the
+        ranking it learns. The identity is ``sum_{j gated} exp(g_j) = B``: the gated keys share a
+        total multiplier of ``B`` while each pinned sink sits at 1. So ``B`` is the number of sink-
+        equivalents the whole history is worth, and with a flat score every gated key gets
+        ``B / n_gated``.
+
+        ⚠️ **RETRACTED: "set it to the inference top-k."** That was this docstring's advice, argued
+        from representability -- a hard top-k gate keeps ``topk`` keys at multiplier 1 and drops the
+        rest, whose ``sum exp(g)`` is exactly ``topk``, so ``B = topk`` is the only exactly
+        representable value. The 2x2 grid was completed and **representability is not the property
+        that matters**. Isolating ``B`` at fixed ``mid_dim=256``, RULER 8K, ``fraction=0.100``,
+        step 600: ``B=1`` scores **48.20** and ``B=2048`` scores **20.43** -- so ``B = topk`` costs
+        **27.8 points**, against an 18.0-point objective gap and 3.4 points for 26x the scorer
+        capacity. It is the largest single effect measured on this objective and its sign is negative.
+        **Leave it at 1.** See ``cross_replay_e2e.md`` §15.3.
+
+        Also retracted: that ``B = 1`` *caused* the first run's low participation. The e2e arm -- the
+        best of the four -- also trains at ``B = 1`` (``E2EIndexerTrainer.gate_budget`` defaults to
+        ``1.0``) with 24x the participation at the same ``B``. Concentration is set by the loss
+        geometry, not by ``B`` (§15.2, §16.3).
+
+        * ``B = 1`` (what omitting the term gives) makes the entire history worth **one** sink. At
+          ``n_gated = 16384`` a flat gate is then ``6.1e-05`` per key. This was believed to be the
+          cause of the first run's collapse; it is not, and it is the measured-best setting.
+        * ``B = n_gated`` is the flat-gate no-op point (``g_j = 0`` for all ``j``), where the router
+          can satisfy the loss having learned nothing. That is what pinning exists to prevent, so it
+          is the diagnostic reference rather than a setting -- and it is what ``None`` resolves to.
+          This end of the range is **not** retracted.
+    lookahead : int, optional
+        Bound on how far past its own position a replay row may see, in keys. ``None`` (the default)
+        is the unbounded rectangle -- today's objective, and what every measured arm trained on.
+
+        This is the knob for §16.3's mechanism: under the rectangle every row chooses among all ``N``
+        keys from step 0, so one ``s_i`` must satisfy ``N`` heterogeneous demands under
+        ``sum exp(g) = B``, and the cheap solution is to concentrate on the few keys every query
+        wants. All three cross-replay arms converged there (participation 0.007-0.062) against the
+        causal e2e arm's 0.165, across 26x capacity and 2048x budget. ``0`` reproduces e2e's causal
+        triangle; a small positive value keeps a growing candidate set (hence the difficulty ramp the
+        rectangle lacks) while letting each row see a little context beyond itself.
+
+        **Keeps the flex path.** A bounded horizon is a real mask, which would disqualify every fused
+        backend and land on SDPA MATH (46.7 GiB, §6.3) -- so :meth:`_attention` lifts it out of the
+        mask and re-expresses it inside ``score_mod`` instead. That matters for the ablation as much as
+        for memory: it means a lookahead run needs **no change to** ``query_chunk``, so it stays
+        single-variable against the unbounded arm. The non-flex branch (CPU, no-flex torch) still
+        applies the real mask, and ``test_lookahead_flex_and_sdpa_paths_agree`` pins the two together.
+    demand_reduce : str
+        How the replay queries' demands on one key are combined into ``dL/ds_i``. ``"sum"`` (default)
+        is plain autograd accumulation and is what every measured arm trained with.
+
+        The motivation is the KVzip contrast (``cross_replay_e2e.md`` §16.4). §4's gradient is
+        ``dL/ds_i = sum_j A_ji <dL/do_j, v_i - o_j>`` -- an average over all ``N`` replay queries,
+        which §16.3 argues is what drives every cross-replay arm to over-concentrate. KVzip takes the
+        **max** attention over queries instead, and a max is not a compromise: each key keeps its
+        *best* query's demand rather than the mean of ``N``, which is what a retrieval task needs and
+        what an average destroys. KVzip gets this for free because it never differentiates.
+
+        A true per-query max would need one backward per query. The affordable granularity is the
+        **query chunk**: ``"max"`` harvests and zeroes ``leaves[idx].grad`` after each chunk, then
+        combines the per-chunk demands, so ``N / query_chunk`` demand groups compete rather than all
+        ``N`` queries averaging. Requires at least 2 chunks and raises otherwise -- with one chunk the
+        reduction is arithmetically inert and would be a silently dead knob.
+
+        ``"mean"`` is the null control: it is ``sum`` divided by the chunk count, i.e. the same
+        direction at a smaller magnitude, so it separates "the reduction changed the direction" from
+        "the reduction changed the effective learning rate". ``"max"`` is rescaled by the chunk count
+        for the same reason.
+
+        This parameter did not exist for one revision, on the reasoning that ``+log B`` is added to
+        every gated key alike and therefore cancels. It *does* cancel **within** the gated softmax,
+        so at fixed parameters it changes neither the ranking nor the participation -- but it does
+        not cancel against the pinned sinks, so it moves where training converges. Measured on
+        Qwen3-8B/0.6B at 4K, only ``B`` varying: final participation 0.254/0.236 at ``B=1`` against
+        0.710/0.951 raw. See ``cross_replay_e2e.md`` §2.5.
     freeze : bool
         Freeze every non-indexer parameter on :meth:`hooks` entry.
     """
@@ -283,6 +436,9 @@ class CrossReplayTrainer:
     pin_mode: str = "sink"
     n_sink: int | None = None
     query_chunk: int | None = None
+    log_budget: float | None = None
+    lookahead: int | None = None
+    demand_reduce: str = "sum"
     freeze: bool = True
 
     #: Layer index -> ``gate_scale`` on the last pass, for logging.
@@ -305,6 +461,15 @@ class CrossReplayTrainer:
 
     def __post_init__(self):
         check_pin_mode(self.pin_mode)
+        if self.demand_reduce not in ("sum", "max", "mean"):
+            raise ValueError(
+                f"demand_reduce must be 'sum', 'max' or 'mean', got {self.demand_reduce!r}"
+            )
+        if self.lookahead is not None and self.lookahead < 0:
+            raise ValueError(
+                f"lookahead must be non-negative or None, got {self.lookahead}: a negative horizon "
+                "would hide the query's own position and earlier keys"
+            )
         if pins_self(self.pin_mode):
             # The decisive geometric fact, and the reason this is an error rather than a warning:
             # under [C ; C'] the diagonal key of replay query j sits in the C' block, which this
@@ -332,6 +497,30 @@ class CrossReplayTrainer:
             )
         if self.query_chunk is not None and self.query_chunk <= 0:
             raise ValueError(f"query_chunk must be positive, got {self.query_chunk}")
+        if self.log_budget is None:
+            # Not an error: B = n_gated is the flat-gate no-op point, which is the right *reference*
+            # for a diagnostic and the wrong setting for a run. Warned rather than defaulted away,
+            # because a silent B=n_gated trains a router that can satisfy the loss having learned
+            # nothing -- the exact hole pinning exists to close.
+            logger.warning(
+                "log_budget is unset, so it resolves to log(n_gated) -- the flat-gate NO-OP point, "
+                "where the router can satisfy the loss without learning any ranking. Pass "
+                "log_budget=math.log(topk) to train at the budget inference will evict at."
+            )
+        elif self.log_budget <= 0.0:
+            # log B <= 0 means B <= 1. This USED to warn and tell the caller to pass log(topk); that
+            # advice is retracted -- the 2x2 grid measured B=1 at 48.20 RULER against B=2048's 20.43,
+            # so B=topk costs 27.8 points and B=1 is the best measured setting (§15.3). Kept as an
+            # info-level note rather than a warning, because B<1 (strictly) is still worth flagging:
+            # nothing has measured it, and the identity makes the whole history worth less than one
+            # sink. Silence at exactly B=1, which is the recommended value.
+            if self.log_budget < 0.0:
+                logger.info(
+                    "log_budget=%.4f means B<1: the entire gated history is worth less than one "
+                    "pinned sink. B=1 (log_budget=0) is the measured-best setting; values below it "
+                    "are unmeasured. See cross_replay_e2e.md §15.3.",
+                    self.log_budget,
+                )
 
     @property
     def sink_count(self) -> int:
@@ -491,20 +680,18 @@ class CrossReplayTrainer:
         """
         The additive log-gate over ``C``'s keys, ``(B, H_kv, N)``.
 
-        ``score - logsumexp(score over gated keys)`` on the gated keys and ``0`` on the pinned
-        leading keys, matching :func:`~.gate_pin.gate_from_score` exactly -- reproduced here rather
-        than called because that helper takes the materialized ``(B, h, Sq, Sk)`` layout this
-        objective never builds.
+        ``score - logsumexp(score over gated keys) + log B`` on the gated keys and ``0`` on the
+        pinned leading keys, matching :func:`~.gate_pin.gate_from_score` plus the budget term --
+        reproduced here rather than called because that helper takes the materialized
+        ``(B, h, Sq, Sk)`` layout this objective never builds.
 
         The pin is what makes the normalizer load-bearing. Normalizing *without* it is inert: the
         logsumexp is one constant per row, so it cancels in the attention softmax along with
         everything else. Exempting the leading keys breaks that symmetry -- they sit at multiplier
-        1 while the gated keys share a fixed total -- so the router can only choose *which* keys
-        receive the budget, and that choice is the ranking.
+        1 while the gated keys share a total of ``B`` -- so the router can only choose *which* keys
+        receive that budget, and that choice is the ranking.
 
-        No ``+log K`` budget term: it would be added to every gated key alike, cancel inside the
-        gated softmax, and be invisible to the ``TopK(s)`` inference performs. See the module
-        docstring.
+        The budget term is what :attr:`log_budget` sets; see it for why omitting it is not neutral.
         """
         scores = self._scores[layer_idx]
         if scores.shape[1] != n_kv_heads:
@@ -523,7 +710,20 @@ class CrossReplayTrainer:
         lse = torch.logsumexp(
             scores.masked_fill(~gated, -float("inf")), dim=-1, keepdim=True
         )
-        return torch.where(gated, scores - lse, torch.zeros_like(scores))
+        normalized = scores - lse + self.resolve_log_budget(k_len - n_sink)
+        return torch.where(gated, normalized, torch.zeros_like(scores))
+
+    def resolve_log_budget(self, n_gated: int) -> float:
+        """
+        ``log B`` for this row, resolving :attr:`log_budget`'s sentinels.
+
+        ``None`` -> ``log(n_gated)``, the flat-gate no-op point, which is the *wrong* default for
+        training and is offered only as the diagnostic reference. Negative sentinel is not used;
+        a numeric value is taken as ``log B`` directly.
+        """
+        if self.log_budget is None:
+            return math.log(max(n_gated, 1))
+        return float(self.log_budget)
 
     def _note_flex_shape(self, query: torch.Tensor, key: torch.Tensor) -> None:
         """
@@ -553,7 +753,7 @@ class CrossReplayTrainer:
                 len(self._flex_shapes), sorted(self._flex_shapes),
             )
 
-    def _flex_attention(self, query, key, value, gate, group_size, scale):
+    def _flex_attention(self, query, key, value, gate, group_size, scale, horizon=None):
         """
         Gated attention through ``flex_attention``: the gate enters as a ``score_mod``, never a mask.
 
@@ -593,14 +793,48 @@ class CrossReplayTrainer:
 
         Queries are padded to :data:`_FLEX_Q_ALIGN` and sliced back; see that constant for the
         autotuner failure that forces it.
+
+        ``horizon``, when given, is ``(lookahead, query_offset)`` from
+        :func:`replay_horizon_mask`, and the bound is applied **inside** ``score_mod`` rather than as
+        an ``attn_mask``. That is what lets a bounded-lookahead run keep this 48 MiB path instead of
+        falling to the 1288 MiB MATH row -- and, just as importantly, it means the ablation needs no
+        change to ``query_chunk``, so it stays single-variable against the unbounded arm.
+
+        Expressed as ``-inf`` on out-of-horizon pairs rather than a ``mask_mod``/``BlockMask``: the
+        block mask would skip whole tiles and be faster, but ``score_mod`` alone keeps this method's
+        signature and its verified gradient path, and the horizon is an ablation rather than the
+        production configuration. Note the padded query rows (see above) get positions past the real
+        ``q_len``; their cotangent is zero either way, so a horizon computed for them is harmless.
         """
         flex = compiled_flex_attention()
         # score_mod is traced, so this closes over `gate` by reference: no (Sq, N) tensor is formed
         # and the gradient flows back into `gate` through the compiled backward (verified against
         # SDPA: forward maxdiff 5.6e-16 fp64, dL/dgate maxdiff 4.8e-07 -- the fp32 floor this gate
         # path already sits at, since ScalarIndexer.score_keys returns .float()).
-        def score_mod(score, b, h, q_idx, kv_idx):
-            return score + gate[b, h // group_size, kv_idx].to(score.dtype)
+        if horizon is None:
+            def score_mod(score, b, h, q_idx, kv_idx):
+                return score + gate[b, h // group_size, kv_idx].to(score.dtype)
+        else:
+            lookahead, query_offset = horizon
+            # Same predicate as replay_horizon_mask's `keys <= rows + lookahead`, with `rows` the
+            # ABSOLUTE replay position (query_offset + q_idx) so a chunked run matches the unchunked
+            # one.
+            #
+            # The bound is a 0-d TENSOR, not a Python int, and that is load-bearing. As an int it is
+            # traced as a compile-time constant, so every chunk's distinct `query_offset` is a fresh
+            # dynamo cache entry: measured 42 recompile events at 4 chunks, and at 16 chunks it blows
+            # through dynamo's recompile_limit of 8 and **falls back to eager flex_attention** -- the
+            # 460x regression (18730 MiB vs 40 MiB per layer) that `compiled_flex_attention`'s
+            # docstring exists to warn about, arriving silently as a mere UserWarning. As a tensor the
+            # value is an input rather than a guard, so all chunks share one compiled kernel.
+            bound = torch.tensor(
+                query_offset + lookahead, device=query.device, dtype=torch.int32
+            )
+
+            def score_mod(score, b, h, q_idx, kv_idx):
+                gated = score + gate[b, h // group_size, kv_idx].to(score.dtype)
+                visible = kv_idx <= q_idx + bound
+                return torch.where(visible, gated, torch.full_like(gated, float("-inf")))
 
         q_len = query.shape[2]
         pad = (-q_len) % _FLEX_Q_ALIGN
@@ -662,16 +896,39 @@ class CrossReplayTrainer:
         if real_mask is not None and getattr(real_mask, "_kvpress_all_zero", False):
             real_mask = None
 
+        # A bounded replay horizon (replay_horizon_mask with lookahead set) is a REAL mask, so leaving
+        # it here would disqualify flex and land on the 1288 MiB MATH row. It is instead re-expressed
+        # inside score_mod from the (lookahead, query_offset) the mask carries, which keeps the 48 MiB
+        # path and -- the reason it matters for the ablation -- keeps query_chunk unchanged, so the
+        # comparison against the unbounded arm stays single-variable. The SDPA branch below still
+        # applies the real mask, and the two are pinned together by
+        # `test_lookahead_flex_and_sdpa_paths_agree`.
+        horizon = None
+        if real_mask is not None and hasattr(real_mask, "_kvpress_lookahead"):
+            horizon = (real_mask._kvpress_lookahead, real_mask._kvpress_query_offset)
+            flex_mask, real_mask = real_mask, None
+        else:
+            flex_mask = None
+
         reason = flex_fallback_reason(query, real_mask, dropout)
         if reason is None:
             self._note_flex_shape(query, key)
-            out = self._flex_attention(query, key, value, gate, group_size, scale)
+            out = self._flex_attention(
+                query, key, value, gate, group_size, scale, horizon=horizon
+            )
         else:
             _warn_flex_fallback(reason, query.is_cuda)
             # (B, H_kv, N) -> (B, H, 1, N): one row, broadcast over every query. On CUDA this route
             # is the 46.7 GiB MATH fallback documented in `_flex_attention`; off CUDA (the fp32/fp64
             # test models) it is correct and cheap enough, and it is the reference the flex path is
             # verified against.
+            #
+            # A horizon mask was moved out of `real_mask` above so flex could take it; put it back
+            # here, since this branch has no score_mod to fold it into. Forgetting this would silently
+            # train the UNBOUNDED rectangle on every non-flex run (CPU tests, no-flex torch) while the
+            # config said otherwise -- the exact failure shape §9 catalogues.
+            if flex_mask is not None:
+                real_mask = flex_mask
             bias = gate.repeat_interleave(group_size, dim=1).unsqueeze(2).to(query.dtype)
             mask = bias if real_mask is None else bias + real_mask.to(bias.dtype)
             out = torch.nn.functional.scaled_dot_product_attention(
@@ -855,6 +1112,16 @@ def cross_replay_training_step(
 
     ``gate_scale`` needs no such treatment: it is applied inside each chunk's own graph, so its
     gradient accumulates directly.
+
+    ⚠️ **That also means ``demand_reduce`` does not reach ``gate_scale``.** The reduction operates on
+    the per-key cotangent ``dL/ds`` harvested from the score leaves, and ``gate_scale``'s gradient
+    never passes through them -- so it keeps summing over chunks whatever the reduction is. Measured:
+    under ``demand_reduce="mean"`` every indexer weight's gradient scales by exactly ``1/n_chunks``
+    while ``gate_scale``'s scales by ``1.0``. This is a real inconsistency, not a rounding artefact,
+    and it is left in deliberately: ``gate_scale`` is one scalar per layer whose job is the *magnitude*
+    of the gate, not the ranking, and the reduction is about which keys the ranking favours. Recorded
+    because a reader comparing gradient norms across reductions will otherwise find it and wonder,
+    and because if the ablation is ever extended to ``gate_scale`` this is the line to change.
     """
     if input_ids.dim() != 2 or input_ids.shape[0] != 1:
         raise ValueError(f"input_ids must be (1, N), got {tuple(input_ids.shape)}")
@@ -916,6 +1183,23 @@ def cross_replay_training_step(
     trainer._context_len = context_len
     language_model = get_language_model(model)
 
+    # Chunk-level demand aggregation (`demand_reduce="max"`). The cotangent that reaches `s` is
+    # `sum_j` over replay queries -- §16.3's averaging, and the thing KVzip replaces with a `max`.
+    # A true per-query max would need one backward per query, so the affordable granularity is the
+    # query chunk: `leaves[idx].grad` is read and zeroed after each chunk, giving that chunk's own
+    # demand, and the per-chunk demands are combined at the end instead of summed by autograd.
+    per_chunk_demand: dict[int, list[torch.Tensor]] = {}
+    collect_per_chunk = stage_two and trainer.demand_reduce != "sum"
+    if collect_per_chunk and len(spans) < 2:
+        # One chunk means one demand group, so `max` and `sum` coincide and the knob is silently
+        # inert -- exactly the "looks configured and is not" failure this file keeps recording.
+        raise ValueError(
+            f"demand_reduce={trainer.demand_reduce!r} needs at least 2 query chunks to aggregate "
+            f"over, but query_chunk={trainer.query_chunk} gives {len(spans)} for context length "
+            f"{context_len}. Set query_chunk to at most {context_len // 2} (it also bounds the "
+            "per-chunk granularity of the reduction: N/query_chunk demand groups)."
+        )
+
     total = 0.0
     graph_loss = None
     for start, stop, label_stop, _ in spans:
@@ -930,8 +1214,16 @@ def cross_replay_training_step(
             past_key_values=read_only,
             position_ids=positions,
             # Explicit, always: see rectangle_mask. None here would silently give a causal triangle.
-            attention_mask=rectangle_mask(
-                stop - start, context_len, input_ids.device, model.dtype
+            # query_offset=start so a chunked run indexes the key axis exactly as the unchunked pass
+            # would -- without it every chunk's horizon would restart at 0 and later chunks would see
+            # far less than they should.
+            attention_mask=replay_horizon_mask(
+                stop - start,
+                context_len,
+                input_ids.device,
+                model.dtype,
+                query_offset=start,
+                lookahead=trainer.lookahead,
             ),
             use_cache=True,
         )
@@ -964,6 +1256,14 @@ def cross_replay_training_step(
             else:
                 graph_loss = block_loss if graph_loss is None else graph_loss + block_loss
 
+        if collect_per_chunk:
+            # Harvest this chunk's own dL/ds and zero the leaf, so the next chunk's backward
+            # accumulates from 0 rather than on top of this one. Cloned because .grad is reused.
+            for idx, leaf in leaves.items():
+                if leaf.grad is not None:
+                    per_chunk_demand.setdefault(idx, []).append(leaf.grad.detach().clone())
+                    leaf.grad = None
+
     if trainer.layers_gated == 0:
         raise RuntimeError(
             "no layer ran the gated attention: the model kept its own attention implementation. "
@@ -977,8 +1277,30 @@ def cross_replay_training_step(
 
     if stage_two:
         # Stage B: push the accumulated dL/ds through s = f(h) into the indexer weights, once.
-        tensors = [scored[idx] for idx in leaves if leaves[idx].grad is not None]
-        cotangents = [leaves[idx].grad for idx in leaves if leaves[idx].grad is not None]
+        if collect_per_chunk:
+            # Combine the per-chunk demands with the chosen reduction instead of letting autograd
+            # sum them. `sum` is what plain accumulation already gives, so it never lands here.
+            #
+            # Sign convention matters and is easy to get backwards: the cotangent is dL/ds, so a
+            # NEGATIVE entry is a key the loss wants raised. "The demand of the chunk that needs this
+            # key most" is therefore the most negative entry, i.e. amin over chunks -- taking amax
+            # would keep the chunk that wants the key GONE the most, which is the opposite selection
+            # and would still train to a plausible-looking loss.
+            reduced = {}
+            for idx, demands in per_chunk_demand.items():
+                stacked = torch.stack(demands)  # (n_chunks, B, H_kv, N)
+                if trainer.demand_reduce == "max":
+                    # Scaled to keep the gradient magnitude comparable to `sum`, so the effective
+                    # learning rate does not silently change with the reduction. Without this, `max`
+                    # would also be an LR ablation and the comparison would be confounded.
+                    reduced[idx] = stacked.amin(dim=0) * stacked.shape[0]
+                else:  # "mean" -- the average demand, i.e. sum/n_chunks. Kept as the null control.
+                    reduced[idx] = stacked.mean(dim=0)
+            tensors = [scored[idx] for idx in reduced]
+            cotangents = [reduced[idx] for idx in reduced]
+        else:
+            tensors = [scored[idx] for idx in leaves if leaves[idx].grad is not None]
+            cotangents = [leaves[idx].grad for idx in leaves if leaves[idx].grad is not None]
         if tensors:
             torch.autograd.backward(tensors, cotangents)
     trainer._scores = scored
@@ -990,15 +1312,23 @@ def gate_participation(gate: torch.Tensor, n_sink: int) -> float:
     Effective fraction of keys the gate spreads its mass over -- **the readout that says whether the
     router learned anything at all**.
 
-    ``p = exp(gate)`` sums to 1 over the gated keys, so its participation ratio ``PR = 1 / sum(p^2)``
-    is the standard effective-support size: ``PR = n`` for a flat distribution over ``n`` keys and
-    ``1`` when a single key takes everything. Divided by the gated count to give a scale-free number
-    comparable across layers and lengths.
+    ``PR = 1 / sum(r^2)`` over the gated keys, where ``r`` is the gate's mass **normalized to sum to
+    1**: ``PR = n`` for a flat distribution over ``n`` keys and ``1`` when a single key takes
+    everything. Divided by the gated count to give a scale-free number comparable across layers,
+    lengths, and budgets.
 
     Read it, not the loss. ``~1.0`` means the gate is **flat**, i.e. no ranking was learned, however
     healthy the loss curve looks -- that is the reachable no-op the whole pin mechanism exists to close
-    (``cross_replay_e2e.md`` §0, §3). Falling towards 0 is the concentration eviction needs. On random
-    token ids it fell 0.883 -> 0.426 over five steps.
+    (``cross_replay_e2e.md`` §0, §3). Falling towards 0 is the concentration eviction needs, and the
+    target is the eval budget ``topk/N``, not 0.
+
+    **The normalization is load-bearing, and omitting it silently broke this metric for one run.**
+    ``exp(gate)`` sums to ``B``, not to 1 (that is what the budget *is*), so ``1 / sum(exp(gate)^2)``
+    is the true participation scaled by ``1 / B^2``. At ``B = 1`` the two agree exactly, so the bug
+    was invisible until the budget term was added -- and then the ``B = 2048`` run reported
+    ``participation = 0.0000`` at every step from step 0, which reads as "totally collapsed" when the
+    truth was 0.927 falling to 0.062. Normalizing first makes the metric budget-invariant, which is
+    the property it needs: it must compare runs whose budgets differ.
 
     Lives here rather than in a script because two callers need it -- the smoke check and the training
     driver -- and a second copy of the one number that distinguishes "trained" from "trained-looking"
@@ -1009,6 +1339,8 @@ def gate_participation(gate: torch.Tensor, n_sink: int) -> float:
     n_gated = p.shape[-1]
     if n_gated == 0:
         return float("nan")
+    # Normalize to a distribution before squaring: sum(exp(gate)) is B, not 1.
+    p = p / p.sum(-1, keepdim=True).clamp_min(torch.finfo(p.dtype).tiny)
     return float((1.0 / (p**2).sum(-1)).mean() / n_gated)
 
 

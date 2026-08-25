@@ -17,6 +17,11 @@ The datasets, scoring and answer formatting are reused verbatim from :mod:`evalu
         --model /path/Qwen3-8B --indexer_ckpt /path/stage1/final.pt \\
         --topk 512 --force_local 64 --force_sink 4 --device cuda:0
 
+To split one configuration's rows across several GPUs, do not run this script directly with
+``--num_shards``: a shard writes predictions and deliberately does not score, since a per-shard
+metric is a per-task mean over an arbitrary subset. Use :mod:`evaluate_sparse_sharded`, which
+launches the shards and scores their union once.
+
 Loading either objective's checkpoint works: an end-to-end checkpoint carries a ``gate_scale``
 parameter and a distilled one does not, so the press is built with ``gate_scale`` matched to what
 the checkpoint actually contains (otherwise the strict key check in ``load_indexer_state_dict``
@@ -25,6 +30,7 @@ would reject the e2e one). The gate is never read -- selection uses the indexer 
 
 import json
 import logging
+import os
 import random
 import sys
 from dataclasses import asdict, dataclass
@@ -54,6 +60,7 @@ from kvpress import (  # noqa: E402
     SparseAttentionContext,
     load_indexer_state_dict,
 )
+from kvpress.presses.gqa_indexer.press import get_language_model  # noqa: E402
 from kvpress.presses.gqa_indexer.train import detect_scorer, infer_scalar_mid_dim  # noqa: E402
 from kvpress.pipeline import KVPressTextGenerationPipeline  # noqa: E402
 
@@ -84,6 +91,25 @@ class SparseEvaluationConfig:
     force_sink: int = 4
     force_local: int = 64
     block_k: int = 64
+    # Whole-CHUNK selection instead of per-token. 0 = token-level (the default, and what the gated
+    # arm should use). Set it to the chunk_size the router trained with -- an exact-K checkpoint
+    # records that in its config, and `chunk_size=-1` reads it from there automatically.
+    #
+    # Why it matters: a chunk-trained score is close to piecewise-constant (measured within/across
+    # chunk variance ratio 0.16 vs the gated arm's 0.99), so a token-level top-k resolves a near-tie
+    # inside every kept chunk -- it measures a resolution the router never learned. See
+    # kvpress/presses/gqa_indexer/chunk_support.py.
+    chunk_size: int = 0
+    # "auto" (default) reads it from the checkpoint. NOT hardcoded: chunk_size and
+    # chunk_score_scale already resolve from the ckpt, so leaving this one behind would score an
+    # lse-trained router with mean aggregation -- a silent mismatch of exactly the kind chunk_size
+    # is guarded against. Pass "lse"/"mean"/"max" to override deliberately.
+    chunk_aggregate: str = "auto"
+    # Token-score multiplier inside the chunk aggregation. -1 resolves from the checkpoint (the HSA
+    # arm records its score_scale); only meaningful for chunk_aggregate="lse", which is not
+    # scale-equivariant. Ignored on the token-level path, which ranks raw scores.
+    chunk_score_scale: float = -1.0
+
     # tl.dot precision. "tf32" because q/k/v here are the model's own bf16, and every bf16 value
     # is exact in tf32 -- so the QK dot is bit-identical and the whole kernel matches the fp32
     # reference to the same 7.5e-3 that bf16 output rounding costs anyway. "ieee" forgoes tensor
@@ -113,8 +139,21 @@ class SparseEvaluationConfig:
     max_context_length: Optional[int] = None
     needle_depth: Optional[int] = None
 
+    # Data-parallel sharding. num_shards > 1 makes this process evaluate only its slice of the
+    # (already sampled) rows and write predictions to a parquet shard file instead of scoring:
+    # a per-shard score is not a score of anything, since RULER's metric is a per-task mean over
+    # whatever rows the shard happened to get. evaluate_sparse_sharded.py launches the shards and
+    # scores their union. Sharding is by CONTEXT, not by row, so a context's questions stay in one
+    # process and are prefilled once -- splitting them would re-prefill the same context per shard.
+    shard_index: int = 0
+    num_shards: int = 1
+
     # Output
     output_dir: str = "./results_sparse"
+    # Set by the sharded driver so every shard writes into the run directory it chose. Bypasses
+    # get_results_dir's uniquification, which N concurrent processes would otherwise race on --
+    # each testing "does this dir exist" and some landing on `.../1`, others on `.../2`.
+    results_dir: Optional[str] = None
     log_level: str = "INFO"
     seed: int = 42
 
@@ -133,6 +172,14 @@ class SparseEvaluationConfig:
             f"force_sink + force_local = {self.force_sink + self.force_local} exceeds topk="
             f"{self.topk}"
         )
+        assert self.num_shards >= 1, f"num_shards must be >= 1, got {self.num_shards}"
+        assert self.chunk_size >= -1, f"chunk_size must be >= -1, got {self.chunk_size}"
+        assert self.chunk_aggregate in ("auto", "lse", "mean", "max"), (
+            f"chunk_aggregate must be 'auto', 'lse', 'mean' or 'max', got {self.chunk_aggregate!r}"
+        )
+        assert 0 <= self.shard_index < self.num_shards, (
+            f"shard_index must be in [0, {self.num_shards}), got {self.shard_index}"
+        )
         if self.dataset == "needle_in_haystack":
             assert self.needle_depth is not None, "needle_depth must be set for needle_in_haystack"
             assert (
@@ -141,12 +188,24 @@ class SparseEvaluationConfig:
 
     def get_results_dir(self) -> Path:
         """Unique results directory, mirroring evaluate.py's layout so runs sit side by side."""
+        if self.results_dir is not None:
+            # Chosen by the sharded driver, which already uniquified it once for all shards.
+            config_dir = Path(self.results_dir)
+            config_dir.mkdir(parents=True, exist_ok=True)
+            return config_dir
         components = [
             self.dataset,
             str(self.data_dir) if self.data_dir else "",
             self.model.replace("/", "--"),
             "sparse_indexer",
             f"topk{self.topk}",
+            # In the directory name so a chunk-wise run is never confused with a token-wise one at
+            # the same length and budget -- they are different operators, not different seeds.
+            # "chunkauto" for -1: get_results_dir runs before the checkpoint is read, so the
+            # resolved value is not known yet, and "chunk-1" reads like a negative chunk size. The
+            # resolved value is logged and lands in config.yaml either way.
+            ("chunkauto" if self.chunk_size < 0 else f"chunk{self.chunk_size}")
+            if self.chunk_size else "",
             Path(self.indexer_ckpt).stem,
         ]
         if self.fraction < 1.0:
@@ -164,6 +223,76 @@ class SparseEvaluationConfig:
             config_dir = config_dir / f"{i}"
         config_dir.mkdir(parents=True, exist_ok=True)
         return config_dir
+
+
+
+def load_cached_dataset(repo_id: str, data_dir: Optional[str]):
+    """
+    Load a HuggingFace dataset from the local cache when ``data_dir`` cannot be resolved offline.
+
+    Why this is needed. ``load_dataset(repo, data_dir="8192")`` hashes ``data_dir`` into the cache
+    key, and that hash is only computed from the *remote* builder script. With no network,
+    ``datasets`` raises ``Couldn't find cache for <repo> for config 'default-data_dir=8192'`` and
+    lists the hashes it does have -- which are opaque, so it cannot tell which one is 8192.
+
+    Rather than hardcode a hash (they differ per machine and per download), the length is
+    **measured**: RULER's ``data_dir`` *is* the context length in tokens, so the cached config whose
+    median context is closest to it is the right one. Verified on this box against a Qwen3 tokenizer
+    -- the two cached configs measure 7849 and 15932 median context tokens, mapping to 8192 and
+    16384. A rough char/token ratio is used here instead of a real tokenizer, since the two
+    candidates differ by 2x and the decision has enormous margin.
+
+    Raises if the match is not within 40%, rather than silently evaluating at the wrong length: a
+    16K number reported as an 8K one is a result that looks fine and means something else.
+    """
+    import glob
+    import statistics
+
+    from datasets import Dataset
+
+    if data_dir is None:
+        raise ValueError(f"cannot resolve {repo_id} from cache without a data_dir")
+    target = float(data_dir)
+    cache_root = Path(
+        os.environ.get("HF_DATASETS_CACHE")
+        or Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "datasets"
+    )
+    pattern = str(cache_root / repo_id.replace("/", "___") / "*" / "*" / "*" / "*.arrow")
+    candidates = sorted(glob.glob(pattern))
+    if not candidates:
+        raise ValueError(
+            f"no cached arrow files for {repo_id} under {cache_root}. With no network this cannot "
+            f"be downloaded; copy the cache from a machine that has it."
+        )
+
+    best, best_gap, measured = None, float("inf"), {}
+    for path in candidates:
+        dataset = Dataset.from_file(path)
+        if "context" not in dataset.column_names:
+            continue
+        step = max(1, len(dataset) // 20)
+        # ~4 chars per token for English, which is plenty to separate configs that differ by 2x.
+        tokens = statistics.median(
+            len(dataset[i]["context"]) / 4.0 for i in range(0, len(dataset), step)
+        )
+        measured[path] = tokens
+        gap = abs(tokens - target) / target
+        if gap < best_gap:
+            best, best_gap = dataset, gap
+
+    if best is None or best_gap > 0.4:
+        raise ValueError(
+            f"no cached config of {repo_id} matches data_dir={data_dir} (closest is "
+            f"{best_gap:.0%} off). Measured median context tokens per cache entry: "
+            f"{ {Path(k).parent.name[:12]: int(v) for k, v in measured.items()} }. Refusing to "
+            f"evaluate at a length other than the one requested."
+        )
+    logger.warning(
+        "resolved %s data_dir=%s from the local cache by measuring context length (%.0f%% off "
+        "target); `datasets` could not map data_dir to a cache hash offline.",
+        repo_id, data_dir, 100 * best_gap,
+    )
+    return best
 
 
 class SparseGenerationPipeline(KVPressTextGenerationPipeline):
@@ -300,6 +429,72 @@ class SparseEvaluationRunner:
             ckpt_config or None,
         )
 
+        chunk_size = cfg.chunk_size
+        if chunk_size == -1:
+            # Read the training geometry from the checkpoint rather than making the caller restate
+            # it. chunk_size is NOT a parameter shape, so a mismatch cannot be caught by weight
+            # loading -- exactly why the trainer records it.
+            chunk_size = int(ckpt_config.get("chunk_size") or 0)
+            if chunk_size:
+                logger.info(
+                    "chunk_size=-1 resolved to %d from the checkpoint (objective=%s). Selection is "
+                    "whole-chunk, matching how this router was trained.",
+                    chunk_size, ckpt_config.get("objective"),
+                )
+            else:
+                logger.warning(
+                    "chunk_size=-1 but the checkpoint records no chunk_size (objective=%s); falling "
+                    "back to token-level selection.", ckpt_config.get("objective"),
+                )
+        elif chunk_size and ckpt_config.get("chunk_size") and chunk_size != ckpt_config["chunk_size"]:
+            logger.warning(
+                "chunk_size=%d differs from the checkpoint's %s. That is a train/inference "
+                "granularity mismatch; pass -1 to use the recorded value.",
+                chunk_size, ckpt_config["chunk_size"],
+            )
+
+        chunk_aggregate = cfg.chunk_aggregate
+        if chunk_aggregate == "auto":
+            chunk_aggregate = str(ckpt_config.get("chunk_aggregate") or "mean")
+            if chunk_size:
+                logger.info(
+                    "chunk_aggregate='auto' resolved to %r from the checkpoint (objective=%s). "
+                    "Scoring an lse-trained router with mean aggregation would rank on a different "
+                    "functional than training optimized, and nothing downstream would flag it.",
+                    chunk_aggregate, ckpt_config.get("objective"),
+                )
+        elif chunk_size and ckpt_config.get("chunk_aggregate") and (
+            chunk_aggregate != ckpt_config["chunk_aggregate"]
+        ):
+            logger.warning(
+                "chunk_aggregate=%r differs from the checkpoint's %r -- a train/inference mismatch "
+                "in the aggregation functional. Pass 'auto' to use the recorded value.",
+                chunk_aggregate, ckpt_config["chunk_aggregate"],
+            )
+
+        chunk_score_scale = cfg.chunk_score_scale
+        if chunk_score_scale < 0:
+            # Resolve from the checkpoint. Like chunk_size this is not a parameter shape, and for the
+            # `lse` aggregation it is NOT cosmetic: logsumexp is not scale-equivariant, so a wrong
+            # value ranks on a different functional than training optimized (measured Spearman
+            # against the true chunk LSE: 1.000 with the trained scale inside the reduction, 0.65
+            # with it outside). Falls back to the indexer's own head_dim ** -0.5, which is the
+            # trainer's default and the backbone's attention scale.
+            recorded = ckpt_config.get("score_scale")
+            if recorded:
+                chunk_score_scale = float(recorded)
+            else:
+                indexer = press.get_indexer(get_language_model(model).layers[0].self_attn)
+                head_dim = getattr(indexer, "head_dim", None)
+                chunk_score_scale = float(head_dim**-0.5) if head_dim else 1.0
+            if chunk_size and cfg.chunk_aggregate == "lse":
+                logger.info(
+                    "chunk_score_scale resolved to %.6g (%s). This is a TEMPERATURE for the lse "
+                    "aggregation, not a cosmetic factor.",
+                    chunk_score_scale,
+                    "from the checkpoint" if recorded else "head_dim ** -0.5 fallback",
+                )
+
         pipeline = SparseGenerationPipeline(model=model, tokenizer=tokenizer, device=model.device)
         pipeline.configure_sparse(
             press,
@@ -308,18 +503,49 @@ class SparseEvaluationRunner:
             force_local=cfg.force_local,
             block_k=cfg.block_k,
             precision=cfg.precision,
+            chunk_size=chunk_size,
+            chunk_aggregate=chunk_aggregate,
+            chunk_score_scale=chunk_score_scale,
         )
         self.pipeline = pipeline
 
     def _load_dataset(self):
         cfg = self.config
         data_dir = str(cfg.data_dir) if cfg.data_dir else None
-        df = load_dataset(DATASET_REGISTRY[cfg.dataset], data_dir=data_dir, split="test").to_pandas()
+        try:
+            df = load_dataset(
+                DATASET_REGISTRY[cfg.dataset], data_dir=data_dir, split="test"
+            ).to_pandas()
+        except ValueError as exc:
+            if "Couldn't find cache" not in str(exc):
+                raise
+            # Offline box: the arrow files are present but `datasets` cannot map data_dir to a
+            # cache hash. Resolve it by measuring the contexts instead -- see
+            # :func:`load_cached_dataset`.
+            df = load_cached_dataset(DATASET_REGISTRY[cfg.dataset], data_dir).to_pandas()
         if cfg.fraction < 1.0:
             df = df.sample(frac=cfg.fraction, random_state=cfg.seed)
         if cfg.dataset == "needle_in_haystack":
             df = insert_needle_in_haystack(
                 df, self.pipeline.tokenizer, cfg.max_context_length, cfg.needle_depth
+            )
+        # Shard AFTER sampling and needle insertion, so every shard derives its slice from the
+        # identical full frame -- the union over shards is then exactly the unsharded row set.
+        if cfg.num_shards > 1:
+            full = len(df)
+            contexts = df["context"].drop_duplicates()
+            # Round-robin over contexts (not rows): a context's questions share one prefill, so
+            # splitting them across shards would re-prefill the same long context in each.
+            mine = set(contexts.iloc[cfg.shard_index :: cfg.num_shards])
+            df = df[df["context"].isin(mine)]
+            logger.info(
+                "Shard %d/%d: %d of %d rows (%d of %d contexts)",
+                cfg.shard_index,
+                cfg.num_shards,
+                len(df),
+                full,
+                len(mine),
+                len(contexts),
             )
         self.df = df
         logger.info("Dataset %s loaded with %d entries", cfg.dataset, len(df))
@@ -348,13 +574,28 @@ class SparseEvaluationRunner:
 
     def run(self):
         results_dir = self.config.get_results_dir()
-        predictions_file = results_dir / "predictions.csv"
-        metrics_file = results_dir / "metrics.json"
-        config_file = results_dir / "config.yaml"
 
         self._setup_pipeline()
         self._load_dataset()
         self._run_inference()
+
+        if self.config.num_shards > 1:
+            # Write the shard and stop. Scoring happens once, over the union, in
+            # evaluate_sparse_sharded.py -- a per-shard metric would be a per-task mean over an
+            # arbitrary subset of rows, which is not comparable to anything.
+            #
+            # Parquet, not CSV: `answer` holds an ndarray of reference strings and the scorers
+            # iterate it. CSV stringifies it to "['2166941']", which then iterates CHARACTER by
+            # character -- 11 phantom references -- and a genuinely wrong prediction scores 0.27
+            # instead of 0.0. The corruption is silent and inflates the metric.
+            shard_file = results_dir / f"predictions_shard{self.config.shard_index}.parquet"
+            self.df.to_parquet(str(shard_file), index=True)
+            logger.info("Shard %d wrote %d rows to %s", self.config.shard_index, len(self.df), shard_file)
+            return
+
+        predictions_file = results_dir / "predictions.csv"
+        metrics_file = results_dir / "metrics.json"
+        config_file = results_dir / "config.yaml"
 
         self.df[list(set(self.df.columns) - {"context"})].to_csv(str(predictions_file), index=False)
         metrics = SCORER_REGISTRY[self.config.dataset](self.df)

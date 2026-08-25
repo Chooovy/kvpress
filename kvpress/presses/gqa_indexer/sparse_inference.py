@@ -41,7 +41,9 @@ import logging
 import torch
 from torch import nn
 
+from kvpress.presses.gqa_indexer.chunk_support import chunk_topk_support
 from kvpress.presses.gqa_indexer.press import GQAIndexerPress, get_language_model
+from kvpress.presses.gqa_indexer.qi_flex_attention import HAS_FLEX, qi_sparse_attention
 from kvpress.presses.gqa_indexer.sparse_support import streaming_topk_support
 from kvpress.presses.gqa_indexer.triton_sparse_attention import sparse_gqa_attention
 
@@ -73,6 +75,23 @@ class SparseAttentionContext:
         Triton topk-tile; power of two, ``>= 16``. Memory/throughput knob only.
     causal : bool
         Mask slots past each query's diagonal. Redundant for causally-selected indices and cheap.
+    chunk_size : int
+        ``0`` (default) selects the top-``topk`` **tokens** per query -- correct for a router trained
+        on per-token scores. ``>0`` selects whole **chunks** of this size instead, via
+        :func:`~.chunk_support.chunk_topk_support`.
+
+        Set this to the ``chunk_size`` the router trained with. A chunk-trained score (the exact-K
+        arm) is close to piecewise-constant -- measured within/across-chunk variance ratio 0.16 at
+        layer 4, against 0.99 for the token-trained gated arm -- so ranking its tokens resolves a
+        near-tie inside every chunk and the token path measures a resolution it never learned. See
+        :mod:`~.chunk_support`.
+    chunk_aggregate : str
+        ``lse``, ``mean`` or ``max`` aggregation of a chunk's token scores when ``chunk_size > 0``.
+        Must match what the router trained with; the checkpoint records it. ``lse`` is the HSA arm's,
+        ``mean`` the exact-K arm's.
+    chunk_score_scale : float
+        Token-score multiplier applied *inside* the aggregation. Only matters for ``lse`` (which is
+        not scale-equivariant, so it acts as a temperature); must match the trainer's ``score_scale``.
     precision : str
         ``tl.dot`` precision. ``"tf32"`` by default here, unlike the kernel's own ``"ieee"``
         default, because at inference the operands are the model's own bf16 q/k/v: every bf16
@@ -108,6 +127,10 @@ class SparseAttentionContext:
         block_k: int = 64,
         causal: bool = True,
         precision: str = "tf32",
+        query_independent: bool | None = None,
+        chunk_size: int = 0,
+        chunk_aggregate: str = "mean",
+        chunk_score_scale: float = 1.0,
     ):
         if topk <= 0:
             raise ValueError(f"topk must be positive, got {topk}")
@@ -128,6 +151,22 @@ class SparseAttentionContext:
         if precision not in ("ieee", "tf32"):
             raise ValueError(f"precision must be 'ieee' or 'tf32', got {precision!r}")
         self.precision = precision
+        if chunk_size < 0:
+            raise ValueError(f"chunk_size must be non-negative, got {chunk_size}")
+        self.chunk_size = int(chunk_size)
+        self.chunk_aggregate = chunk_aggregate
+        self.chunk_score_scale = float(chunk_score_scale)
+        if self.chunk_size and self.chunk_size > topk - force_sink - force_local:
+            raise ValueError(
+                f"chunk_size {self.chunk_size} exceeds the selectable budget "
+                f"topk - force_sink - force_local = {topk - force_sink - force_local}: not even one "
+                "chunk would fit, so every row would attend to the forced slots alone. Raise topk."
+            )
+        # Resolved lazily in __enter__: it depends on the scorer the press holds, which
+        # post_init_from_model attaches there. None means "use the fast path when the scorer
+        # declares itself query-independent and this torch has flex_attention".
+        self._query_independent = query_independent
+        self._use_qi = False
 
         # Per-layer state, all keyed by layer_idx and reset on entry.
         self._hidden_states: dict[int, torch.Tensor] = {}
@@ -195,21 +234,62 @@ class SparseAttentionContext:
                 "SparseAttentionContext per generation (its cache resets on entry)."
             )
 
+        # Query-independent scorers take the flex_attention path: the score is a fixed per-key
+        # vector, so each key is selected by one contiguous interval of query rows and the whole
+        # support is a per-key deadline instead of a (B, h, Sq, topk) index tensor. Same selection,
+        # block-sparse contiguous reads instead of gathers -- measured 2.31x at L=8030 and 4.25x at
+        # L=4096 for the select+attend pair. Only worth it when there is a query axis to amortize
+        # the block-mask build over, so decode (Sq == 1) stays on the gather path.
+        if self._use_qi and self.chunk_size:
+            raise RuntimeError(
+                "chunk_size is set but the query-independent flex path selects tokens by per-key "
+                "deadline, which cannot express whole-chunk selection. Pass query_independent=False "
+                "to force the gather path."
+            )
+        if self._use_qi and q_idx.shape[2] > 1:
+            out = qi_sparse_attention(
+                query,
+                key,
+                value,
+                # The per-key score IS one row of the score matrix; take row 0 rather than calling
+                # score_keys again, so this path cannot drift from what the gather path would score.
+                torch.einsum("bhqd,bkd->bhk", q_idx[:, :, :1], k_idx),
+                self.topk,
+                force_sink=self.force_sink,
+                force_local=self.force_local,
+                scaling=scaling,
+            )  # (B, H, Sq, Dv)
+            return out.transpose(1, 2).contiguous()
+
         # query_offset defaults to k_len - Sq in both calls (bottom-right), correct for prefill
         # (Sq == k_len) and decode (Sq == 1) alike -- so it is never passed explicitly.
-        support, _ = streaming_topk_support(
-            q_idx,
-            k_idx,
-            self.topk,
-            mask=None,
-            force_sink=self.force_sink,
-            force_local=self.force_local,
-        )  # (B, h, Sq, topk) int64, ascending, -1 empty
+        if self.chunk_size:
+            # Whole-chunk selection, for a router trained on chunk-mean scores. Same output
+            # convention as the token path, so sparse_gqa_attention is unchanged.
+            support, _ = chunk_topk_support(
+                q_idx,
+                k_idx,
+                self.topk,
+                chunk_size=self.chunk_size,
+                chunk_aggregate=self.chunk_aggregate,
+                score_scale=self.chunk_score_scale,
+                force_sink=self.force_sink,
+                force_local=self.force_local,
+            )
+        else:
+            support, _ = streaming_topk_support(
+                q_idx,
+                k_idx,
+                self.topk,
+                mask=None,
+                force_sink=self.force_sink,
+                force_local=self.force_local,
+            )  # (B, h, Sq, topk) int32, ascending, -1 empty
         out, _ = sparse_gqa_attention(
             query,
             key,
             value,
-            support.to(torch.int32),
+            support,
             scaling=scaling,
             causal=self.causal,
             block_k=self.block_k,
@@ -231,6 +311,33 @@ class SparseAttentionContext:
 
         self.press.post_init_from_model(self.model)
         self.reset()
+
+        # Decide the selection path now that the indexers exist. Keyed off a declared capability
+        # rather than isinstance, so a third scorer only has to set the attribute.
+        layers = get_language_model(self.model).layers
+        scorer_is_qi = bool(
+            getattr(self.press.get_indexer(layers[0].self_attn), "is_query_independent", False)
+        )
+        if self._query_independent is None:
+            self._use_qi = scorer_is_qi and HAS_FLEX
+            if scorer_is_qi and not HAS_FLEX:
+                logger.warning(
+                    "scorer is query-independent but this torch has no flex_attention; falling "
+                    "back to the gather path (correct, just slower)."
+                )
+        else:
+            self._use_qi = bool(self._query_independent)
+            if self._use_qi and not scorer_is_qi:
+                # The fast path reads one row of the score matrix and applies it to every query. For
+                # a pairwise scorer that is a different (wrong) support, not a slower one.
+                raise ValueError(
+                    "query_independent=True but the indexer's score depends on the query "
+                    f"({type(self.press.get_indexer(layers[0].self_attn)).__name__}). The flex path "
+                    "would attend over the wrong keys."
+                )
+            if self._use_qi and not HAS_FLEX:
+                raise RuntimeError("query_independent=True but this torch has no flex_attention")
+        logger.info("sparse selection path: %s", "flex (query-independent)" if self._use_qi else "gather")
 
         def sparse_attention_impl(
             module, query, key, value, attention_mask, scaling=None, dropout=0.0, **_

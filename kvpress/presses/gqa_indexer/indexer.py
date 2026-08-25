@@ -295,6 +295,13 @@ class GQAIndexer(nn.Module):
             else None
         )
 
+    #: Whether the score depends on the query. False here: this scorer forms a genuine
+    #: ``(query, key)`` dot product, so a key's rank differs per query row. Callers that have a
+    #: cheaper path for query-independent scores (see
+    #: :class:`~.scalar_indexer.ScalarIndexer`) branch on this rather than on ``isinstance``, so a
+    #: third scorer only has to declare the property.
+    is_query_independent = False
+
     def project_q(self, hidden_states: torch.Tensor, cos=None, sin=None) -> torch.Tensor:
         """Project and rotate indexer queries -> (B, n_heads, Sq, D)."""
         bsz, q_len, _ = hidden_states.shape

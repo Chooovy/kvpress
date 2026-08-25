@@ -1,0 +1,541 @@
+{
+ "A": {
+  "arm": "A",
+  "ckpt_config": {
+   "objective": "cross_replay_lm_loss",
+   "model": "/apdcephfs_gy8/share_303843174/guhao/models/Qwen3-8B",
+   "scorer": "scalar",
+   "scalar_mid_dim": 0,
+   "scalar_pos_slope": 1e-06,
+   "pin_mode": "sink",
+   "n_sink": 4,
+   "schedule": "8192:300,16384:300,32768:900",
+   "subsets": [
+    "2e16",
+    "2e17"
+   ],
+   "query_chunk": 1024,
+   "logit_chunk": null,
+   "peak_lr": 0.001,
+   "final_lr": 5e-06,
+   "seed": 0
+  },
+  "needle_covered_mean": 0.6893350630739911,
+  "per_layer": [
+   {
+    "layer": 0,
+    "needle_covered": 0.4039810998365283
+   },
+   {
+    "layer": 1,
+    "needle_covered": 0.687750980257988
+   },
+   {
+    "layer": 2,
+    "needle_covered": 0.7754564695060253
+   },
+   {
+    "layer": 3,
+    "needle_covered": 0.8256852515041828
+   },
+   {
+    "layer": 4,
+    "needle_covered": 0.6281839143484831
+   },
+   {
+    "layer": 5,
+    "needle_covered": 0.774096067994833
+   },
+   {
+    "layer": 6,
+    "needle_covered": 0.7068017944693565
+   },
+   {
+    "layer": 7,
+    "needle_covered": 0.6180623527616262
+   },
+   {
+    "layer": 8,
+    "needle_covered": 0.7274821177124977
+   },
+   {
+    "layer": 9,
+    "needle_covered": 0.7517428882420063
+   },
+   {
+    "layer": 10,
+    "needle_covered": 0.7850400544703007
+   },
+   {
+    "layer": 11,
+    "needle_covered": 0.7073938883841038
+   },
+   {
+    "layer": 12,
+    "needle_covered": 0.6983497701585293
+   },
+   {
+    "layer": 13,
+    "needle_covered": 0.6679564826190472
+   },
+   {
+    "layer": 14,
+    "needle_covered": 0.6103142984211445
+   },
+   {
+    "layer": 15,
+    "needle_covered": 0.5885298475623131
+   },
+   {
+    "layer": 16,
+    "needle_covered": 0.7216939739882946
+   },
+   {
+    "layer": 17,
+    "needle_covered": 0.5860761720687151
+   },
+   {
+    "layer": 18,
+    "needle_covered": 0.7002916038036346
+   },
+   {
+    "layer": 19,
+    "needle_covered": 0.8194691650569439
+   },
+   {
+    "layer": 20,
+    "needle_covered": 0.5032436959445477
+   },
+   {
+    "layer": 21,
+    "needle_covered": 0.6158885881304741
+   },
+   {
+    "layer": 22,
+    "needle_covered": 0.6680509429425001
+   },
+   {
+    "layer": 23,
+    "needle_covered": 0.6621386837214231
+   },
+   {
+    "layer": 24,
+    "needle_covered": 0.725909560918808
+   },
+   {
+    "layer": 25,
+    "needle_covered": 0.7571604643017054
+   },
+   {
+    "layer": 26,
+    "needle_covered": 0.8121886029839516
+   },
+   {
+    "layer": 27,
+    "needle_covered": 0.7341036349534988
+   },
+   {
+    "layer": 28,
+    "needle_covered": 0.8238727450370789
+   },
+   {
+    "layer": 29,
+    "needle_covered": 0.7222669683396816
+   },
+   {
+    "layer": 30,
+    "needle_covered": 0.5910889711230993
+   },
+   {
+    "layer": 31,
+    "needle_covered": 0.7244870271533728
+   },
+   {
+    "layer": 32,
+    "needle_covered": 0.6089365314692259
+   },
+   {
+    "layer": 33,
+    "needle_covered": 0.7487651892006397
+   },
+   {
+    "layer": 34,
+    "needle_covered": 0.6316425558179617
+   },
+   {
+    "layer": 35,
+    "needle_covered": 0.701959915459156
+   }
+  ],
+  "by_task": {
+   "niah_single_1": 0.7187345321807597,
+   "niah_single_2": 0.6752542479791575,
+   "niah_single_3": 0.6523777883913782,
+   "vt": 0.710973683744669
+  }
+ },
+ "B": {
+  "arm": "B",
+  "ckpt_config": {
+   "objective": "cross_replay_lm_loss",
+   "model": "/apdcephfs_gy8/share_303843174/guhao/models/Qwen3-8B",
+   "scorer": "scalar",
+   "scalar_mid_dim": 256,
+   "scalar_pos_slope": 1e-06,
+   "pin_mode": "sink",
+   "n_sink": 4,
+   "budget": 2048,
+   "schedule": "8192:300,16384:300,32768:900",
+   "subsets": [
+    "2e16",
+    "2e17"
+   ],
+   "query_chunk": 1024,
+   "logit_chunk": null,
+   "peak_lr": 0.001,
+   "final_lr": 5e-06,
+   "seed": 0
+  },
+  "needle_covered_mean": 0.561562448989005,
+  "per_layer": [
+   {
+    "layer": 0,
+    "needle_covered": 0.507515661418438
+   },
+   {
+    "layer": 1,
+    "needle_covered": 0.5626668650656939
+   },
+   {
+    "layer": 2,
+    "needle_covered": 0.7996953874826431
+   },
+   {
+    "layer": 3,
+    "needle_covered": 0.6158362124115229
+   },
+   {
+    "layer": 4,
+    "needle_covered": 0.5222926177084446
+   },
+   {
+    "layer": 5,
+    "needle_covered": 0.6049890946596861
+   },
+   {
+    "layer": 6,
+    "needle_covered": 0.5807557757943869
+   },
+   {
+    "layer": 7,
+    "needle_covered": 0.509042676538229
+   },
+   {
+    "layer": 8,
+    "needle_covered": 0.4804016686975956
+   },
+   {
+    "layer": 9,
+    "needle_covered": 0.6706163622438908
+   },
+   {
+    "layer": 10,
+    "needle_covered": 0.6749633345752954
+   },
+   {
+    "layer": 11,
+    "needle_covered": 0.715212456882
+   },
+   {
+    "layer": 12,
+    "needle_covered": 0.6510234605520964
+   },
+   {
+    "layer": 13,
+    "needle_covered": 0.5262175630778074
+   },
+   {
+    "layer": 14,
+    "needle_covered": 0.40370773151516914
+   },
+   {
+    "layer": 15,
+    "needle_covered": 0.5062945019453764
+   },
+   {
+    "layer": 16,
+    "needle_covered": 0.6661329939961433
+   },
+   {
+    "layer": 17,
+    "needle_covered": 0.5791726522147655
+   },
+   {
+    "layer": 18,
+    "needle_covered": 0.5254546124488115
+   },
+   {
+    "layer": 19,
+    "needle_covered": 0.6885561123490334
+   },
+   {
+    "layer": 20,
+    "needle_covered": 0.5574454739689827
+   },
+   {
+    "layer": 21,
+    "needle_covered": 0.6147328596562147
+   },
+   {
+    "layer": 22,
+    "needle_covered": 0.7039601914584637
+   },
+   {
+    "layer": 23,
+    "needle_covered": 0.7743941321969032
+   },
+   {
+    "layer": 24,
+    "needle_covered": 0.5099838254973292
+   },
+   {
+    "layer": 25,
+    "needle_covered": 0.5145123964175582
+   },
+   {
+    "layer": 26,
+    "needle_covered": 0.6289841216057539
+   },
+   {
+    "layer": 27,
+    "needle_covered": 0.37649716064333916
+   },
+   {
+    "layer": 28,
+    "needle_covered": 0.3778855102136731
+   },
+   {
+    "layer": 29,
+    "needle_covered": 0.5706624370068312
+   },
+   {
+    "layer": 30,
+    "needle_covered": 0.4216810513753444
+   },
+   {
+    "layer": 31,
+    "needle_covered": 0.5296032140031457
+   },
+   {
+    "layer": 32,
+    "needle_covered": 0.5261719487607479
+   },
+   {
+    "layer": 33,
+    "needle_covered": 0.35791521763894707
+   },
+   {
+    "layer": 34,
+    "needle_covered": 0.37834976031444967
+   },
+   {
+    "layer": 35,
+    "needle_covered": 0.5829211212694645
+   }
+  ],
+  "by_task": {
+   "niah_single_1": 0.5329706340691902,
+   "niah_single_2": 0.5757843748562865,
+   "niah_single_3": 0.6378564662817452,
+   "vt": 0.4996383207487977
+  }
+ },
+ "C": {
+  "arm": "C",
+  "ckpt_config": {
+   "objective": "e2e_lm_loss",
+   "model": "/apdcephfs_gy8/share_303843174/guhao/models/Qwen3-8B",
+   "scorer": "scalar",
+   "scalar_mid_dim": 256,
+   "scalar_pos_slope": 1e-06,
+   "stage": "dense",
+   "pin_mode": "sink",
+   "n_sink": 4,
+   "schedule": "8192:300,16384:300,32768:900",
+   "subsets": [
+    "2e16",
+    "2e17"
+   ],
+   "topk": 0,
+   "peak_lr": 0.001,
+   "final_lr": 5e-06,
+   "seed": 0
+  },
+  "needle_covered_mean": 0.6009938499062426,
+  "per_layer": [
+   {
+    "layer": 0,
+    "needle_covered": 0.5147606283426285
+   },
+   {
+    "layer": 1,
+    "needle_covered": 0.6272874306887388
+   },
+   {
+    "layer": 2,
+    "needle_covered": 0.625449382700026
+   },
+   {
+    "layer": 3,
+    "needle_covered": 0.7589697856456041
+   },
+   {
+    "layer": 4,
+    "needle_covered": 0.6291302070021629
+   },
+   {
+    "layer": 5,
+    "needle_covered": 0.619908669963479
+   },
+   {
+    "layer": 6,
+    "needle_covered": 0.7908809185028076
+   },
+   {
+    "layer": 7,
+    "needle_covered": 0.8038148209452629
+   },
+   {
+    "layer": 8,
+    "needle_covered": 0.539178092032671
+   },
+   {
+    "layer": 9,
+    "needle_covered": 0.7597575336694717
+   },
+   {
+    "layer": 10,
+    "needle_covered": 0.5221394384279847
+   },
+   {
+    "layer": 11,
+    "needle_covered": 0.47158840484917164
+   },
+   {
+    "layer": 12,
+    "needle_covered": 0.6152972057461739
+   },
+   {
+    "layer": 13,
+    "needle_covered": 0.7517643384635448
+   },
+   {
+    "layer": 14,
+    "needle_covered": 0.5093106552958488
+   },
+   {
+    "layer": 15,
+    "needle_covered": 0.4986502565443516
+   },
+   {
+    "layer": 16,
+    "needle_covered": 0.4990128390491009
+   },
+   {
+    "layer": 17,
+    "needle_covered": 0.6066074296832085
+   },
+   {
+    "layer": 18,
+    "needle_covered": 0.48341413866728544
+   },
+   {
+    "layer": 19,
+    "needle_covered": 0.6112519148737192
+   },
+   {
+    "layer": 20,
+    "needle_covered": 0.746773898601532
+   },
+   {
+    "layer": 21,
+    "needle_covered": 0.6442827023565769
+   },
+   {
+    "layer": 22,
+    "needle_covered": 0.5045409630984068
+   },
+   {
+    "layer": 23,
+    "needle_covered": 0.5856221094727516
+   },
+   {
+    "layer": 24,
+    "needle_covered": 0.7256743852049112
+   },
+   {
+    "layer": 25,
+    "needle_covered": 0.48516214452683926
+   },
+   {
+    "layer": 26,
+    "needle_covered": 0.6996292043477297
+   },
+   {
+    "layer": 27,
+    "needle_covered": 0.5081740710884333
+   },
+   {
+    "layer": 28,
+    "needle_covered": 0.5318894013762474
+   },
+   {
+    "layer": 29,
+    "needle_covered": 0.75231147184968
+   },
+   {
+    "layer": 30,
+    "needle_covered": 0.42494025733321905
+   },
+   {
+    "layer": 31,
+    "needle_covered": 0.5566440895199776
+   },
+   {
+    "layer": 32,
+    "needle_covered": 0.6116554588079453
+   },
+   {
+    "layer": 33,
+    "needle_covered": 0.737363426014781
+   },
+   {
+    "layer": 34,
+    "needle_covered": 0.44679454155266285
+   },
+   {
+    "layer": 35,
+    "needle_covered": 0.43614638037979603
+   }
+  ],
+  "by_task": {
+   "niah_single_1": 0.6555214824361933,
+   "niah_single_2": 0.5117187728691432,
+   "niah_single_3": 0.39423296093526816,
+   "vt": 0.8425021833843656
+  }
+ },
+ "_meta": {
+  "tasks": [
+   "niah_single_1",
+   "niah_single_2",
+   "niah_single_3",
+   "vt"
+  ],
+  "topk": 4096,
+  "n_rows": 16,
+  "force_sink": 4,
+  "force_local": 64,
+  "chance": 0.5150905432595574
+ }
+}

@@ -69,6 +69,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
 import time
 from pathlib import Path
@@ -139,8 +140,25 @@ def save(
             "scorer": args.scorer,
             "scalar_mid_dim": args.scalar_mid_dim,
             "scalar_pos_slope": args.scalar_pos_slope,
+            # The prefix branch's geometry, for the same reason as `budget` below: head_dim and
+            # value_dim are parameter shapes and would fail loudly, but prefix_zero_init is not,
+            # and a run whose flag differed would be a different experiment with every tensor
+            # still loading cleanly.
+            "prefix_head_dim": args.prefix_head_dim if args.scorer == "prefix" else None,
+            "prefix_value_dim": args.prefix_value_dim if args.scorer == "prefix" else None,
+            "prefix_zero_init": args.prefix_zero_init if args.scorer == "prefix" else None,
             "pin_mode": args.pin_mode,
             "n_sink": args.n_sink,
+            # Recorded because it decides the gate's converged concentration, so a checkpoint whose
+            # budget is unknown cannot be compared against another. This is exactly how the
+            # scalar-vs-cross-replay A/B turned out to be confounded: `scalar_mid_dim` differed
+            # 256-vs-0 and only the checkpoint's own config revealed it.
+            "budget": args.budget,
+            # Same reason as `budget`: these change what the router is trained on, so a checkpoint
+            # that does not record them cannot be compared against another (§13, §16).
+            "lookahead": args.lookahead,
+            "demand_reduce": args.demand_reduce,
+            "cross_doc_replay": args.cross_doc_replay,
             "schedule": args.schedule,
             "subsets": list(args.subsets),
             "query_chunk": args.query_chunk,
@@ -227,14 +245,39 @@ def build_parser() -> argparse.ArgumentParser:
     model_group.add_argument("--scorer-attr", default="indexer")
     model_group.add_argument(
         "--scorer",
-        choices=("scalar",),
+        choices=("scalar", "prefix"),
         default="scalar",
-        help="only 'scalar' exists here. This objective trains a QUERY-INDEPENDENT score; a pairwise "
-        "indexer would need an (Sq, Sk) gate, which is the cost the whole design avoids "
-        "(cross_replay_e2e.md §1.1). A pairwise press is rejected in score_context anyway.",
+        help="which QUERY-INDEPENDENT router to train. 'pairwise' is not offered: it would need an "
+        "(Sq, Sk) gate, which is the cost the whole design avoids (cross_replay_e2e.md §1.1), and "
+        "a pairwise press is rejected in score_context anyway. 'scalar' scores each key from its "
+        "own hidden state; 'prefix' scores it from its whole prefix through the indexer's own "
+        "causal attention -- still query-independent, so this objective's rectangle applies "
+        "unchanged, and a strict superset of 'scalar' so the A/B is single-variable.",
     )
     model_group.add_argument("--scalar-mid-dim", type=int, default=0, help="0 = a linear score")
     model_group.add_argument("--scalar-pos-slope", type=float, default=DEFAULT_POS_SLOPE)
+    model_group.add_argument(
+        "--prefix-head-dim",
+        type=int,
+        default=128,
+        help="--scorer prefix only: q/k width of the indexer's own prefix attention.",
+    )
+    model_group.add_argument(
+        "--prefix-value-dim",
+        type=int,
+        default=128,
+        help="--scorer prefix only: width of the prefix attention's v readout.",
+    )
+    model_group.add_argument(
+        "--no-prefix-zero-init",
+        dest="prefix_zero_init",
+        action="store_false",
+        help="--scorer prefix only: start the prefix branch at random init rather than zero. By "
+        "default it is zeroed, so training starts bit-identical to --scorer scalar and 'reads the "
+        "prefix' is the only variable. See the e2e script's copy of this flag for why the zero is "
+        "an escapable saddle rather than a dead start.",
+    )
+    model_group.set_defaults(prefix_zero_init=True)
     model_group.add_argument("--press-n-sink", type=int, default=4)
     model_group.add_argument(
         "--init-from",
@@ -262,6 +305,56 @@ def build_parser() -> argparse.ArgumentParser:
         "inert and the flat-gate no-op reopens. Rejected in CrossReplayTrainer.__post_init__.",
     )
     gate.add_argument("--n-sink", type=int, default=4, help="leading keys exempt from the gate")
+    gate.add_argument(
+        "--budget",
+        type=int,
+        default=None,
+        help="B in the gate's `s - LSE(s) + log B`, applied to the gated keys only. LEAVE AT 1. "
+        "The identity `sum_gated exp(g) = B` makes B the number of pinned-sink equivalents the whole "
+        "history is worth, so it decides how concentrated the gate becomes at convergence. RETRACTED: "
+        "this flag used to say 'set this to the inference top-k', argued from representability; the "
+        "2x2 grid measured B=1 at 48.20 and B=2048 at 20.43 on RULER 8K, i.e. B=topk costs 27.8 "
+        "points, against an 18.0-point objective gap. B=n_gated remains the flat-gate no-op; unset "
+        "resolves there and warns. See cross_replay_e2e.md §15.3.",
+    )
+
+    shape = parser.add_argument_group("supervision shape (cross_replay_e2e.md §16)")
+    shape.add_argument(
+        "--lookahead",
+        type=int,
+        default=None,
+        help="bound on how far past its own position a replay row may see, in keys. Unset = the "
+        "unbounded rectangle, which every measured arm trained on. 0 reproduces the causal triangle "
+        "the e2e LM loss uses; a small positive value keeps a growing candidate set (hence the "
+        "difficulty ramp the rectangle lacks). §16.3 argues the rectangle's N-way averaging is what "
+        "over-concentrates every cross-replay arm. NOTE: a bounded horizon is a real mask, so it "
+        "disqualifies the flex path and lands on SDPA MATH (46.7 GiB) -- lower --query-chunk.",
+    )
+    shape.add_argument(
+        "--demand-reduce",
+        choices=("sum", "max", "mean"),
+        default="sum",
+        help="how replay queries' demands on one key combine into dL/ds. 'sum' is plain autograd "
+        "accumulation and what every measured arm used. 'max' keeps each key's strongest demand per "
+        "query CHUNK instead of averaging over all N queries, which is what KVzip's max-attention "
+        "label does for free because it never differentiates (§16.4); it needs >= 2 chunks, so set "
+        "--query-chunk accordingly. 'mean' is the null control (same direction, 1/n_chunks scale). "
+        "MEASURED: 'max' reaches the flat-gate degeneracy (six flat shuffle controls, participation "
+        "rising to 0.96) and was killed -- see §17.4.1 before using it.",
+    )
+    shape.add_argument(
+        "--cross-doc-replay",
+        action="store_true",
+        help="replay an UNRELATED document against KV(C) instead of C itself -- the cross-document "
+        "control, promoted from an eval-time null to a TRAINING condition. An unrelated document's "
+        "next token cannot be predicted from C's keys, so if the reconstruction relation is what "
+        "teaches the router, this must collapse. If it instead trains to a comparable score AND lands "
+        "in the same selection cluster as the rectangle arms (§18.3), reconstruction was never the "
+        "teacher and the router is learning a document-independent salience -- which would explain "
+        "why 26x capacity, 2048x budget and the causal mask shape all failed to move it. The donor is "
+        "the next batch from the same loader, so it is real corpus text at identical length and "
+        "distribution. See cross_replay_e2e.md §19.",
+    )
 
     memory = parser.add_argument_group("memory")
     memory.add_argument(
@@ -440,7 +533,7 @@ def main() -> int:
 
     model, tokenizer = build_model(args.model, getattr(torch, args.dtype), args.attn, device)
 
-    press = GQAIndexerPress(
+    press_kwargs = dict(
         compression_ratio=args.compression_ratio,
         scorer_attr=args.scorer_attr,
         gate_scale=True,
@@ -449,6 +542,13 @@ def main() -> int:
         scalar_mid_dim=args.scalar_mid_dim,
         scalar_pos_slope=args.scalar_pos_slope,
     )
+    if args.scorer == "prefix":
+        press_kwargs.update(
+            prefix_head_dim=args.prefix_head_dim,
+            prefix_value_dim=args.prefix_value_dim,
+            prefix_zero_init=args.prefix_zero_init,
+        )
+    press = GQAIndexerPress(**press_kwargs)
     press.post_init_from_model(model)
 
     if args.init_from:
@@ -468,15 +568,22 @@ def main() -> int:
         pin_mode=args.pin_mode,
         n_sink=args.n_sink,
         query_chunk=args.query_chunk,
+        # None stays None so the trainer's own warning about resolving to the no-op point fires,
+        # rather than being silently turned into some default here.
+        log_budget=None if args.budget is None else math.log(args.budget),
+        lookahead=args.lookahead,
+        demand_reduce=args.demand_reduce,
     )
     trainer.freeze_backbone(model)
     params = trainer.indexer_parameters(model)
     trainable = sum(p.numel() for p in params)
     logger.info(
         "trainable %.2fM of %.2fB parameters; objective = cross-replay LM loss, pin=%s n_sink=%d, "
-        "query_chunk=%s logit_chunk=%s",
+        "budget=%s query_chunk=%s logit_chunk=%s",
         trainable / 1e6, sum(p.numel() for p in model.parameters()) / 1e9,
-        trainer.pin_mode, trainer.sink_count, args.query_chunk, args.logit_chunk,
+        trainer.pin_mode, trainer.sink_count,
+        "n_gated (NO-OP)" if args.budget is None else args.budget,
+        args.query_chunk, args.logit_chunk,
     )
 
     optimizer, lr_schedule = build_optimizer(params, args)
@@ -538,6 +645,33 @@ def main() -> int:
                         batch = next(iterator)
                     input_ids = batch["input_ids"].to(device, non_blocking=True)
                     last_ids = input_ids
+                    # The cross-document control (--cross-doc-replay): replay an UNRELATED document
+                    # against KV(C) instead of C itself. The next token of an unrelated document
+                    # cannot be predicted from C's keys, so if "reconstruction" is what teaches the
+                    # router anything, this must collapse. If instead it trains to the same score --
+                    # and lands in the same selection cluster as the rectangle arms (§18.3) -- then
+                    # the reconstruction relation was never the teacher and the router is learning a
+                    # document-independent salience. See cross_replay_e2e.md §19.
+                    #
+                    # Drawn from the SAME loader as C, one batch later, so it is real corpus text at
+                    # the identical length and from the identical distribution: the only thing that
+                    # changes is whether C' is related to C. Using noise or a shuffle instead would
+                    # confound "unrelated" with "not natural text".
+                    replay_ids = None
+                    if args.cross_doc_replay:
+                        try:
+                            donor = next(iterator)
+                        except StopIteration:
+                            iterator = iter(loader)
+                            donor = next(iterator)
+                        replay_ids = donor["input_ids"].to(device, non_blocking=True)
+                        if replay_ids.shape != input_ids.shape:
+                            # The trainer requires equal shapes; the loader emits fixed-length
+                            # windows, so a mismatch means a ragged tail. Skip rather than pad,
+                            # since padding would put PAD tokens in the loss.
+                            replay_ids = replay_ids[:, : input_ids.shape[1]]
+                            if replay_ids.shape[1] < input_ids.shape[1]:
+                                replay_ids = input_ids  # degenerate tail: fall back to self-replay
                     # loss_scale, NOT (loss / accum_steps).backward(): this function differentiates
                     # internally and returns a DETACHED scalar, so scaling the return value would
                     # divide a number with no graph attached and leave the gradients accum_steps
@@ -546,6 +680,7 @@ def main() -> int:
                         model,
                         trainer,
                         input_ids=input_ids,
+                        replay_ids=replay_ids,
                         logit_chunk=args.logit_chunk,
                         loss_scale=1.0 / args.accum_steps,
                     )
@@ -618,6 +753,12 @@ def main() -> int:
                                     # carries a ranking; <= 0 = it does not.
                                     "shuffle_delta": shuffle_delta,
                                     "peak_gib": peak,
+                                    "budget": args.budget,
+            # Same reason as `budget`: these change what the router is trained on, so a checkpoint
+            # that does not record them cannot be compared against another (§13, §16).
+            "lookahead": args.lookahead,
+            "demand_reduce": args.demand_reduce,
+            "cross_doc_replay": args.cross_doc_replay,
                                     "query_chunk": args.query_chunk,
                                     "logit_chunk": args.logit_chunk,
                                     "accum_steps": args.accum_steps,

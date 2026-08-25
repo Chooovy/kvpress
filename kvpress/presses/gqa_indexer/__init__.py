@@ -70,6 +70,7 @@ from kvpress.presses.gqa_indexer.cross_replay import (
     cross_replay_training_step,
     gate_participation,
     rectangle_mask,
+    replay_horizon_mask,
     shuffled_scores,
 )
 from kvpress.presses.gqa_indexer.data import (
@@ -90,6 +91,61 @@ from kvpress.presses.gqa_indexer.e2e_trainer import (
     STAGES,
     E2EIndexerTrainer,
     e2e_indexer_training_step,
+)
+from kvpress.presses.gqa_indexer.exact_k_attention import (
+    PAD_SCORE,
+    TILE_LOGIT_BYTES,
+    build_candidates,
+    chunk_visibility,
+    exact_k_chunk_attention,
+    gather_candidate_gradient,
+    gather_candidate_scores,
+    pool_scores_to_chunks,
+    selection_jaccard,
+    share_over_query_blocks,
+)
+from kvpress.presses.gqa_indexer.exact_k_diagnostics import (
+    SwapOracleResult,
+    lm_loss_regret,
+    router_recall_at_k,
+    swap_oracle_correlation,
+)
+from kvpress.presses.gqa_indexer.exact_k_subset import (
+    LOG_P_MAX,
+    NEG_INF,
+    exact_k_marginals,
+    log1mexp,
+    log_pr_exactly_k,
+    log_sigmoid,
+    sample_k_subset,
+    straight_through_mask,
+    subset_indices,
+)
+from kvpress.presses.gqa_indexer.exact_k_trainer import (
+    ExactKIndexerTrainer,
+    exact_k_indexer_training_step,
+)
+from kvpress.presses.gqa_indexer.hsa_attention import (
+    INVISIBLE_SCORE,
+    chunk_lse,
+    hsa_chunk_attention,
+    hsa_chunk_attention_reference,
+)
+from kvpress.presses.gqa_indexer.hsa_trainer import (
+    HSAIndexerTrainer,
+    hsa_indexer_training_step,
+)
+from kvpress.presses.gqa_indexer.utility_loss import (
+    INVALID_UTILITY,
+    lm_gradient_utility,
+    pairwise_rank_loss,
+    sample_boundary_pairs,
+    score_utility_correlation,
+    utility_recall_at_k,
+)
+from kvpress.presses.gqa_indexer.utility_trainer import (
+    UtilityIndexerTrainer,
+    utility_indexer_training_step,
 )
 from kvpress.presses.gqa_indexer.fused_loss import (
     accumulation_dtype,
@@ -152,6 +208,11 @@ from kvpress.presses.gqa_indexer.scalar_indexer import (
     ScalarIndexer,
     ScalarIndexerConfig,
 )
+from kvpress.presses.gqa_indexer.prefix_indexer import (
+    PrefixIndexer,
+    PrefixIndexerConfig,
+    score_variance_profile,
+)
 from kvpress.presses.gqa_indexer.loss import (
     build_dense_indexer_target,
     build_sparse_indexer_target,
@@ -208,6 +269,12 @@ from kvpress.presses.gqa_indexer.train import (
     detect_scorer_from_keys,
     infer_scalar_mid_dim,
 )
+from kvpress.presses.gqa_indexer.qi_flex_attention import (
+    HAS_FLEX,
+    deadlines,
+    qi_block_mask,
+    qi_sparse_attention,
+)
 from kvpress.presses.gqa_indexer.triton_fused_loss import (
     HAS_TRITON,
     decompose_mask,
@@ -243,6 +310,9 @@ __all__ = [
     "IndexerNorm",
     "ScalarIndexer",
     "ScalarIndexerConfig",
+    "PrefixIndexer",
+    "PrefixIndexerConfig",
+    "score_variance_profile",
     "DEFAULT_POS_SLOPE",
     "GQAIndexerPress",
     "SparseAttentionContext",
@@ -283,11 +353,58 @@ __all__ = [
     "E2EIndexerTrainer",
     "e2e_indexer_training_step",
     "STAGES",
+    # Exact-K chunk subset training: discrete k-subset forward, exact-marginal backward.
+    # The one objective whose train-time forward is genuinely sparse, so nothing needs pinning.
+    "ExactKIndexerTrainer",
+    "HSAIndexerTrainer",
+    "hsa_indexer_training_step",
+    "hsa_chunk_attention",
+    "hsa_chunk_attention_reference",
+    "chunk_lse",
+    "INVISIBLE_SCORE",
+    # Utility self-distillation: unmodified forward, router supervised by -dL/db_j read out of the
+    # backbone's own backward. A distillation arm with a much better teacher than attention weights,
+    # NOT an end-to-end one -- the router is not on the forward path.
+    "UtilityIndexerTrainer",
+    "utility_indexer_training_step",
+    "lm_gradient_utility",
+    "sample_boundary_pairs",
+    "pairwise_rank_loss",
+    "score_utility_correlation",
+    "utility_recall_at_k",
+    "INVALID_UTILITY",
+    "exact_k_indexer_training_step",
+    "exact_k_marginals",
+    "sample_k_subset",
+    "straight_through_mask",
+    "subset_indices",
+    "log_pr_exactly_k",
+    "log_sigmoid",
+    "log1mexp",
+    "LOG_P_MAX",
+    "NEG_INF",
+    "PAD_SCORE",
+    "TILE_LOGIT_BYTES",
+    "build_candidates",
+    "chunk_visibility",
+    "exact_k_chunk_attention",
+    "gather_candidate_scores",
+    "gather_candidate_gradient",
+    "pool_scores_to_chunks",
+    "selection_jaccard",
+    "share_over_query_blocks",
+    # Does the gradient recover the DISCRETE marginal utility? The handoff's most informative
+    # diagnostic, and the only one that compares against ground truth rather than self-reporting.
+    "SwapOracleResult",
+    "swap_oracle_correlation",
+    "router_recall_at_k",
+    "lm_loss_regret",
     # Cross-replay training (query-independent scorer only)
     "CrossReplayTrainer",
     "cross_replay_training_step",
     "ReadOnlyCache",
     "rectangle_mask",
+    "replay_horizon_mask",
     # The two diagnostics that distinguish a trained router from a trained-looking one.
     "gate_participation",
     "shuffled_scores",
@@ -348,6 +465,11 @@ __all__ = [
     "seq_ids_from_cu_seqlens",
     "pack_varlen",
     "unpack_varlen",
+    # Query-independent (scalar-scorer) sparse attention via flex_attention
+    "HAS_FLEX",
+    "deadlines",
+    "qi_block_mask",
+    "qi_sparse_attention",
     # Triton kernels for stage 1
     "HAS_TRITON",
     "kernels_available",

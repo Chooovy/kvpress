@@ -174,6 +174,14 @@ class ScalarIndexer(nn.Module):
     #: staticmethod with the same name so callers can treat the two scorers alike.
     GATE_SCALE_INIT = staticmethod(lambda _n_heads=None: 1.0)
 
+    #: The score does not depend on the query -- that is this module's entire premise. Callers use
+    #: this to take an asymptotically cheaper selection path: because a key's score is fixed and the
+    #: eligible pool only grows, each key is selected by one *contiguous interval* of query rows, so
+    #: the whole support is expressible as a per-key deadline instead of a
+    #: ``(B, h, Sq, topk)`` index tensor. See
+    #: :mod:`~kvpress.presses.gqa_indexer.qi_flex_attention`.
+    is_query_independent = True
+
     def __init__(self, config: ScalarIndexerConfig):
         super().__init__()
         self.config = config

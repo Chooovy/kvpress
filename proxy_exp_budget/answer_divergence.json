@@ -1,0 +1,1375 @@
+{
+ "A": {
+  "arm": "A",
+  "ckpt_config": {
+   "objective": "cross_replay_lm_loss",
+   "model": "/apdcephfs_gy8/share_303843174/guhao/models/Qwen3-8B",
+   "scorer": "scalar",
+   "scalar_mid_dim": 0,
+   "scalar_pos_slope": 1e-06,
+   "pin_mode": "sink",
+   "n_sink": 4,
+   "schedule": "8192:300,16384:300,32768:900",
+   "subsets": [
+    "2e16",
+    "2e17"
+   ],
+   "query_chunk": 1024,
+   "logit_chunk": null,
+   "peak_lr": 0.001,
+   "final_lr": 5e-06,
+   "seed": 0
+  },
+  "gold_nll_sparse": 14.66853446052188,
+  "gold_nll_dense": 16.633367606571742,
+  "nll_gap": -1.9648331460498625,
+  "top1_agree": 0.6190476190476191,
+  "kl": 0.42963062454059364,
+  "gold_top1_frac_sparse": 0.0,
+  "gold_top1_frac_dense": 0.0,
+  "by_task": {
+   "vt": {
+    "gold_nll_sparse": 17.20807679494222,
+    "gold_nll_dense": 16.330070972442627,
+    "top1_agree": 0.8333333333333334,
+    "gold_top1_frac": 0.0
+   },
+   "niah_single_1": {
+    "gold_nll_sparse": 18.764836311340332,
+    "gold_nll_dense": 20.26425552368164,
+    "top1_agree": 0.3333333333333333,
+    "gold_top1_frac": 0.0
+   },
+   "niah_single_2": {
+    "gold_nll_sparse": 16.10843563079834,
+    "gold_nll_dense": 21.425837834676106,
+    "top1_agree": 0.8333333333333334,
+    "gold_top1_frac": 0.0
+   },
+   "niah_single_3": {
+    "gold_nll_sparse": 14.910787582397461,
+    "gold_nll_dense": 18.47715886433919,
+    "top1_agree": 1.0,
+    "gold_top1_frac": 0.0
+   },
+   "niah_multiquery": {
+    "gold_nll_sparse": 12.268896420796713,
+    "gold_nll_dense": 13.870978355407715,
+    "top1_agree": 0.6666666666666666,
+    "gold_top1_frac": 0.0
+   },
+   "niah_multivalue": {
+    "gold_nll_sparse": 15.247684796651205,
+    "gold_nll_dense": 16.731417020161945,
+    "top1_agree": 0.3333333333333333,
+    "gold_top1_frac": 0.0
+   },
+   "qa_1": {
+    "gold_nll_sparse": 8.171023686726889,
+    "gold_nll_dense": 9.333854675292969,
+    "top1_agree": 0.3333333333333333,
+    "gold_top1_frac": 0.0
+   }
+  },
+  "rows": [
+   {
+    "task": "vt",
+    "gold_nll_dense": 15.06403636932373,
+    "gold_nll_sparse": 18.06477165222168,
+    "gold_rank_dense": 230,
+    "gold_rank_sparse": 176,
+    "top1_agree": 1.0,
+    "kl": 0.005157907027751207
+   },
+   {
+    "task": "vt",
+    "gold_nll_dense": 15.750870704650879,
+    "gold_nll_sparse": 16.58467674255371,
+    "gold_rank_dense": 239,
+    "gold_rank_sparse": 891,
+    "top1_agree": 1.0,
+    "kl": 0.020075466483831406
+   },
+   {
+    "task": "vt",
+    "gold_nll_dense": 22.189130783081055,
+    "gold_nll_sparse": 19.78936004638672,
+    "gold_rank_dense": 10396,
+    "gold_rank_sparse": 2876,
+    "top1_agree": 1.0,
+    "kl": 0.03577899932861328
+   },
+   {
+    "task": "vt",
+    "gold_nll_dense": 18.283720016479492,
+    "gold_nll_sparse": 18.890899658203125,
+    "gold_rank_dense": 1596,
+    "gold_rank_sparse": 11510,
+    "top1_agree": 0.0,
+    "kl": 1.9399079084396362
+   },
+   {
+    "task": "vt",
+    "gold_nll_dense": 11.12684440612793,
+    "gold_nll_sparse": 16.1980037689209,
+    "gold_rank_dense": 25,
+    "gold_rank_sparse": 443,
+    "top1_agree": 1.0,
+    "kl": 0.07063367962837219
+   },
+   {
+    "task": "vt",
+    "gold_nll_dense": 15.565823554992676,
+    "gold_nll_sparse": 13.720748901367188,
+    "gold_rank_dense": 325,
+    "gold_rank_sparse": 226,
+    "top1_agree": 1.0,
+    "kl": 0.02448536455631256
+   },
+   {
+    "task": "niah_single_1",
+    "gold_nll_dense": 20.881258010864258,
+    "gold_nll_sparse": 18.51913070678711,
+    "gold_rank_dense": 368,
+    "gold_rank_sparse": 99,
+    "top1_agree": 0.0,
+    "kl": 0.8955806493759155
+   },
+   {
+    "task": "niah_single_1",
+    "gold_nll_dense": 20.27254867553711,
+    "gold_nll_sparse": 17.93043327331543,
+    "gold_rank_dense": 280,
+    "gold_rank_sparse": 75,
+    "top1_agree": 0.0,
+    "kl": 0.4947526454925537
+   },
+   {
+    "task": "niah_single_1",
+    "gold_nll_dense": 20.445064544677734,
+    "gold_nll_sparse": 20.648868560791016,
+    "gold_rank_dense": 321,
+    "gold_rank_sparse": 842,
+    "top1_agree": 0.0,
+    "kl": 1.0491067171096802
+   },
+   {
+    "task": "niah_single_1",
+    "gold_nll_dense": 19.226320266723633,
+    "gold_nll_sparse": 13.252687454223633,
+    "gold_rank_dense": 144,
+    "gold_rank_sparse": 32,
+    "top1_agree": 1.0,
+    "kl": 0.31327834725379944
+   },
+   {
+    "task": "niah_single_1",
+    "gold_nll_dense": 20.006855010986328,
+    "gold_nll_sparse": 19.465864181518555,
+    "gold_rank_dense": 291,
+    "gold_rank_sparse": 451,
+    "top1_agree": 1.0,
+    "kl": 0.2020851969718933
+   },
+   {
+    "task": "niah_single_1",
+    "gold_nll_dense": 20.75348663330078,
+    "gold_nll_sparse": 22.77203369140625,
+    "gold_rank_dense": 347,
+    "gold_rank_sparse": 602,
+    "top1_agree": 0.0,
+    "kl": 0.6251388192176819
+   },
+   {
+    "task": "niah_single_2",
+    "gold_nll_dense": 21.804607391357422,
+    "gold_nll_sparse": 17.034696578979492,
+    "gold_rank_dense": 292,
+    "gold_rank_sparse": 388,
+    "top1_agree": 1.0,
+    "kl": 0.021100565791130066
+   },
+   {
+    "task": "niah_single_2",
+    "gold_nll_dense": 21.1873836517334,
+    "gold_nll_sparse": 17.048892974853516,
+    "gold_rank_dense": 282,
+    "gold_rank_sparse": 331,
+    "top1_agree": 0.0,
+    "kl": 0.1740894764661789
+   },
+   {
+    "task": "niah_single_2",
+    "gold_nll_dense": 21.110149383544922,
+    "gold_nll_sparse": 13.210017204284668,
+    "gold_rank_dense": 273,
+    "gold_rank_sparse": 226,
+    "top1_agree": 1.0,
+    "kl": 0.8188353776931763
+   },
+   {
+    "task": "niah_single_2",
+    "gold_nll_dense": 19.383745193481445,
+    "gold_nll_sparse": 13.181241035461426,
+    "gold_rank_dense": 103,
+    "gold_rank_sparse": 134,
+    "top1_agree": 1.0,
+    "kl": 0.43179216980934143
+   },
+   {
+    "task": "niah_single_2",
+    "gold_nll_dense": 22.11898422241211,
+    "gold_nll_sparse": 19.143959045410156,
+    "gold_rank_dense": 655,
+    "gold_rank_sparse": 854,
+    "top1_agree": 1.0,
+    "kl": 0.11842590570449829
+   },
+   {
+    "task": "niah_single_2",
+    "gold_nll_dense": 22.950157165527344,
+    "gold_nll_sparse": 17.03180694580078,
+    "gold_rank_dense": 457,
+    "gold_rank_sparse": 589,
+    "top1_agree": 1.0,
+    "kl": 0.3043287992477417
+   },
+   {
+    "task": "niah_single_3",
+    "gold_nll_dense": 18.22869110107422,
+    "gold_nll_sparse": 14.897552490234375,
+    "gold_rank_dense": 43,
+    "gold_rank_sparse": 90,
+    "top1_agree": 1.0,
+    "kl": 0.013753682374954224
+   },
+   {
+    "task": "niah_single_3",
+    "gold_nll_dense": 17.23381805419922,
+    "gold_nll_sparse": 14.922056198120117,
+    "gold_rank_dense": 48,
+    "gold_rank_sparse": 45,
+    "top1_agree": 1.0,
+    "kl": 0.03272990137338638
+   },
+   {
+    "task": "niah_single_3",
+    "gold_nll_dense": 21.646366119384766,
+    "gold_nll_sparse": 14.134788513183594,
+    "gold_rank_dense": 67,
+    "gold_rank_sparse": 102,
+    "top1_agree": 1.0,
+    "kl": 0.18533790111541748
+   },
+   {
+    "task": "niah_single_3",
+    "gold_nll_dense": 18.037050247192383,
+    "gold_nll_sparse": 16.16621971130371,
+    "gold_rank_dense": 89,
+    "gold_rank_sparse": 224,
+    "top1_agree": 1.0,
+    "kl": 0.04413105919957161
+   },
+   {
+    "task": "niah_single_3",
+    "gold_nll_dense": 17.323116302490234,
+    "gold_nll_sparse": 13.269266128540039,
+    "gold_rank_dense": 57,
+    "gold_rank_sparse": 106,
+    "top1_agree": 1.0,
+    "kl": 0.0360044464468956
+   },
+   {
+    "task": "niah_single_3",
+    "gold_nll_dense": 18.393911361694336,
+    "gold_nll_sparse": 16.07484245300293,
+    "gold_rank_dense": 49,
+    "gold_rank_sparse": 101,
+    "top1_agree": 1.0,
+    "kl": 0.028232740238308907
+   },
+   {
+    "task": "niah_multiquery",
+    "gold_nll_dense": 12.057794570922852,
+    "gold_nll_sparse": 11.637643814086914,
+    "gold_rank_dense": 27,
+    "gold_rank_sparse": 78,
+    "top1_agree": 1.0,
+    "kl": 0.2218828946352005
+   },
+   {
+    "task": "niah_multiquery",
+    "gold_nll_dense": 14.678593635559082,
+    "gold_nll_sparse": 13.059638977050781,
+    "gold_rank_dense": 132,
+    "gold_rank_sparse": 205,
+    "top1_agree": 0.0,
+    "kl": 0.3887290060520172
+   },
+   {
+    "task": "niah_multiquery",
+    "gold_nll_dense": 14.397001266479492,
+    "gold_nll_sparse": 13.151368141174316,
+    "gold_rank_dense": 150,
+    "gold_rank_sparse": 312,
+    "top1_agree": 1.0,
+    "kl": 0.2924017012119293
+   },
+   {
+    "task": "niah_multiquery",
+    "gold_nll_dense": 12.955021858215332,
+    "gold_nll_sparse": 11.28494930267334,
+    "gold_rank_dense": 89,
+    "gold_rank_sparse": 116,
+    "top1_agree": 1.0,
+    "kl": 0.3630577623844147
+   },
+   {
+    "task": "niah_multiquery",
+    "gold_nll_dense": 13.448956489562988,
+    "gold_nll_sparse": 11.153812408447266,
+    "gold_rank_dense": 105,
+    "gold_rank_sparse": 102,
+    "top1_agree": 1.0,
+    "kl": 0.27023452520370483
+   },
+   {
+    "task": "niah_multiquery",
+    "gold_nll_dense": 15.688502311706543,
+    "gold_nll_sparse": 13.325965881347656,
+    "gold_rank_dense": 346,
+    "gold_rank_sparse": 318,
+    "top1_agree": 0.0,
+    "kl": 0.42957666516304016
+   },
+   {
+    "task": "niah_multivalue",
+    "gold_nll_dense": 17.19038200378418,
+    "gold_nll_sparse": 15.325847625732422,
+    "gold_rank_dense": 666,
+    "gold_rank_sparse": 556,
+    "top1_agree": 0.0,
+    "kl": 0.4902961850166321
+   },
+   {
+    "task": "niah_multivalue",
+    "gold_nll_dense": 16.31263542175293,
+    "gold_nll_sparse": 15.034612655639648,
+    "gold_rank_dense": 297,
+    "gold_rank_sparse": 366,
+    "top1_agree": 0.0,
+    "kl": 0.5091351270675659
+   },
+   {
+    "task": "niah_multivalue",
+    "gold_nll_dense": 17.120893478393555,
+    "gold_nll_sparse": 15.738377571105957,
+    "gold_rank_dense": 540,
+    "gold_rank_sparse": 531,
+    "top1_agree": 0.0,
+    "kl": 0.3937060534954071
+   },
+   {
+    "task": "niah_multivalue",
+    "gold_nll_dense": 16.581130981445312,
+    "gold_nll_sparse": 15.089966773986816,
+    "gold_rank_dense": 765,
+    "gold_rank_sparse": 521,
+    "top1_agree": 1.0,
+    "kl": 0.19457849860191345
+   },
+   {
+    "task": "niah_multivalue",
+    "gold_nll_dense": 16.5107364654541,
+    "gold_nll_sparse": 14.465078353881836,
+    "gold_rank_dense": 375,
+    "gold_rank_sparse": 343,
+    "top1_agree": 0.0,
+    "kl": 0.4461451768875122
+   },
+   {
+    "task": "niah_multivalue",
+    "gold_nll_dense": 16.6727237701416,
+    "gold_nll_sparse": 15.832225799560547,
+    "gold_rank_dense": 451,
+    "gold_rank_sparse": 384,
+    "top1_agree": 1.0,
+    "kl": 0.33770525455474854
+   },
+   {
+    "task": "qa_1",
+    "gold_nll_dense": 9.335859298706055,
+    "gold_nll_sparse": 9.130324363708496,
+    "gold_rank_dense": 19,
+    "gold_rank_sparse": 9,
+    "top1_agree": 1.0,
+    "kl": 0.23346246778964996
+   },
+   {
+    "task": "qa_1",
+    "gold_nll_dense": 7.968874454498291,
+    "gold_nll_sparse": 6.82847785949707,
+    "gold_rank_dense": 28,
+    "gold_rank_sparse": 24,
+    "top1_agree": 0.0,
+    "kl": 1.251627802848816
+   },
+   {
+    "task": "qa_1",
+    "gold_nll_dense": 12.931560516357422,
+    "gold_nll_sparse": 9.399683952331543,
+    "gold_rank_dense": 216,
+    "gold_rank_sparse": 62,
+    "top1_agree": 1.0,
+    "kl": 0.2704737186431885
+   },
+   {
+    "task": "qa_1",
+    "gold_nll_dense": 8.078621864318848,
+    "gold_nll_sparse": 8.554278373718262,
+    "gold_rank_dense": 28,
+    "gold_rank_sparse": 106,
+    "top1_agree": 0.0,
+    "kl": 1.245742678642273
+   },
+   {
+    "task": "qa_1",
+    "gold_nll_dense": 10.272972106933594,
+    "gold_nll_sparse": 8.698417663574219,
+    "gold_rank_dense": 63,
+    "gold_rank_sparse": 29,
+    "top1_agree": 0.0,
+    "kl": 1.0089240074157715
+   },
+   {
+    "task": "qa_1",
+    "gold_nll_dense": 7.4152398109436035,
+    "gold_nll_sparse": 6.414959907531738,
+    "gold_rank_dense": 26,
+    "gold_rank_sparse": 12,
+    "top1_agree": 0.0,
+    "kl": 1.8120629787445068
+   }
+  ]
+ },
+ "B": {
+  "arm": "B",
+  "ckpt_config": {
+   "objective": "cross_replay_lm_loss",
+   "model": "/apdcephfs_gy8/share_303843174/guhao/models/Qwen3-8B",
+   "scorer": "scalar",
+   "scalar_mid_dim": 256,
+   "scalar_pos_slope": 1e-06,
+   "pin_mode": "sink",
+   "n_sink": 4,
+   "budget": 2048,
+   "schedule": "8192:300,16384:300,32768:900",
+   "subsets": [
+    "2e16",
+    "2e17"
+   ],
+   "query_chunk": 1024,
+   "logit_chunk": null,
+   "peak_lr": 0.001,
+   "final_lr": 5e-06,
+   "seed": 0
+  },
+  "gold_nll_sparse": 16.719396931784495,
+  "gold_nll_dense": 16.633367606571742,
+  "nll_gap": 0.08602932521275264,
+  "top1_agree": 0.3333333333333333,
+  "kl": 1.9368684501165436,
+  "gold_top1_frac_sparse": 0.0,
+  "gold_top1_frac_dense": 0.0,
+  "by_task": {
+   "vt": {
+    "gold_nll_sparse": 20.282720883687336,
+    "gold_nll_dense": 16.330070972442627,
+    "top1_agree": 0.0,
+    "gold_top1_frac": 0.0
+   },
+   "niah_single_1": {
+    "gold_nll_sparse": 16.520785490671795,
+    "gold_nll_dense": 20.26425552368164,
+    "top1_agree": 0.16666666666666666,
+    "gold_top1_frac": 0.0
+   },
+   "niah_single_2": {
+    "gold_nll_sparse": 19.592724482218426,
+    "gold_nll_dense": 21.425837834676106,
+    "top1_agree": 0.3333333333333333,
+    "gold_top1_frac": 0.0
+   },
+   "niah_single_3": {
+    "gold_nll_sparse": 15.685059706370035,
+    "gold_nll_dense": 18.47715886433919,
+    "top1_agree": 0.6666666666666666,
+    "gold_top1_frac": 0.0
+   },
+   "niah_multiquery": {
+    "gold_nll_sparse": 15.489696979522705,
+    "gold_nll_dense": 13.870978355407715,
+    "top1_agree": 0.6666666666666666,
+    "gold_top1_frac": 0.0
+   },
+   "niah_multivalue": {
+    "gold_nll_sparse": 17.119850158691406,
+    "gold_nll_dense": 16.731417020161945,
+    "top1_agree": 0.3333333333333333,
+    "gold_top1_frac": 0.0
+   },
+   "qa_1": {
+    "gold_nll_sparse": 12.344940821329752,
+    "gold_nll_dense": 9.333854675292969,
+    "top1_agree": 0.16666666666666666,
+    "gold_top1_frac": 0.0
+   }
+  },
+  "rows": [
+   {
+    "task": "vt",
+    "gold_nll_dense": 15.06403636932373,
+    "gold_nll_sparse": 18.739852905273438,
+    "gold_rank_dense": 230,
+    "gold_rank_sparse": 11790,
+    "top1_agree": 0.0,
+    "kl": 7.002002239227295
+   },
+   {
+    "task": "vt",
+    "gold_nll_dense": 15.750870704650879,
+    "gold_nll_sparse": 21.59107208251953,
+    "gold_rank_dense": 239,
+    "gold_rank_sparse": 29581,
+    "top1_agree": 0.0,
+    "kl": 7.236627578735352
+   },
+   {
+    "task": "vt",
+    "gold_nll_dense": 22.189130783081055,
+    "gold_nll_sparse": 21.325782775878906,
+    "gold_rank_dense": 10396,
+    "gold_rank_sparse": 50698,
+    "top1_agree": 0.0,
+    "kl": 10.114492416381836
+   },
+   {
+    "task": "vt",
+    "gold_nll_dense": 18.283720016479492,
+    "gold_nll_sparse": 21.77568244934082,
+    "gold_rank_dense": 1596,
+    "gold_rank_sparse": 52238,
+    "top1_agree": 0.0,
+    "kl": 14.992416381835938
+   },
+   {
+    "task": "vt",
+    "gold_nll_dense": 11.12684440612793,
+    "gold_nll_sparse": 19.26280403137207,
+    "gold_rank_dense": 25,
+    "gold_rank_sparse": 10554,
+    "top1_agree": 0.0,
+    "kl": 5.08765172958374
+   },
+   {
+    "task": "vt",
+    "gold_nll_dense": 15.565823554992676,
+    "gold_nll_sparse": 19.001131057739258,
+    "gold_rank_dense": 325,
+    "gold_rank_sparse": 11721,
+    "top1_agree": 0.0,
+    "kl": 3.51169753074646
+   },
+   {
+    "task": "niah_single_1",
+    "gold_nll_dense": 20.881258010864258,
+    "gold_nll_sparse": 15.632197380065918,
+    "gold_rank_dense": 368,
+    "gold_rank_sparse": 269,
+    "top1_agree": 0.0,
+    "kl": 3.065056800842285
+   },
+   {
+    "task": "niah_single_1",
+    "gold_nll_dense": 20.27254867553711,
+    "gold_nll_sparse": 20.255277633666992,
+    "gold_rank_dense": 280,
+    "gold_rank_sparse": 738,
+    "top1_agree": 0.0,
+    "kl": 0.31112220883369446
+   },
+   {
+    "task": "niah_single_1",
+    "gold_nll_dense": 20.445064544677734,
+    "gold_nll_sparse": 16.928348541259766,
+    "gold_rank_dense": 321,
+    "gold_rank_sparse": 920,
+    "top1_agree": 0.0,
+    "kl": 1.0166352987289429
+   },
+   {
+    "task": "niah_single_1",
+    "gold_nll_dense": 19.226320266723633,
+    "gold_nll_sparse": 15.30650806427002,
+    "gold_rank_dense": 144,
+    "gold_rank_sparse": 320,
+    "top1_agree": 1.0,
+    "kl": 0.555253267288208
+   },
+   {
+    "task": "niah_single_1",
+    "gold_nll_dense": 20.006855010986328,
+    "gold_nll_sparse": 14.918353080749512,
+    "gold_rank_dense": 291,
+    "gold_rank_sparse": 416,
+    "top1_agree": 0.0,
+    "kl": 2.9793331623077393
+   },
+   {
+    "task": "niah_single_1",
+    "gold_nll_dense": 20.75348663330078,
+    "gold_nll_sparse": 16.084028244018555,
+    "gold_rank_dense": 347,
+    "gold_rank_sparse": 379,
+    "top1_agree": 0.0,
+    "kl": 2.6496033668518066
+   },
+   {
+    "task": "niah_single_2",
+    "gold_nll_dense": 21.804607391357422,
+    "gold_nll_sparse": 18.951072692871094,
+    "gold_rank_dense": 292,
+    "gold_rank_sparse": 737,
+    "top1_agree": 0.0,
+    "kl": 0.7669065594673157
+   },
+   {
+    "task": "niah_single_2",
+    "gold_nll_dense": 21.1873836517334,
+    "gold_nll_sparse": 20.729900360107422,
+    "gold_rank_dense": 282,
+    "gold_rank_sparse": 762,
+    "top1_agree": 1.0,
+    "kl": 0.13210538029670715
+   },
+   {
+    "task": "niah_single_2",
+    "gold_nll_dense": 21.110149383544922,
+    "gold_nll_sparse": 18.056964874267578,
+    "gold_rank_dense": 273,
+    "gold_rank_sparse": 1675,
+    "top1_agree": 0.0,
+    "kl": 1.4910327196121216
+   },
+   {
+    "task": "niah_single_2",
+    "gold_nll_dense": 19.383745193481445,
+    "gold_nll_sparse": 17.91788101196289,
+    "gold_rank_dense": 103,
+    "gold_rank_sparse": 459,
+    "top1_agree": 0.0,
+    "kl": 2.3909201622009277
+   },
+   {
+    "task": "niah_single_2",
+    "gold_nll_dense": 22.11898422241211,
+    "gold_nll_sparse": 21.76371192932129,
+    "gold_rank_dense": 655,
+    "gold_rank_sparse": 1734,
+    "top1_agree": 1.0,
+    "kl": 0.4062415659427643
+   },
+   {
+    "task": "niah_single_2",
+    "gold_nll_dense": 22.950157165527344,
+    "gold_nll_sparse": 20.136816024780273,
+    "gold_rank_dense": 457,
+    "gold_rank_sparse": 1093,
+    "top1_agree": 0.0,
+    "kl": 1.141979694366455
+   },
+   {
+    "task": "niah_single_3",
+    "gold_nll_dense": 18.22869110107422,
+    "gold_nll_sparse": 15.112222671508789,
+    "gold_rank_dense": 43,
+    "gold_rank_sparse": 182,
+    "top1_agree": 1.0,
+    "kl": 0.3549654185771942
+   },
+   {
+    "task": "niah_single_3",
+    "gold_nll_dense": 17.23381805419922,
+    "gold_nll_sparse": 15.151762962341309,
+    "gold_rank_dense": 48,
+    "gold_rank_sparse": 94,
+    "top1_agree": 1.0,
+    "kl": 0.23870469629764557
+   },
+   {
+    "task": "niah_single_3",
+    "gold_nll_dense": 21.646366119384766,
+    "gold_nll_sparse": 15.326300621032715,
+    "gold_rank_dense": 67,
+    "gold_rank_sparse": 326,
+    "top1_agree": 1.0,
+    "kl": 0.8126751184463501
+   },
+   {
+    "task": "niah_single_3",
+    "gold_nll_dense": 18.037050247192383,
+    "gold_nll_sparse": 17.32060432434082,
+    "gold_rank_dense": 89,
+    "gold_rank_sparse": 219,
+    "top1_agree": 1.0,
+    "kl": 0.06711035966873169
+   },
+   {
+    "task": "niah_single_3",
+    "gold_nll_dense": 17.323116302490234,
+    "gold_nll_sparse": 15.207966804504395,
+    "gold_rank_dense": 57,
+    "gold_rank_sparse": 263,
+    "top1_agree": 0.0,
+    "kl": 0.8270556330680847
+   },
+   {
+    "task": "niah_single_3",
+    "gold_nll_dense": 18.393911361694336,
+    "gold_nll_sparse": 15.991500854492188,
+    "gold_rank_dense": 49,
+    "gold_rank_sparse": 272,
+    "top1_agree": 0.0,
+    "kl": 2.0364325046539307
+   },
+   {
+    "task": "niah_multiquery",
+    "gold_nll_dense": 12.057794570922852,
+    "gold_nll_sparse": 15.304317474365234,
+    "gold_rank_dense": 27,
+    "gold_rank_sparse": 315,
+    "top1_agree": 1.0,
+    "kl": 0.12604856491088867
+   },
+   {
+    "task": "niah_multiquery",
+    "gold_nll_dense": 14.678593635559082,
+    "gold_nll_sparse": 17.355148315429688,
+    "gold_rank_dense": 132,
+    "gold_rank_sparse": 664,
+    "top1_agree": 1.0,
+    "kl": 0.07439230382442474
+   },
+   {
+    "task": "niah_multiquery",
+    "gold_nll_dense": 14.397001266479492,
+    "gold_nll_sparse": 16.470869064331055,
+    "gold_rank_dense": 150,
+    "gold_rank_sparse": 647,
+    "top1_agree": 1.0,
+    "kl": 0.0367613285779953
+   },
+   {
+    "task": "niah_multiquery",
+    "gold_nll_dense": 12.955021858215332,
+    "gold_nll_sparse": 13.578670501708984,
+    "gold_rank_dense": 89,
+    "gold_rank_sparse": 187,
+    "top1_agree": 0.0,
+    "kl": 0.3422577977180481
+   },
+   {
+    "task": "niah_multiquery",
+    "gold_nll_dense": 13.448956489562988,
+    "gold_nll_sparse": 14.0354585647583,
+    "gold_rank_dense": 105,
+    "gold_rank_sparse": 164,
+    "top1_agree": 0.0,
+    "kl": 0.0990091934800148
+   },
+   {
+    "task": "niah_multiquery",
+    "gold_nll_dense": 15.688502311706543,
+    "gold_nll_sparse": 16.19371795654297,
+    "gold_rank_dense": 346,
+    "gold_rank_sparse": 1017,
+    "top1_agree": 1.0,
+    "kl": 0.29513102769851685
+   },
+   {
+    "task": "niah_multivalue",
+    "gold_nll_dense": 17.19038200378418,
+    "gold_nll_sparse": 17.119537353515625,
+    "gold_rank_dense": 666,
+    "gold_rank_sparse": 825,
+    "top1_agree": 0.0,
+    "kl": 0.23973610997200012
+   },
+   {
+    "task": "niah_multivalue",
+    "gold_nll_dense": 16.31263542175293,
+    "gold_nll_sparse": 16.652198791503906,
+    "gold_rank_dense": 297,
+    "gold_rank_sparse": 465,
+    "top1_agree": 0.0,
+    "kl": 0.08390313386917114
+   },
+   {
+    "task": "niah_multivalue",
+    "gold_nll_dense": 17.120893478393555,
+    "gold_nll_sparse": 17.910938262939453,
+    "gold_rank_dense": 540,
+    "gold_rank_sparse": 910,
+    "top1_agree": 1.0,
+    "kl": 0.09783283621072769
+   },
+   {
+    "task": "niah_multivalue",
+    "gold_nll_dense": 16.581130981445312,
+    "gold_nll_sparse": 16.61233901977539,
+    "gold_rank_dense": 765,
+    "gold_rank_sparse": 776,
+    "top1_agree": 0.0,
+    "kl": 0.1749902069568634
+   },
+   {
+    "task": "niah_multivalue",
+    "gold_nll_dense": 16.5107364654541,
+    "gold_nll_sparse": 16.5966854095459,
+    "gold_rank_dense": 375,
+    "gold_rank_sparse": 501,
+    "top1_agree": 0.0,
+    "kl": 0.1507069319486618
+   },
+   {
+    "task": "niah_multivalue",
+    "gold_nll_dense": 16.6727237701416,
+    "gold_nll_sparse": 17.827402114868164,
+    "gold_rank_dense": 451,
+    "gold_rank_sparse": 422,
+    "top1_agree": 1.0,
+    "kl": 0.3196617662906647
+   },
+   {
+    "task": "qa_1",
+    "gold_nll_dense": 9.335859298706055,
+    "gold_nll_sparse": 11.738306045532227,
+    "gold_rank_dense": 19,
+    "gold_rank_sparse": 18,
+    "top1_agree": 1.0,
+    "kl": 0.3013763725757599
+   },
+   {
+    "task": "qa_1",
+    "gold_nll_dense": 7.968874454498291,
+    "gold_nll_sparse": 10.383810997009277,
+    "gold_rank_dense": 28,
+    "gold_rank_sparse": 50,
+    "top1_agree": 0.0,
+    "kl": 2.1385841369628906
+   },
+   {
+    "task": "qa_1",
+    "gold_nll_dense": 12.931560516357422,
+    "gold_nll_sparse": 17.10517692565918,
+    "gold_rank_dense": 216,
+    "gold_rank_sparse": 598,
+    "top1_agree": 0.0,
+    "kl": 0.7036096453666687
+   },
+   {
+    "task": "qa_1",
+    "gold_nll_dense": 8.078621864318848,
+    "gold_nll_sparse": 11.078144073486328,
+    "gold_rank_dense": 28,
+    "gold_rank_sparse": 245,
+    "top1_agree": 0.0,
+    "kl": 4.324156761169434
+   },
+   {
+    "task": "qa_1",
+    "gold_nll_dense": 10.272972106933594,
+    "gold_nll_sparse": 14.231141090393066,
+    "gold_rank_dense": 63,
+    "gold_rank_sparse": 133,
+    "top1_agree": 0.0,
+    "kl": 0.5022076368331909
+   },
+   {
+    "task": "qa_1",
+    "gold_nll_dense": 7.4152398109436035,
+    "gold_nll_sparse": 9.533065795898438,
+    "gold_rank_dense": 26,
+    "gold_rank_sparse": 19,
+    "top1_agree": 0.0,
+    "kl": 2.150087356567383
+   }
+  ]
+ },
+ "C": {
+  "arm": "C",
+  "ckpt_config": {
+   "objective": "e2e_lm_loss",
+   "model": "/apdcephfs_gy8/share_303843174/guhao/models/Qwen3-8B",
+   "scorer": "scalar",
+   "scalar_mid_dim": 256,
+   "scalar_pos_slope": 1e-06,
+   "stage": "dense",
+   "pin_mode": "sink",
+   "n_sink": 4,
+   "schedule": "8192:300,16384:300,32768:900",
+   "subsets": [
+    "2e16",
+    "2e17"
+   ],
+   "topk": 0,
+   "peak_lr": 0.001,
+   "final_lr": 5e-06,
+   "seed": 0
+  },
+  "gold_nll_sparse": 17.573481673286075,
+  "gold_nll_dense": 16.633367606571742,
+  "nll_gap": 0.9401140667143331,
+  "top1_agree": 0.8333333333333334,
+  "kl": 0.22741107943944544,
+  "gold_top1_frac_sparse": 0.0,
+  "gold_top1_frac_dense": 0.0,
+  "by_task": {
+   "vt": {
+    "gold_nll_sparse": 15.370813210805258,
+    "gold_nll_dense": 16.330070972442627,
+    "top1_agree": 1.0,
+    "gold_top1_frac": 0.0
+   },
+   "niah_single_1": {
+    "gold_nll_sparse": 19.0566307703654,
+    "gold_nll_dense": 20.26425552368164,
+    "top1_agree": 1.0,
+    "gold_top1_frac": 0.0
+   },
+   "niah_single_2": {
+    "gold_nll_sparse": 22.866348584493,
+    "gold_nll_dense": 21.425837834676106,
+    "top1_agree": 0.8333333333333334,
+    "gold_top1_frac": 0.0
+   },
+   "niah_single_3": {
+    "gold_nll_sparse": 23.76702054341634,
+    "gold_nll_dense": 18.47715886433919,
+    "top1_agree": 1.0,
+    "gold_top1_frac": 0.0
+   },
+   "niah_multiquery": {
+    "gold_nll_sparse": 13.745436350504557,
+    "gold_nll_dense": 13.870978355407715,
+    "top1_agree": 0.6666666666666666,
+    "gold_top1_frac": 0.0
+   },
+   "niah_multivalue": {
+    "gold_nll_sparse": 18.95350392659505,
+    "gold_nll_dense": 16.731417020161945,
+    "top1_agree": 0.6666666666666666,
+    "gold_top1_frac": 0.0
+   },
+   "qa_1": {
+    "gold_nll_sparse": 9.254618326822916,
+    "gold_nll_dense": 9.333854675292969,
+    "top1_agree": 0.6666666666666666,
+    "gold_top1_frac": 0.0
+   }
+  },
+  "rows": [
+   {
+    "task": "vt",
+    "gold_nll_dense": 15.06403636932373,
+    "gold_nll_sparse": 13.500519752502441,
+    "gold_rank_dense": 230,
+    "gold_rank_sparse": 33,
+    "top1_agree": 1.0,
+    "kl": 0.002071211813017726
+   },
+   {
+    "task": "vt",
+    "gold_nll_dense": 15.750870704650879,
+    "gold_nll_sparse": 15.376766204833984,
+    "gold_rank_dense": 239,
+    "gold_rank_sparse": 216,
+    "top1_agree": 1.0,
+    "kl": 0.0011816212208941579
+   },
+   {
+    "task": "vt",
+    "gold_nll_dense": 22.189130783081055,
+    "gold_nll_sparse": 22.219970703125,
+    "gold_rank_dense": 10396,
+    "gold_rank_sparse": 4468,
+    "top1_agree": 1.0,
+    "kl": 0.0015798520762473345
+   },
+   {
+    "task": "vt",
+    "gold_nll_dense": 18.283720016479492,
+    "gold_nll_sparse": 16.928260803222656,
+    "gold_rank_dense": 1596,
+    "gold_rank_sparse": 1504,
+    "top1_agree": 1.0,
+    "kl": 0.016254687681794167
+   },
+   {
+    "task": "vt",
+    "gold_nll_dense": 11.12684440612793,
+    "gold_nll_sparse": 10.001888275146484,
+    "gold_rank_dense": 25,
+    "gold_rank_sparse": 6,
+    "top1_agree": 1.0,
+    "kl": 0.0023151827044785023
+   },
+   {
+    "task": "vt",
+    "gold_nll_dense": 15.565823554992676,
+    "gold_nll_sparse": 14.197473526000977,
+    "gold_rank_dense": 325,
+    "gold_rank_sparse": 200,
+    "top1_agree": 1.0,
+    "kl": 0.0036992302630096674
+   },
+   {
+    "task": "niah_single_1",
+    "gold_nll_dense": 20.881258010864258,
+    "gold_nll_sparse": 18.936670303344727,
+    "gold_rank_dense": 368,
+    "gold_rank_sparse": 256,
+    "top1_agree": 1.0,
+    "kl": 0.16499605774879456
+   },
+   {
+    "task": "niah_single_1",
+    "gold_nll_dense": 20.27254867553711,
+    "gold_nll_sparse": 19.940271377563477,
+    "gold_rank_dense": 280,
+    "gold_rank_sparse": 236,
+    "top1_agree": 1.0,
+    "kl": 0.13066466152668
+   },
+   {
+    "task": "niah_single_1",
+    "gold_nll_dense": 20.445064544677734,
+    "gold_nll_sparse": 19.525495529174805,
+    "gold_rank_dense": 321,
+    "gold_rank_sparse": 239,
+    "top1_agree": 1.0,
+    "kl": 0.19115930795669556
+   },
+   {
+    "task": "niah_single_1",
+    "gold_nll_dense": 19.226320266723633,
+    "gold_nll_sparse": 15.30459976196289,
+    "gold_rank_dense": 144,
+    "gold_rank_sparse": 62,
+    "top1_agree": 1.0,
+    "kl": 0.028309354558587074
+   },
+   {
+    "task": "niah_single_1",
+    "gold_nll_dense": 20.006855010986328,
+    "gold_nll_sparse": 19.56839370727539,
+    "gold_rank_dense": 291,
+    "gold_rank_sparse": 126,
+    "top1_agree": 1.0,
+    "kl": 0.04725336283445358
+   },
+   {
+    "task": "niah_single_1",
+    "gold_nll_dense": 20.75348663330078,
+    "gold_nll_sparse": 21.064353942871094,
+    "gold_rank_dense": 347,
+    "gold_rank_sparse": 234,
+    "top1_agree": 1.0,
+    "kl": 0.07071384787559509
+   },
+   {
+    "task": "niah_single_2",
+    "gold_nll_dense": 21.804607391357422,
+    "gold_nll_sparse": 21.398962020874023,
+    "gold_rank_dense": 292,
+    "gold_rank_sparse": 64,
+    "top1_agree": 1.0,
+    "kl": 0.7044923901557922
+   },
+   {
+    "task": "niah_single_2",
+    "gold_nll_dense": 21.1873836517334,
+    "gold_nll_sparse": 21.354951858520508,
+    "gold_rank_dense": 282,
+    "gold_rank_sparse": 43,
+    "top1_agree": 0.0,
+    "kl": 1.7217072248458862
+   },
+   {
+    "task": "niah_single_2",
+    "gold_nll_dense": 21.110149383544922,
+    "gold_nll_sparse": 19.51141357421875,
+    "gold_rank_dense": 273,
+    "gold_rank_sparse": 68,
+    "top1_agree": 1.0,
+    "kl": 0.721023678779602
+   },
+   {
+    "task": "niah_single_2",
+    "gold_nll_dense": 19.383745193481445,
+    "gold_nll_sparse": 18.40228271484375,
+    "gold_rank_dense": 103,
+    "gold_rank_sparse": 29,
+    "top1_agree": 1.0,
+    "kl": 0.7932939529418945
+   },
+   {
+    "task": "niah_single_2",
+    "gold_nll_dense": 22.11898422241211,
+    "gold_nll_sparse": 29.104949951171875,
+    "gold_rank_dense": 655,
+    "gold_rank_sparse": 776,
+    "top1_agree": 1.0,
+    "kl": 0.5210384726524353
+   },
+   {
+    "task": "niah_single_2",
+    "gold_nll_dense": 22.950157165527344,
+    "gold_nll_sparse": 27.4255313873291,
+    "gold_rank_dense": 457,
+    "gold_rank_sparse": 158,
+    "top1_agree": 1.0,
+    "kl": 0.1813584417104721
+   },
+   {
+    "task": "niah_single_3",
+    "gold_nll_dense": 18.22869110107422,
+    "gold_nll_sparse": 24.131755828857422,
+    "gold_rank_dense": 43,
+    "gold_rank_sparse": 35,
+    "top1_agree": 1.0,
+    "kl": 0.1803380399942398
+   },
+   {
+    "task": "niah_single_3",
+    "gold_nll_dense": 17.23381805419922,
+    "gold_nll_sparse": 24.251583099365234,
+    "gold_rank_dense": 48,
+    "gold_rank_sparse": 38,
+    "top1_agree": 1.0,
+    "kl": 0.3414039611816406
+   },
+   {
+    "task": "niah_single_3",
+    "gold_nll_dense": 21.646366119384766,
+    "gold_nll_sparse": 25.889217376708984,
+    "gold_rank_dense": 67,
+    "gold_rank_sparse": 67,
+    "top1_agree": 1.0,
+    "kl": 0.010569961741566658
+   },
+   {
+    "task": "niah_single_3",
+    "gold_nll_dense": 18.037050247192383,
+    "gold_nll_sparse": 21.764270782470703,
+    "gold_rank_dense": 89,
+    "gold_rank_sparse": 42,
+    "top1_agree": 1.0,
+    "kl": 0.12378769367933273
+   },
+   {
+    "task": "niah_single_3",
+    "gold_nll_dense": 17.323116302490234,
+    "gold_nll_sparse": 23.503196716308594,
+    "gold_rank_dense": 57,
+    "gold_rank_sparse": 37,
+    "top1_agree": 1.0,
+    "kl": 0.7925623059272766
+   },
+   {
+    "task": "niah_single_3",
+    "gold_nll_dense": 18.393911361694336,
+    "gold_nll_sparse": 23.06209945678711,
+    "gold_rank_dense": 49,
+    "gold_rank_sparse": 33,
+    "top1_agree": 1.0,
+    "kl": 0.3364405632019043
+   },
+   {
+    "task": "niah_multiquery",
+    "gold_nll_dense": 12.057794570922852,
+    "gold_nll_sparse": 12.096941947937012,
+    "gold_rank_dense": 27,
+    "gold_rank_sparse": 49,
+    "top1_agree": 1.0,
+    "kl": 0.01541964616626501
+   },
+   {
+    "task": "niah_multiquery",
+    "gold_nll_dense": 14.678593635559082,
+    "gold_nll_sparse": 14.998995780944824,
+    "gold_rank_dense": 132,
+    "gold_rank_sparse": 185,
+    "top1_agree": 1.0,
+    "kl": 0.0051012830808758736
+   },
+   {
+    "task": "niah_multiquery",
+    "gold_nll_dense": 14.397001266479492,
+    "gold_nll_sparse": 15.070652961730957,
+    "gold_rank_dense": 150,
+    "gold_rank_sparse": 159,
+    "top1_agree": 0.0,
+    "kl": 0.018084513023495674
+   },
+   {
+    "task": "niah_multiquery",
+    "gold_nll_dense": 12.955021858215332,
+    "gold_nll_sparse": 12.530397415161133,
+    "gold_rank_dense": 89,
+    "gold_rank_sparse": 90,
+    "top1_agree": 0.0,
+    "kl": 0.05661354959011078
+   },
+   {
+    "task": "niah_multiquery",
+    "gold_nll_dense": 13.448956489562988,
+    "gold_nll_sparse": 13.742742538452148,
+    "gold_rank_dense": 105,
+    "gold_rank_sparse": 106,
+    "top1_agree": 1.0,
+    "kl": 0.01225805003196001
+   },
+   {
+    "task": "niah_multiquery",
+    "gold_nll_dense": 15.688502311706543,
+    "gold_nll_sparse": 14.03288745880127,
+    "gold_rank_dense": 346,
+    "gold_rank_sparse": 162,
+    "top1_agree": 1.0,
+    "kl": 0.027301257476210594
+   },
+   {
+    "task": "niah_multivalue",
+    "gold_nll_dense": 17.19038200378418,
+    "gold_nll_sparse": 18.25293731689453,
+    "gold_rank_dense": 666,
+    "gold_rank_sparse": 1418,
+    "top1_agree": 1.0,
+    "kl": 0.06718780100345612
+   },
+   {
+    "task": "niah_multivalue",
+    "gold_nll_dense": 16.31263542175293,
+    "gold_nll_sparse": 19.061424255371094,
+    "gold_rank_dense": 297,
+    "gold_rank_sparse": 907,
+    "top1_agree": 1.0,
+    "kl": 0.04375321418046951
+   },
+   {
+    "task": "niah_multivalue",
+    "gold_nll_dense": 17.120893478393555,
+    "gold_nll_sparse": 20.045150756835938,
+    "gold_rank_dense": 540,
+    "gold_rank_sparse": 1568,
+    "top1_agree": 1.0,
+    "kl": 0.06579902023077011
+   },
+   {
+    "task": "niah_multivalue",
+    "gold_nll_dense": 16.581130981445312,
+    "gold_nll_sparse": 19.875768661499023,
+    "gold_rank_dense": 765,
+    "gold_rank_sparse": 2119,
+    "top1_agree": 0.0,
+    "kl": 0.07840786129236221
+   },
+   {
+    "task": "niah_multivalue",
+    "gold_nll_dense": 16.5107364654541,
+    "gold_nll_sparse": 17.084665298461914,
+    "gold_rank_dense": 375,
+    "gold_rank_sparse": 723,
+    "top1_agree": 1.0,
+    "kl": 0.02420157752931118
+   },
+   {
+    "task": "niah_multivalue",
+    "gold_nll_dense": 16.6727237701416,
+    "gold_nll_sparse": 19.401077270507812,
+    "gold_rank_dense": 451,
+    "gold_rank_sparse": 1049,
+    "top1_agree": 0.0,
+    "kl": 0.21052344143390656
+   },
+   {
+    "task": "qa_1",
+    "gold_nll_dense": 9.335859298706055,
+    "gold_nll_sparse": 8.265256881713867,
+    "gold_rank_dense": 19,
+    "gold_rank_sparse": 14,
+    "top1_agree": 1.0,
+    "kl": 0.053831394761800766
+   },
+   {
+    "task": "qa_1",
+    "gold_nll_dense": 7.968874454498291,
+    "gold_nll_sparse": 9.52613639831543,
+    "gold_rank_dense": 28,
+    "gold_rank_sparse": 52,
+    "top1_agree": 0.0,
+    "kl": 0.7693583965301514
+   },
+   {
+    "task": "qa_1",
+    "gold_nll_dense": 12.931560516357422,
+    "gold_nll_sparse": 10.256049156188965,
+    "gold_rank_dense": 216,
+    "gold_rank_sparse": 142,
+    "top1_agree": 1.0,
+    "kl": 0.43867164850234985
+   },
+   {
+    "task": "qa_1",
+    "gold_nll_dense": 8.078621864318848,
+    "gold_nll_sparse": 9.139596939086914,
+    "gold_rank_dense": 28,
+    "gold_rank_sparse": 50,
+    "top1_agree": 1.0,
+    "kl": 0.041495539247989655
+   },
+   {
+    "task": "qa_1",
+    "gold_nll_dense": 10.272972106933594,
+    "gold_nll_sparse": 11.129115104675293,
+    "gold_rank_dense": 63,
+    "gold_rank_sparse": 96,
+    "top1_agree": 1.0,
+    "kl": 0.2416273057460785
+   },
+   {
+    "task": "qa_1",
+    "gold_nll_dense": 7.4152398109436035,
+    "gold_nll_sparse": 7.211555480957031,
+    "gold_rank_dense": 26,
+    "gold_rank_sparse": 25,
+    "top1_agree": 0.0,
+    "kl": 0.29341477155685425
+   }
+  ]
+ },
+ "_meta": {
+  "tasks": [
+   "vt",
+   "niah_single_1",
+   "niah_single_2",
+   "niah_single_3",
+   "niah_multiquery",
+   "niah_multivalue",
+   "qa_1"
+  ],
+  "topk": 2048,
+  "n_rows": 42
+ }
+}

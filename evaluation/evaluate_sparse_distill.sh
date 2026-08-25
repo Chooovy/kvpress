@@ -36,10 +36,13 @@ FRACTION="${FRACTION:-0.1}"
 SEED="${SEED:-42}"
 
 # The sweep is (length x topk), one CONFIGURATION per GPU -- not a split of one dataset and not a
-# bigger batch. evaluate_sparse.py has no sharding option, so running one identical configuration
-# on 8 GPUs would evaluate the same rows 8 times for 8 identical numbers. For RULER the data_dir IS
-# the context length, so LENGTHS sweeps that; DATA_DIR above is the fallback for datasets with no
-# length split (set LENGTHS="" to use it).
+# bigger batch. Running one identical configuration on 8 GPUs this way would evaluate the same rows
+# 8 times for 8 identical numbers. For RULER the data_dir IS the context length, so LENGTHS sweeps
+# that; DATA_DIR above is the fallback for datasets with no length split (set LENGTHS="" to use it).
+#
+# To split ONE configuration's rows across all GPUs instead -- the faster choice when the sweep has
+# fewer (length, topk) pairs than GPUs -- use evaluate_sparse_scalar_shard.sh, which drives
+# evaluate_sparse.py's --num_shards/--shard_index and scores the union once.
 #
 # Every (length, topk) pair is one job, and the pairs are packed onto the GPUs round-robin: with
 # more pairs than GPUs, a GPU runs its jobs sequentially rather than oversubscribing.

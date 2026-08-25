@@ -36,41 +36,12 @@ Two training objectives ship, and they are alternatives rather than stages of on
 
 Both expose a full-scope stage and a top-k-scope stage under the same ``stage`` names, so the
 two objectives can be compared at matched budget.
-
-A third, for the **query-independent** scorer only:
-
-* **Cross-replay** (:mod:`~kvpress.presses.gqa_indexer.cross_replay`) keeps the LM loss but
-  changes the query distribution it is taken over: the context is replayed against its own
-  first-pass KV, so every key is supervised by every replay query rather than only by its
-  successors. Design notes in ``cross_replay_e2e.md``.
 """
 
 from kvpress.presses.gqa_indexer.aggregate import (
     aggregate_chunk_scores,
     expand_chunk_indices,
     reduce_queries,
-)
-from kvpress.presses.gqa_indexer.autotune import (
-    Candidate,
-    Measurement,
-    Profile,
-    autotune,
-    autotune_cached,
-    batch_for_length,
-    candidate_grid,
-    default_token_budget,
-    is_resource_limit,
-    is_shared_memory_limit,
-    pick_best,
-    profile_key,
-)
-from kvpress.presses.gqa_indexer.cross_replay import (
-    CrossReplayTrainer,
-    ReadOnlyCache,
-    cross_replay_training_step,
-    gate_participation,
-    rectangle_mask,
-    shuffled_scores,
 )
 from kvpress.presses.gqa_indexer.data import (
     SUBSETS,
@@ -152,6 +123,11 @@ from kvpress.presses.gqa_indexer.scalar_indexer import (
     ScalarIndexer,
     ScalarIndexerConfig,
 )
+from kvpress.presses.gqa_indexer.prefix_indexer import (
+    PrefixIndexer,
+    PrefixIndexerConfig,
+    score_variance_profile,
+)
 from kvpress.presses.gqa_indexer.loss import (
     build_dense_indexer_target,
     build_sparse_indexer_target,
@@ -208,6 +184,12 @@ from kvpress.presses.gqa_indexer.train import (
     detect_scorer_from_keys,
     infer_scalar_mid_dim,
 )
+from kvpress.presses.gqa_indexer.qi_flex_attention import (
+    HAS_FLEX,
+    deadlines,
+    qi_block_mask,
+    qi_sparse_attention,
+)
 from kvpress.presses.gqa_indexer.triton_fused_loss import (
     HAS_TRITON,
     decompose_mask,
@@ -225,7 +207,6 @@ from kvpress.presses.gqa_indexer.triton_sparse_attention import (
 )
 
 __all__ = [
-    # Data loading
     "SUBSETS",
     "LengthSchedule",
     "LongminoConfig",
@@ -243,6 +224,9 @@ __all__ = [
     "IndexerNorm",
     "ScalarIndexer",
     "ScalarIndexerConfig",
+    "PrefixIndexer",
+    "PrefixIndexerConfig",
+    "score_variance_profile",
     "DEFAULT_POS_SLOPE",
     "GQAIndexerPress",
     "SparseAttentionContext",
@@ -279,18 +263,9 @@ __all__ = [
     "attention_scaling",
     "fused_indexer_training_step",
     "teacher_query_states",
-    # End-to-end (gated-attention) training
     "E2EIndexerTrainer",
     "e2e_indexer_training_step",
     "STAGES",
-    # Cross-replay training (query-independent scorer only)
-    "CrossReplayTrainer",
-    "cross_replay_training_step",
-    "ReadOnlyCache",
-    "rectangle_mask",
-    # The two diagnostics that distinguish a trained router from a trained-looking one.
-    "gate_participation",
-    "shuffled_scores",
     "SCOPES",
     "gated_attention",
     "gated_attention_full",
@@ -303,7 +278,6 @@ __all__ = [
     "pad_value_to_width",
     "triton_gated_attention",
     "gated_kernels_available",
-    # Gate pinning (what stops the gate flattening into a no-op)
     "PIN_MODES",
     "check_pin_mode",
     "gate_from_score",
@@ -319,7 +293,6 @@ __all__ = [
     "assert_lse_mask_compatible",
     "capture_teacher_lse",
     "normalize_captured_lse",
-    # Stage 2: sparse support selection + KL on the support
     "resolve_topk",
     "forced_support_positions",
     "excluded_key_mask",
@@ -334,7 +307,6 @@ __all__ = [
     "make_sparse_recompute_teacher",
     "fused_sparse_indexer_kl_rows",
     "fused_sparse_indexer_loss",
-    # Sparse attention at inference: per-query top-k, no eviction
     "check_sparse_shapes",
     "resolve_scaling",
     "slot_validity",
@@ -348,24 +320,14 @@ __all__ = [
     "seq_ids_from_cu_seqlens",
     "pack_varlen",
     "unpack_varlen",
-    # Triton kernels for stage 1
+    "HAS_FLEX",
+    "deadlines",
+    "qi_block_mask",
+    "qi_sparse_attention",
     "HAS_TRITON",
     "kernels_available",
     "triton_interpret_enabled",
     "decompose_mask",
     "triton_indexer_ce_rows",
     "triton_indexer_loss",
-    # Per-length batch/tile autotuning
-    "Candidate",
-    "Measurement",
-    "Profile",
-    "autotune",
-    "autotune_cached",
-    "batch_for_length",
-    "candidate_grid",
-    "default_token_budget",
-    "is_resource_limit",
-    "is_shared_memory_limit",
-    "pick_best",
-    "profile_key",
 ]

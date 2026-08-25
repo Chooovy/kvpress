@@ -19,6 +19,7 @@ from kvpress.presses.gqa_indexer.indexer import (
     build_indexer_mask,
     slice_rope_tables,
 )
+from kvpress.presses.gqa_indexer.prefix_indexer import PrefixIndexer, PrefixIndexerConfig
 from kvpress.presses.gqa_indexer.scalar_indexer import (
     DEFAULT_POS_SLOPE,
     ScalarIndexer,
@@ -27,6 +28,17 @@ from kvpress.presses.gqa_indexer.scalar_indexer import (
 from kvpress.presses.scorer_press import ScorerPress
 
 logger = logging.getLogger(__name__)
+
+#: ``scorer`` name -> module class. ``"prefix"`` must map to :class:`PrefixIndexer` before any
+#: ``isinstance`` reasoning is applied elsewhere: it *is* a :class:`ScalarIndexer`, so an
+#: ``isinstance`` dispatch would resolve the wrong way round. Nothing in this package does that
+#: today -- the scorers are consumed through the duck-typed protocol -- and this table exists so
+#: it stays that way.
+_SCORER_CLASSES = {
+    "pairwise": GQAIndexer,
+    "scalar": ScalarIndexer,
+    "prefix": PrefixIndexer,
+}
 
 
 def get_language_model(model: nn.Module) -> nn.Module:
@@ -86,14 +98,29 @@ class GQAIndexerPress(ScorerPress):
         every ``(query, key)`` pair -- query-aware, and ``O(t)`` per decode step.
         ``"scalar"`` is :class:`~.scalar_indexer.ScalarIndexer`, which scores each key once from
         its own hidden state -- ``O(1)`` per decode step and one score per token of cache
-        instead of ``head_dim``, at the cost of query-awareness. The two satisfy the same
-        protocol, so everything downstream (this press, the trainers, the gate) is unchanged.
+        instead of ``head_dim``, at the cost of query-awareness.
+        ``"prefix"`` is :class:`~.prefix_indexer.PrefixIndexer`, which scores each key once from
+        its whole *prefix* via the indexer's own causal attention. Still query-independent, so it
+        can evict, but its view of a key is the prefix rather than the single vector ``h_j``. It
+        is a strict superset of ``"scalar"`` -- with ``prefix_zero_init`` (the default) the score
+        starts bit-identical -- so the A/B against it is single-variable. Prefill-time only.
+        All three satisfy the same protocol, so everything downstream (this press, the trainers,
+        the gate) is unchanged.
     scalar_mid_dim : int
-        MLP width for ``scorer="scalar"``. ``0`` is SparseK's plain linear score; the arm's
-        capacity knob otherwise. See :class:`~.scalar_indexer.ScalarIndexerConfig`.
+        MLP width for ``scorer="scalar"`` and ``scorer="prefix"``. ``0`` is SparseK's plain linear
+        score; the arm's capacity knob otherwise. See
+        :class:`~.scalar_indexer.ScalarIndexerConfig`.
     scalar_pos_slope : float
-        Recency tilt for ``scorer="scalar"``. Keeps top-k irreversible, which is what makes
-        the dropped keys safe to free.
+        Recency tilt for ``scorer="scalar"`` and ``scorer="prefix"``. Keeps top-k irreversible,
+        which is what makes the dropped keys safe to free.
+    prefix_head_dim, prefix_value_dim : int
+        ``scorer="prefix"`` only: width of the prefix attention's ``q``/``k`` and of its ``v``
+        readout. ``prefix_value_dim`` is what a decode-time indexer cache would cost per token
+        per layer, alongside ``prefix_head_dim`` for the keys.
+    prefix_zero_init : bool
+        ``scorer="prefix"`` only: zero-initialize the prefix branch's output projection so
+        training starts exactly at the scalar arm. On by default, which is what makes "read the
+        prefix" the single variable in the comparison.
     scorer_attr : str
         Attribute name the indexer is registered under on each attention module.
     """
@@ -111,6 +138,11 @@ class GQAIndexerPress(ScorerPress):
     scorer: str = "pairwise"
     scalar_mid_dim: int = 256
     scalar_pos_slope: float = DEFAULT_POS_SLOPE
+
+    # scorer="prefix" only: the prefix-attention branch's geometry
+    prefix_head_dim: int = 128
+    prefix_value_dim: int = 128
+    prefix_zero_init: bool = True
 
     # Query-axis reduction
     query_reduce: str = "mean"
@@ -136,8 +168,10 @@ class GQAIndexerPress(ScorerPress):
             raise ValueError("n_sink and n_local must be non-negative")
         if self.chunk_size < 0:
             raise ValueError("chunk_size must be non-negative")
-        if self.scorer not in ("pairwise", "scalar"):
-            raise ValueError(f"scorer must be 'pairwise' or 'scalar', got {self.scorer!r}")
+        if self.scorer not in ("pairwise", "scalar", "prefix"):
+            raise ValueError(
+                f"scorer must be 'pairwise', 'scalar' or 'prefix', got {self.scorer!r}"
+            )
 
     # ------------------------------------------------------------------
     # Setup
@@ -155,24 +189,39 @@ class GQAIndexerPress(ScorerPress):
         # physically separate caches, so it is the granularity at which eviction can differ.
         n_heads = self.n_heads or text_config.num_key_value_heads
 
-        if self.scorer == "scalar":
-            # No head_dim and no rope_dim: the score is one number per (key, head), derived
-            # from that key alone, so there is nothing to rotate. head_dim/rope_dim overrides
-            # would silently do nothing, so reject them rather than accept and ignore.
+        if self.scorer in ("scalar", "prefix"):
+            # No head_dim and no rope_dim: the score is one number per (key, head), derived from
+            # that key (or its prefix) alone, so there is nothing to rotate. The prefix arm's own
+            # attention is deliberately NoPE -- h_j already carries the backbone's rotary signal
+            # and pos_slope carries recency -- and its q/k width is prefix_head_dim, not this
+            # head_dim. Overrides here would silently do nothing, so reject them.
             for name in ("head_dim", "rope_dim"):
                 if getattr(self, name) is not None:
-                    raise ValueError(
-                        f"{name} was set but scorer='scalar' has no q/k geometry to apply it "
-                        f"to; the scalar score has no per-head dimension and no rotary width. "
-                        f"Drop {name}, or use scorer='pairwise'."
+                    hint = (
+                        " Use prefix_head_dim for the prefix attention's q/k width."
+                        if name == "head_dim" and self.scorer == "prefix"
+                        else ""
                     )
-            return ScalarIndexerConfig(
+                    raise ValueError(
+                        f"{name} was set but scorer={self.scorer!r} has no q/k geometry to apply "
+                        f"it to; the score has no per-head dimension and no rotary width. "
+                        f"Drop {name}, or use scorer='pairwise'.{hint}"
+                    )
+            common = dict(
                 hidden_size=text_config.hidden_size,
                 n_heads=n_heads,
                 mid_dim=self.scalar_mid_dim,
                 pos_slope=self.scalar_pos_slope,
                 gate_scale=self.gate_scale,
             )
+            if self.scorer == "prefix":
+                return PrefixIndexerConfig(
+                    **common,
+                    head_dim=self.prefix_head_dim,
+                    value_dim=self.prefix_value_dim,
+                    zero_init_prefix=self.prefix_zero_init,
+                )
+            return ScalarIndexerConfig(**common)
 
         head_dim = self.head_dim or getattr(
             module, "head_dim", text_config.hidden_size // text_config.num_attention_heads
@@ -227,7 +276,7 @@ class GQAIndexerPress(ScorerPress):
                         "(which discards the existing weights)."
                     )
                 continue
-            cls = ScalarIndexer if self.scorer == "scalar" else GQAIndexer
+            cls = _SCORER_CLASSES[self.scorer]
             indexer = cls(indexer_config).to(device=model.device, dtype=model.dtype)
             attn.register_module(self.scorer_attr, indexer)
             created += 1

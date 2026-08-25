@@ -6,8 +6,6 @@
 #
 #   scripts/train_gqa_indexer.sh tokenize   # once: pre-tokenize to 64K (serves both stages)
 #   scripts/train_gqa_indexer.sh smoke      # 2 steps, verifies the whole path
-#   scripts/train_gqa_indexer.sh check      # can the teacher lse come from flash-attn?
-#   scripts/train_gqa_indexer.sh profile    # once per machine: measure batch/tile per length
 #   scripts/train_gqa_indexer.sh stage1     # dense, 8K -> 16K -> 32K curriculum
 #   scripts/train_gqa_indexer.sh stage2     # sparse @ 64K, from stage 1's checkpoint
 #
@@ -17,8 +15,7 @@
 # Runs on NGPU GPUs of one node via torchrun. Per-GPU batch size is 1, so the effective batch is
 # NGPU sequences. Batch 1 is always correct -- the loss is a plain row mean, so batch changes the
 # effective batch and the device occupancy, never the objective. It does leave the 8K stage using
-# a quarter of the memory 32K does, i.e. partly idle; AUTOTUNE=1 recovers that by sizing the
-# batch per length, at the cost of a profiling sweep up front.
+# a quarter of the memory 32K does, i.e. partly idle.
 #
 # LR is WSD throughout: warmup 10% to PEAK_LR, hold 60%, decay linearly to FINAL_LR on the
 # last step. The LR is NOT scaled by NGPU -- the gradient is averaged across ranks, not summed,
@@ -44,25 +41,13 @@ FINAL_LR="${FINAL_LR:-5e-6}"
 WARMUP_FRAC="${WARMUP_FRAC:-0.10}"
 STABLE_FRAC="${STABLE_FRAC:-0.60}"
 
-# Autotune batch size and tile shape per curriculum length. OFF by default: a full sweep is
-# ~180 real forward+backward steps, and at 32K that is most of an hour before the first
-# optimizer step -- too much to pay up front for a throughput gain that batch=1 does not need
-# in order to be correct.
-#
-# AUTOTUNE=1 turns it back on, and the result is cached per (GPU, model, stage, backend), so
-# the cost is paid once per machine rather than once per run. `$0 profile` does exactly that
-# without training, and bounds itself with AUTOTUNE_TIME_BUDGET.
-AUTOTUNE="${AUTOTUNE:-0}"
-TOKEN_BUDGET="${TOKEN_BUDGET:-0}"
-AUTOTUNE_TIME_BUDGET="${AUTOTUNE_TIME_BUDGET:-900}"
-
 # Reuse the logsumexp flash-attention already computed, instead of recomputing it with
 # teacher_lse_from_qk on every layer of every step (which runs on BOTH backends -- the Triton
 # kernel takes lse as an input, so it does not avoid the recompute).
 #
 # Default "never" until it has been exercised on real hardware: it changes what the teacher is
-# normalized against, so it is opt-in rather than silently on. `$0 check` reports whether this
-# box can use it; "auto" falls back per layer when the mask is not purely causal.
+# normalized against, so it is opt-in rather than silently on. "auto" falls back per layer when
+# the mask is not purely causal.
 CAPTURE_LSE="${CAPTURE_LSE:-never}"
 
 cd "$(dirname "$0")/.."
@@ -132,22 +117,20 @@ case "$MODE" in
     # not a regression -- loss(L) ~ log(L) + const, measured +0.7076/+0.7057/+0.6990 per
     # doubling. Nothing needs to react to it.
     #
-    # Batch size is a flat BATCH_SIZE (default 1) unless AUTOTUNE=1. Batch 1 at every length is
+    # Batch size is a flat BATCH_SIZE (default 1). Batch 1 at every length is
     # always correct -- the loss is a plain mean over rows, so batch only changes the effective
     # batch and the device occupancy, never the objective. What it costs is throughput at the
     # short end: 8K at batch 1 uses a quarter of the memory 32K does, so the card is partly
-    # idle there. AUTOTUNE=1 (or `$0 profile` once per machine) recovers that by holding
-    # batch x seq_len roughly constant, giving about 4 / 2 / 1 across 8K / 16K / 32K.
+    # idle there.
     #
-    # Leaving it off keeps tokens/step proportional to seq_len instead of constant. That is fine
+    # Tokens/step stay proportional to seq_len instead of constant. That is fine
     # for the single lr schedule -- the boundaries are still pure length changes, since batch is
     # not changing either -- it just means the short stages see fewer tokens per step, which is
     # also why they are cheap.
     #
     # Note --key-tile/--query-tile are NOT passed here. They do not reach the Triton kernels at
     # all (those take block_m/block_n, default 64), and backend=auto selects Triton for every
-    # mask stage 1 builds -- so the only thing they affected was teacher_lse_from_qk. The
-    # profiler sweeps both and records which backend actually ran.
+    # mask stage 1 builds -- so the only thing they affected was teacher_lse_from_qk.
     EXTRA=()
     if [[ -f "$TOKENIZED/index.json" ]]; then
       # No retokenization needed for the curriculum: every stage length is <= the stored
@@ -157,13 +140,6 @@ case "$MODE" in
     else
       EXTRA+=(--subsets 2e15 2e16 synth_cwe synth_rex)
       echo "no $TOKENIZED/index.json; tokenizing on the fly (run '$0 tokenize' to avoid this)"
-    fi
-    if [[ "$AUTOTUNE" != "0" ]]; then
-      # The cache is keyed on GPU, model geometry, stage and backend, so it is safe to share
-      # and safe to keep: a different machine misses rather than silently reusing.
-      EXTRA+=(--autotune --token-budget "$TOKEN_BUDGET"
-              --autotune-time-budget "$AUTOTUNE_TIME_BUDGET"
-              --autotune-cache "$OUT/autotune.json")
     fi
     exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer \
       --data-root "$DATA_ROOT" --model "$MODEL" "${EXTRA[@]}" \
@@ -176,32 +152,6 @@ case "$MODE" in
       --num-workers "${WORKERS:-2}" \
       --out "$OUT/stage1" --metrics-file "$OUT/stage1/metrics.jsonl" \
       --save-every "${SAVE_EVERY:-200}" --log-every "${LOG_EVERY:-10}"
-    ;;
-
-  check)
-    # Report whether the teacher logsumexp can come from flash-attention rather than being
-    # recomputed by teacher_lse_from_qk on every layer of every step. Exits non-zero when it
-    # cannot, so it can gate a launch.
-    exec python -m scripts.check_flash_lse --model "$MODEL" --dtype "${DTYPE:-bfloat16}"
-    ;;
-
-  profile)
-    # Measure batch/tile per curriculum length and write the cache, without training.
-    #
-    # Single-process on purpose: only rank 0 measures during training anyway (the ranks must
-    # agree on batch size, since a differing batch would desynchronize the gradient allreduce),
-    # so eight processes here would be eight times the work for one answer. --dry-run stops
-    # after 2 steps; the profiling itself happens before the loop, so the cache is complete.
-    exec python -m scripts.train_gqa_indexer \
-      --data-root "$DATA_ROOT" --model "$MODEL" \
-      --tokenized "$TOKENIZED" --subsets 2e16 2e17 \
-      --schedule "${SCHEDULE:-8192:1,16384:1,32768:1}" \
-      --stage dense \
-      --autotune --autotune-force --token-budget "$TOKEN_BUDGET" \
-      --autotune-time-budget "$AUTOTUNE_TIME_BUDGET" \
-      --autotune-cache "$OUT/autotune.json" \
-      --num-workers 0 --log-every 1 --save-every 0 \
-      --out "$OUT/profile" --dry-run
     ;;
 
   stage2)
@@ -234,7 +184,7 @@ case "$MODE" in
     ;;
 
   *)
-    echo "usage: $0 {tokenize|smoke|check|profile|stage1|stage2}" >&2
+    echo "usage: $0 {tokenize|smoke|stage1|stage2}" >&2
     exit 1
     ;;
 esac

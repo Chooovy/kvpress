@@ -1,8 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
-"""The GQA lightning indexer module."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,9 +5,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-# Sentinel for "this (query, key) pair is not allowed". Kept finite so a fully masked row
-# still produces finite logits; the loss helpers track validity with a boolean mask rather
-# than relying on -inf arithmetic.
+
 MASK_NEG = -1e4
 
 
@@ -294,6 +287,13 @@ class GQAIndexer(nn.Module):
             if config.gate_scale
             else None
         )
+
+    #: Whether the score depends on the query. False here: this scorer forms a genuine
+    #: ``(query, key)`` dot product, so a key's rank differs per query row. Callers that have a
+    #: cheaper path for query-independent scores (see
+    #: :class:`~.scalar_indexer.ScalarIndexer`) branch on this rather than on ``isinstance``, so a
+    #: third scorer only has to declare the property.
+    is_query_independent = False
 
     def project_q(self, hidden_states: torch.Tensor, cos=None, sin=None) -> torch.Tensor:
         """Project and rotate indexer queries -> (B, n_heads, Sq, D)."""

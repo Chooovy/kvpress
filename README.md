@@ -21,7 +21,7 @@ Score `q_i · k_j` per (query, key). Trained two ways:
 The point of the e2e arm is not that it beats distillation here — it does not — but that
 **training the router straight from the LM loss is viable at all**, without an auxiliary
 per-key target. That matters because a distillation label collapses the sum over queries before
-the set-level decision is visible (see `proxy_exp/HANDOFF.md` §1: the LM-loss gradient on a gate
+the set-level decision is visible (§1: the LM-loss gradient on a gate
 is `Σ_i A_ij ⟨∂L/∂o_i, v_j − o_i⟩`, which carries value geometry *and* is implicitly conditioned
 on what the other keys are doing). Retrieval SFT should close some of the remaining gap —
 **TODO, deliberately last**, since it is a data change and everything else should be settled first.
@@ -56,8 +56,6 @@ scalar uniquely buys, so it is a lower bound on the approach, not a verdict on i
 
 ### The current thesis: the bottleneck is the loss, not the architecture
 
-Proxy experiments on the real model (`proxy_exp/`, summarized in `HANDOFF.md`) point one way, and
-**the architecture is not it**:
 
 - **Function class is saturated.** A 4k-parameter linear score matches a 1M-parameter MLP on
   eviction damage (0.0360 vs 0.0356 — a gap ~0.04× the measurement noise floor). Bilinear
@@ -69,23 +67,15 @@ Proxy experiments on the real model (`proxy_exp/`, summarized in `HANDOFF.md`) p
 - Two attempts to feed the router extra history (a running state, a delta-rule reconstruction
   residual) both failed against their own shuffle controls.
 
-Hence **repeat / cross-replay loss** (design notes:
-`kvpress/presses/gqa_indexer/cross_replay_e2e.md`, motivation:
-`query_independent_indexer_cross_replay.md`): keep the
+Hence **repeat / cross-replay loss**: keep the
 LM loss, change the *query distribution it is taken over*. Replay the context against its own
 first-pass KV (`C' → KV(C)` but `C' ↛ KV(C')`), so supervision
 goes from a causal triangle to a full cross-context rectangle and every score is trained on the
 question "how valuable is this token to a shared cache serving many unknown queries?" Unlike
 Fast-KVzip this keeps the LM loss instead of regressing a per-key label. **This is the next thing
 to build.** Note that KVzip's own supervision is *block-diagonal*, not a rectangle — its
-`chunk_size` bounds the materialised scoring matrix, not the replay distance
-(`cross_replay_e2e.md` §7).
+`chunk_size` bounds the materialised scoring matrix, not the replay distance.
 
-> ⚠️ `proxy_exp/HANDOFF.md` is kept for its record of *which conclusions survived audit and which
-> instrument mistakes recurred*, not as a source of reusable numbers — adversarial audits (§10–§13)
-> found six bugs in those diagnostics, reversed one headline, and caught the proxy measuring
-> something the shipped module does not do (four times). Read §10–§13 before reusing any figure
-> from §8. The scripts themselves are gitignored.
 
 ### Caveats on the numbers above
 

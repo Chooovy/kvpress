@@ -24,7 +24,7 @@ set -euo pipefail
 DATASET="${DATASET:-ruler}"
 DATA_DIR="${DATA_DIR:-8192 16384}"
 MODEL="${MODEL:-/apdcephfs_gy8/share_303843174/guhao/models/Qwen3-8B}"
-CKPT="${CKPT:-/apdcephfs_gy8/share_303843174/guhao/models/Qwen-3-8B-gqa_indexer_scalar/stage1/final.pt}"
+CKPT="${CKPT:-/apdcephfs_gy8/share_303843174/guhao/models/Qwen-3-8B-gqa_indexer_cross_replay/stage1/final.pt}"
 OUTPUT_DIR="${OUTPUT_DIR:-./results_sparse_scalar}"
 
 FORCE_LOCAL="${FORCE_LOCAL:-64}"
@@ -46,10 +46,13 @@ FRACTION="${FRACTION:-0.1}"
 SEED="${SEED:-42}"
 
 # The sweep is (length x topk), one CONFIGURATION per GPU -- not a split of one dataset and not a
-# bigger batch. evaluate_sparse.py has no sharding option, so running one identical configuration
-# on 8 GPUs would evaluate the same rows 8 times for 8 identical numbers. For RULER the data_dir IS
-# the context length, so LENGTHS sweeps that; DATA_DIR above is the fallback for datasets with no
-# length split (set LENGTHS="" to use it).
+# bigger batch. Running one identical configuration on 8 GPUs this way would evaluate the same rows
+# 8 times for 8 identical numbers. For RULER the data_dir IS the context length, so LENGTHS sweeps
+# that; DATA_DIR above is the fallback for datasets with no length split (set LENGTHS="" to use it).
+#
+# To split ONE configuration's rows across all GPUs instead -- the faster choice when the sweep has
+# fewer (length, topk) pairs than GPUs -- use evaluate_sparse_scalar_shard.sh, this script's
+# data-parallel sibling. It scores the union once, so its numbers match this script's exactly.
 #
 # Every (length, topk) pair is one job, and the pairs are packed onto the GPUs round-robin: with
 # more pairs than GPUs, a GPU runs its jobs sequentially rather than oversubscribing.

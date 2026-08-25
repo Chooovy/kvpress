@@ -22,8 +22,6 @@
 #
 # Deliberately NOT matched, because they have no counterpart:
 #   - no --capture-lse / --backend / --key-tile for a teacher: there is no teacher.
-#   - no --autotune: it profiles the distillation loss kernels, whose memory profile is not this
-#     one's. Batch stays 1, which is always correct (the loss is a plain mean over tokens).
 #
 # Attention runs on the fused kernel in kvpress/presses/gqa_indexer/triton_gated_attention.py, which
 # computes the gate inside the tile loop. SDPA cannot host this operation in O(L) memory -- the
@@ -174,8 +172,7 @@ case "$MODE" in
     # the curve at each boundary. An LM loss has no such term, so any jump here is real.
     #
     # Batch stays 1 at every length. Always correct (the loss is a mean over tokens), and it
-    # leaves the 8K stage partly idle -- accepted here rather than autotuned, because the
-    # autotuner profiles the distillation kernels, not these.
+    # leaves the 8K stage partly idle.
     exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer_e2e \
       --data-root "$DATA_ROOT" --model "$MODEL" $(data_args) \
       --schedule "${SCHEDULE:-8192:300,16384:300,32768:900}" \

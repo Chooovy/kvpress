@@ -44,8 +44,6 @@ What differs from distillation, and why
   ``logsumexp``.
 * **``use_cache=False``.** Distillation reads the teacher's keys out of the KV cache; here
   nothing does, so building one only costs memory.
-* **Autotune is not wired.** It profiles the *distillation* loss kernels, and their memory
-  profile is not this one's. ``--batch-size`` is explicit instead.
 * **The reported loss is comparable across lengths.** Distillation's loss grows like
   ``log(L)`` because the softmax it normalizes over gets wider, which puts a ``log 2`` step in
   the curve at every curriculum boundary. An LM loss has no such term, so the raw number is
@@ -130,8 +128,18 @@ def save(
             # names differ, so load_indexer_state_dict (strict=False) would drop everything and
             # silently start from init.
             "scorer": args.scorer,
-            "scalar_mid_dim": args.scalar_mid_dim if args.scorer == "scalar" else None,
-            "scalar_pos_slope": args.scalar_pos_slope if args.scorer == "scalar" else None,
+            "scalar_mid_dim": args.scalar_mid_dim if args.scorer in ("scalar", "prefix") else None,
+            "scalar_pos_slope": (
+                args.scalar_pos_slope if args.scorer in ("scalar", "prefix") else None
+            ),
+            # The prefix branch's geometry. Recorded for the same reason as `scorer`: head_dim and
+            # value_dim ARE parameter shapes, so a mismatch would fail to load loudly -- but
+            # prefix_zero_init is not, and a run resumed with the flag flipped would train a
+            # different experiment (one that no longer nests inside the scalar arm) while every
+            # tensor still loaded cleanly.
+            "prefix_head_dim": args.prefix_head_dim if args.scorer == "prefix" else None,
+            "prefix_value_dim": args.prefix_value_dim if args.scorer == "prefix" else None,
+            "prefix_zero_init": args.prefix_zero_init if args.scorer == "prefix" else None,
             "stage": args.stage,
             "pin_mode": args.pin_mode,
             "n_sink": args.n_sink,
@@ -338,22 +346,28 @@ def main() -> int:
     model_group.add_argument("--n-heads", type=int, default=None)
     model_group.add_argument(
         "--scorer",
-        choices=("pairwise", "scalar"),
+        choices=("pairwise", "scalar", "prefix"),
         default="pairwise",
         help="which router to train. 'pairwise' scores every (query, key) pair -- query-aware, "
         "and O(t) per decode step, which at 128K makes the router 32x the cost of the sparse "
         "attention it feeds. 'scalar' scores each key once from its own hidden state: O(1) per "
         "decode step and one score per token of cache instead of head_dim, at the cost of "
         "query-awareness (a needle matters only to the query that asks for it, so a frozen "
-        "per-key score must keep it always or lose it). The two share this script, the loss, "
-        "the schedule and the checkpoint format, which is what makes them comparable; "
-        "--head-dim and --rope-dim do not apply to 'scalar' and are rejected with it.",
+        "per-key score must keep it always or lose it). 'prefix' scores each key once from its "
+        "whole *prefix*, through the indexer's own causal attention -- still query-independent, "
+        "so still able to evict, but its view of a key is the prefix rather than the single "
+        "vector h_j. It is a strict superset of 'scalar': with --prefix-zero-init (the default) "
+        "the score starts bit-identical, so a prefix-vs-scalar A/B has exactly one variable. "
+        "All three share this script, the loss, the schedule and the checkpoint format, which is "
+        "what makes them comparable; --head-dim and --rope-dim apply only to 'pairwise' and are "
+        "rejected with the other two.",
     )
     model_group.add_argument(
         "--scalar-mid-dim",
         type=int,
         default=256,
-        help="MLP width for --scorer scalar; 0 is SparseK's plain linear score. This is the arm's "
+        help="MLP width for --scorer scalar and --scorer prefix; 0 is SparseK's plain linear "
+        "score. This is the arm's "
         "capacity knob, not just a parameter-matching one: in the probe study a nonlinear readout "
         "of the hidden state beat a linear one by +0.12 held-out Spearman on total attention mass, "
         "larger than anything a recurrent state added. At 256 the router is ~1.06M params/layer "
@@ -364,11 +378,42 @@ def main() -> int:
         "--scalar-pos-slope",
         type=float,
         default=DEFAULT_POS_SLOPE,
-        help="recency tilt (t * eps) for --scorer scalar. Keeps top-k irreversible, which is what "
+        help="recency tilt (t * eps) for --scorer scalar and --scorer prefix. Keeps top-k "
+        "irreversible, which is what "
         "makes a dropped key safe to free: verified 0 re-entries over 1500 steps with an absolute "
         "tilt against 27 when normalised by sequence length. Also carries the recency duty so the "
         "learned part is not pushed to predict ever-larger values (SparseK Sec. 3.2). 0 ablates it.",
     )
+    model_group.add_argument(
+        "--prefix-head-dim",
+        type=int,
+        default=128,
+        help="--scorer prefix only: q/k width of the indexer's own prefix attention, which also "
+        "sets its 1/sqrt(d) softmax scale. Distinct from --head-dim, which is the pairwise "
+        "router's geometry and is rejected with this scorer.",
+    )
+    model_group.add_argument(
+        "--prefix-value-dim",
+        type=int,
+        default=128,
+        help="--scorer prefix only: width of the prefix attention's v, i.e. of the readout that "
+        "feeds the score. This is what a decode-time indexer cache would cost per token per layer "
+        "(alongside --prefix-head-dim for the keys), against n_heads scalars for --scorer scalar. "
+        "Training and prefill-time eviction do not pay it -- the readout is consumed immediately.",
+    )
+    model_group.add_argument(
+        "--no-prefix-zero-init",
+        dest="prefix_zero_init",
+        action="store_false",
+        help="--scorer prefix only: do NOT zero-initialize the prefix branch's output projection. "
+        "By default it is zeroed, so training starts bit-identical to --scorer scalar and 'reads "
+        "the prefix' is the single variable in the comparison. The zero is an escapable saddle, "
+        "not a dead start: w_a receives gradient at step one (dL/dW_a = dL/dz (x) norm(a), and "
+        "norm(a) is not zero) even though the branch's own projections do not, so they are live "
+        "from step two. Pass this to start the branch at random init instead, which is a different "
+        "experiment -- the arm no longer nests inside the scalar one.",
+    )
+    model_group.set_defaults(prefix_zero_init=True)
     model_group.add_argument(
         "--press-n-sink", type=int, default=4,
         help="keys the press protects from eviction. Also the default for --n-sink, so the keys "
@@ -668,9 +713,13 @@ def main() -> int:
         "n_sink": args.press_n_sink,
         "scorer": args.scorer,
     }
-    if args.scorer == "scalar":
+    if args.scorer in ("scalar", "prefix"):
         press_kwargs["scalar_mid_dim"] = args.scalar_mid_dim
         press_kwargs["scalar_pos_slope"] = args.scalar_pos_slope
+    if args.scorer == "prefix":
+        press_kwargs["prefix_head_dim"] = args.prefix_head_dim
+        press_kwargs["prefix_value_dim"] = args.prefix_value_dim
+        press_kwargs["prefix_zero_init"] = args.prefix_zero_init
     for name in ("rope_dim", "head_dim", "n_heads"):
         value = getattr(args, name)
         if value is not None:

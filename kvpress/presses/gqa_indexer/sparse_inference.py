@@ -14,16 +14,17 @@ path, :class:`~kvpress.presses.gqa_indexer.e2e_trainer.E2EIndexerTrainer`).
 Mechanism
 ---------
 The wiring mirrors ``E2EIndexerTrainer.hooks()`` exactly: a forward pre-hook on every attention
-module stashes the ``hidden_states`` the indexer projects from (the attention *interface* only sees
-q/k/v), and a temporary entry in ``ALL_ATTENTION_FUNCTIONS`` that ``config._attn_implementation``
-is pointed at replaces the attention itself. Both are removed on exit.
+module stashes the ``hidden_states`` used by hidden-state scorers, while the attention interface
+provides the actual projected values used by value scorers. A temporary entry in
+``ALL_ATTENTION_FUNCTIONS`` that ``config._attn_implementation`` is pointed at replaces the
+attention itself. Both are removed on exit.
 
 The one thing training does not need and this does: an **indexer key-cache**. During training a
-forward sees the whole sequence at once, so ``project_k`` produces every key. At inference the
-attention interface only gets the *new* tokens' ``hidden_states`` each step, so we accumulate the
-per-layer post-RoPE indexer keys ourselves -- initialize on prefill, append on each decode step --
-and assert the cache length stays in lockstep with the model's own ``key.shape[2]``. The cache is
-tiny (MQA: one ``head_dim`` per token per layer) and lives only for the duration of the ``with``
+forward sees the whole sequence at once, so ``project_k`` produces every key. At inference each
+step contributes only the *new* hidden states or projected values, so we accumulate the per-layer
+indexer keys ourselves -- initialize on prefill, append on each decode step -- and assert the cache
+length stays in lockstep with the model's own ``key.shape[2]``. The cache is tiny (one projected
+key, or one score per KV head, per token and layer) and lives only for the duration of the ``with``
 block, so a fresh context per generation gives a fresh cache.
 
 Batch-1 assumption
@@ -139,7 +140,7 @@ class SparseAttentionContext:
         # Per-layer state, all keyed by layer_idx and reset on entry.
         self._hidden_states: dict[int, torch.Tensor] = {}
         self._kwargs: dict[int, dict] = {}
-        self._k_idx: dict[int, torch.Tensor] = {}  # the indexer key-cache, (B, Sk, D) post-RoPE
+        self._k_idx: dict[int, torch.Tensor] = {}  # the indexer key-cache, (B, Sk, Di)
 
         self._handles: list = []
         self._configs: list = []
@@ -183,14 +184,24 @@ class SparseAttentionContext:
 
         indexer = self.press.get_indexer(module)
         cos, sin = self.press.get_rope_tables(indexer, kwargs)
-        # Same q/k the training path builds (E2EIndexerTrainer.indexer_qk), so selection at
-        # inference matches selection at train time.
+        # Same inputs the training path uses: hidden-state scorers ignore value_states, while DMA
+        # consumes the actual post-projection values for only this step's new tokens.
         q_idx = indexer.project_q(hidden_states, cos, sin)  # (B, h, Sq, D)
-        k_idx_new = indexer.project_k(hidden_states, cos, sin)  # (B, Sq, D), post-RoPE
-
-        # Indexer key-cache: initialize on prefill, append on each decode step. Post-RoPE keys are
-        # appended in position order, so the cache mirrors the model's own KV cache.
         previous = self._k_idx.get(layer_idx)
+        previous_len = 0 if previous is None else previous.shape[1]
+        value_states_new = value[:, :, previous_len:, :]
+        if value_states_new.shape[2] != hidden_states.shape[1]:
+            raise RuntimeError(
+                f"layer {layer_idx}: expected {hidden_states.shape[1]} newly appended values but "
+                f"found {value_states_new.shape[2]}. SparseAttentionContext requires an "
+                "append-only KV cache."
+            )
+        k_idx_new = indexer.project_k(
+            hidden_states, cos, sin, value_states=value_states_new
+        )  # (B, Sq, Di)
+
+        # Indexer key-cache: initialize on prefill, append on each decode step. Entries stay in
+        # position order, so the cache mirrors the model's own KV cache.
         k_idx = k_idx_new if previous is None else torch.cat([previous, k_idx_new], dim=1)
         self._k_idx[layer_idx] = k_idx
 

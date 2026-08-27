@@ -85,6 +85,35 @@ def test_decode_keeps_indexer_cache_in_lockstep():
 
 
 @torch.no_grad()
+def test_dma_prefill_and_decode_use_value_states():
+    """DMA scores newly projected values across context, question prefill, and decode."""
+    model = _tiny_model()
+    press = GQAIndexerPress(compression_ratio=0.0, scorer="dma")
+    press.post_init_from_model(model)
+    ids = torch.randint(0, model.config.vocab_size, (1, 20))
+
+    with SparseAttentionContext(
+        model, press, topk=8, force_sink=2, force_local=2, query_independent=False
+    ) as sparse:
+        out = model(input_ids=ids, use_cache=True)
+        cache = out.past_key_values
+        assert all(k_idx.shape == (1, 20, 2) for k_idx in sparse._k_idx.values())
+
+        question_ids = torch.randint(0, model.config.vocab_size, (1, 3))
+        out = model(input_ids=question_ids, past_key_values=cache, use_cache=True)
+        assert all(k_idx.shape == (1, 23, 2) for k_idx in sparse._k_idx.values())
+
+        next_id = out.logits[:, -1:].argmax(-1)
+        for _ in range(2):
+            out = model(input_ids=next_id, past_key_values=cache, use_cache=True)
+            next_id = out.logits[:, -1:].argmax(-1)
+        assert all(k_idx.shape == (1, 25, 2) for k_idx in sparse._k_idx.values())
+
+    assert cache.get_seq_length() == 25
+    assert torch.isfinite(out.logits).all()
+
+
+@torch.no_grad()
 def test_small_topk_runs_and_differs_from_dense():
     """A genuinely sparse budget produces finite output that differs from full attention."""
     model = _tiny_model()
@@ -157,4 +186,3 @@ def test_precision_is_validated():
     press = _press(model)
     with pytest.raises(ValueError, match="precision must be"):
         SparseAttentionContext(model, press, topk=8, precision="fp32")
-

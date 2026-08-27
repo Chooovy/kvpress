@@ -146,8 +146,8 @@ class SparseEvaluationConfig:
         assert self.precision in ("ieee", "tf32"), (
             f"precision must be 'ieee' or 'tf32', got {self.precision!r}"
         )
-        assert self.scorer in (None, "pairwise", "scalar"), (
-            f"scorer must be None, 'pairwise' or 'scalar', got {self.scorer!r}"
+        assert self.scorer in (None, "pairwise", "scalar", "dma"), (
+            f"scorer must be None, 'pairwise', 'scalar' or 'dma', got {self.scorer!r}"
         )
         assert self.force_sink + self.force_local <= self.topk, (
             f"force_sink + force_local = {self.force_sink + self.force_local} exceeds topk="
@@ -351,7 +351,7 @@ class SparseEvaluationRunner:
         try:
             scorer = cfg.scorer or detect_scorer(indexer_sd, ckpt_config)
         except ValueError as exc:
-            raise SystemExit(f"{exc} Use --scorer pairwise or --scorer scalar.") from exc
+            raise SystemExit(f"{exc} Use --scorer pairwise, --scorer scalar or --scorer dma.") from exc
 
         scorer_kwargs: dict = {}
         if scorer == "scalar":

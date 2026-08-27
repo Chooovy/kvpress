@@ -1,16 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from benchmarks.aime25.calculate_metrics import calculate_metrics as aime25_scorer
-from benchmarks.infinite_bench.calculate_metrics import calculate_metrics as infinite_bench_scorer
-from benchmarks.longbench.calculate_metrics import calculate_metrics as longbench_scorer
-from benchmarks.longbench.calculate_metrics import calculate_metrics_e as longbench_scorer_e
-from benchmarks.longbenchv2.calculate_metrics import calculate_metrics as longbenchv2_scorer
-from benchmarks.loogle.calculate_metrics import calculate_metrics as loogle_scorer
-from benchmarks.math500.calculate_metrics import calculate_metrics as math500_scorer
-from benchmarks.needle_in_haystack.calculate_metrics import calculate_metrics as needle_in_haystack_scorer
-from benchmarks.ruler.calculate_metrics import calculate_metrics as ruler_scorer
-from benchmarks.zero_scrolls.calculate_metrics import calculate_metrics as zero_scrolls_scorer
+from importlib import import_module
 
 from kvpress import (
     AdaKVPress,
@@ -46,6 +37,16 @@ from kvpress import (
     TOVAPress,
 )
 
+
+def _lazy_scorer(module: str, function: str = "calculate_metrics"):
+    """Load a benchmark's optional metric dependencies only when it is scored."""
+
+    def score(*args, **kwargs):
+        return getattr(import_module(module), function)(*args, **kwargs)
+
+    return score
+
+
 # These dictionaries define the available datasets, scorers, and KVPress methods for evaluation.
 DATASET_REGISTRY = {
     "loogle": "simonjegou/loogle",
@@ -62,16 +63,16 @@ DATASET_REGISTRY = {
 }
 
 SCORER_REGISTRY = {
-    "loogle": loogle_scorer,
-    "ruler": ruler_scorer,
-    "zero_scrolls": zero_scrolls_scorer,
-    "infinitebench": infinite_bench_scorer,
-    "longbench": longbench_scorer,
-    "longbench-e": longbench_scorer_e,
-    "longbench-v2": longbenchv2_scorer,
-    "needle_in_haystack": needle_in_haystack_scorer,
-    "aime25": aime25_scorer,
-    "math500": math500_scorer,
+    "loogle": _lazy_scorer("benchmarks.loogle.calculate_metrics"),
+    "ruler": _lazy_scorer("benchmarks.ruler.calculate_metrics"),
+    "zero_scrolls": _lazy_scorer("benchmarks.zero_scrolls.calculate_metrics"),
+    "infinitebench": _lazy_scorer("benchmarks.infinite_bench.calculate_metrics"),
+    "longbench": _lazy_scorer("benchmarks.longbench.calculate_metrics"),
+    "longbench-e": _lazy_scorer("benchmarks.longbench.calculate_metrics", "calculate_metrics_e"),
+    "longbench-v2": _lazy_scorer("benchmarks.longbenchv2.calculate_metrics"),
+    "needle_in_haystack": _lazy_scorer("benchmarks.needle_in_haystack.calculate_metrics"),
+    "aime25": _lazy_scorer("benchmarks.aime25.calculate_metrics"),
+    "math500": _lazy_scorer("benchmarks.math500.calculate_metrics"),
 }
 
 

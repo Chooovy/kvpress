@@ -209,11 +209,93 @@ def test_key_offset_is_rejected():
     ``hidden_states`` is a suffix, so every key's prefix attention would silently see only part
     of the prefix -- and the score would then depend on how the prefill was chunked, which is
     exactly the class of silent framing bug this package has been bitten by before.
+
+    Only without the cache: ``enable_cache`` keeps the earlier prefix, which is what makes an
+    offset meaningful. See :func:`test_cached_decode_matches_a_full_rescore`.
     """
     p = _prefix()
     h = torch.randn(1, 8, 64, dtype=torch.float64)
     with pytest.raises(ValueError, match="key_offset=0"):
         p.score_keys(h, key_offset=4)
+
+
+@pytest.mark.parametrize("mid_dim", [32, 0])
+def test_cached_decode_matches_a_full_rescore(mid_dim):
+    """Token-by-token scoring under the cache equals scoring the whole sequence at once.
+
+    This is the property the cache exists for: the readout is a function of the key's whole
+    prefix, so an incremental step is only correct if it attends against every earlier key. An
+    exact match rather than a tolerance is the right assertion -- it is the same softmax over the
+    same keys, so any drift would mean the cache lost or reordered one.
+    """
+    p = _prefix(mid_dim=mid_dim)
+    with torch.no_grad():
+        p.w_a.weight.normal_(0, 0.5)
+    h = torch.randn(1, 20, 64, dtype=torch.float64)
+
+    with torch.no_grad():
+        full = p.score_keys(h)
+        p.enable_cache()
+        parts = [p.score_keys(h[:, :12])]
+        for t in range(12, 20):
+            parts.append(p.score_keys(h[:, t : t + 1], key_offset=t))
+        p.disable_cache()
+
+    assert torch.equal(full, torch.cat(parts, dim=-1))
+
+
+def test_cached_chunked_prefill_matches_a_full_rescore():
+    """Ragged multi-token chunks agree with one shot, so chunk boundaries carry no signal."""
+    p = _prefix()
+    with torch.no_grad():
+        p.w_a.weight.normal_(0, 0.5)
+    h = torch.randn(1, 24, 64, dtype=torch.float64)
+
+    with torch.no_grad():
+        full = p.score_keys(h)
+        p.enable_cache()
+        parts = [
+            p.score_keys(h[:, lo:hi], key_offset=lo)
+            for lo, hi in ((0, 7), (7, 13), (13, 14), (14, 24))
+        ]
+        p.disable_cache()
+
+    assert torch.equal(full, torch.cat(parts, dim=-1))
+
+
+def test_cache_rejects_an_offset_that_does_not_match_its_length():
+    """A mismatched offset means cache and sequence diverged, which cannot be scored correctly.
+
+    Trusting it would score the new keys against the wrong prefix *and* tilt them at the wrong
+    positions -- both invisible in the output.
+    """
+    p = _prefix()
+    h = torch.randn(1, 10, 64, dtype=torch.float64)
+    p.enable_cache()
+    p.score_keys(h[:, :5])
+    with pytest.raises(ValueError, match="prefix cache holds 5 keys"):
+        p.score_keys(h[:, 5:6], key_offset=9)
+
+
+def test_cache_rejects_padding():
+    """Padding and the cache are incompatible: a padded key would persist in every later step."""
+    p = _prefix()
+    h = torch.randn(1, 4, 64, dtype=torch.float64)
+    p.enable_cache()
+    with pytest.raises(ValueError, match="does not support a padding mask"):
+        p.score_keys(h, mask=torch.tensor([[True, True, False, False]]))
+
+
+def test_disable_cache_frees_the_state_and_restores_the_offset_guard():
+    p = _prefix()
+    h = torch.randn(1, 6, 64, dtype=torch.float64)
+    p.enable_cache()
+    p.score_keys(h)
+    assert p.cached_length == 6
+    p.disable_cache()
+    assert p.cached_length == 0
+    with pytest.raises(ValueError, match="key_offset=0"):
+        p.score_keys(h[:, :1], key_offset=6)
 
 
 def test_rope_is_rejected_and_rope_dim_is_zero():

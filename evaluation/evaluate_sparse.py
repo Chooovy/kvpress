@@ -60,7 +60,7 @@ from kvpress import (  # noqa: E402
     SparseAttentionContext,
     load_indexer_state_dict,
 )
-from kvpress.presses.gqa_indexer.train import detect_scorer, infer_scalar_mid_dim  # noqa: E402
+from kvpress.presses.gqa_indexer.train import press_kwargs_from_checkpoint  # noqa: E402
 from kvpress.pipeline import KVPressTextGenerationPipeline  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -349,33 +349,34 @@ class SparseEvaluationRunner:
         ckpt_config = ckpt.get("config") or {}
         has_gate = any(str(k).endswith("gate_scale") for k in indexer_sd)
         try:
-            scorer = cfg.scorer or detect_scorer(indexer_sd, ckpt_config)
+            scorer, scorer_kwargs = press_kwargs_from_checkpoint(
+                indexer_sd, ckpt_config, scorer=cfg.scorer
+            )
         except ValueError as exc:
-            raise SystemExit(f"{exc} Use --scorer pairwise, --scorer scalar or --scorer dma.") from exc
+            raise SystemExit(
+                f"{exc} Use --scorer pairwise, --scorer scalar, --scorer prefix or --scorer dma."
+            ) from exc
 
-        scorer_kwargs: dict = {}
-        if scorer == "scalar":
-            # mid_dim is recoverable from w_in's shape, but pos_slope is NOT a parameter -- it is
-            # added to the score at :meth:`ScalarIndexer.score_keys` and never stored. So a wrong
-            # value here mis-scores silently, with every weight loading cleanly. Prefer the
-            # checkpoint's record, and say so when falling back to the default.
-            scorer_kwargs["scalar_mid_dim"] = infer_scalar_mid_dim(indexer_sd, ckpt_config)
+        if scorer in ("scalar", "prefix"):
+            # pos_slope is NOT a parameter -- it is added inside score_keys and never stored -- so
+            # a wrong value mis-scores silently with every weight loading cleanly. The CLI wins
+            # over the checkpoint's record; if neither has it, say so rather than quietly taking
+            # the module default.
             if cfg.scalar_pos_slope is not None:
                 scorer_kwargs["scalar_pos_slope"] = cfg.scalar_pos_slope
-            elif "scalar_pos_slope" in ckpt_config:
-                scorer_kwargs["scalar_pos_slope"] = float(ckpt_config["scalar_pos_slope"])
-            else:
+            elif "scalar_pos_slope" not in scorer_kwargs:
                 logger.warning(
-                    "checkpoint records no scalar_pos_slope; using the ScalarIndexer default. "
-                    "pos_slope is not a parameter, so a mismatch against training cannot be "
-                    "detected by weight loading -- pass --scalar_pos_slope if training set it."
+                    "checkpoint records no scalar_pos_slope; using the module default. pos_slope "
+                    "is not a parameter, so a mismatch against training cannot be detected by "
+                    "weight loading -- pass --scalar_pos_slope if training set it."
                 )
-            # The scalar score has no per-head q/k geometry, and the press rejects these rather
-            # than accepting and ignoring them.
+            # Neither scorer has per-head q/k geometry, and the press rejects these rather than
+            # accepting and ignoring them. (The prefix arm's own attention is sized by
+            # prefix_head_dim, read from the weights above, not by --head_dim.)
             if cfg.head_dim is not None or cfg.rope_dim is not None:
                 raise SystemExit(
-                    "--head_dim/--rope_dim do not apply to a scalar indexer (it has no q/k pair "
-                    "to shape or rotate). Drop them."
+                    f"--head_dim/--rope_dim do not apply to a {scorer} indexer (its score has no "
+                    "per-head q/k pair to shape or rotate). Drop them."
                 )
         else:
             scorer_kwargs["head_dim"] = cfg.head_dim

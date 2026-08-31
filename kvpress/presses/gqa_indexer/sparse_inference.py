@@ -260,10 +260,18 @@ class SparseAttentionContext:
     # ------------------------------------------------------------------
     # Context management (mirrors E2EIndexerTrainer.hooks)
     # ------------------------------------------------------------------
+    def _set_prefix_cache(self, enabled: bool) -> None:
+        for layer in get_language_model(self.model).layers:
+            indexer = self.press.get_indexer(layer.self_attn)
+            setter = getattr(indexer, "enable_cache" if enabled else "disable_cache", None)
+            if setter is not None:
+                setter()
+
     def reset(self) -> None:
         self._hidden_states.clear()
         self._kwargs.clear()
         self._k_idx.clear()
+        self._set_prefix_cache(True)
 
     def __enter__(self) -> "SparseAttentionContext":
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -341,4 +349,7 @@ class SparseAttentionContext:
             else:
                 global_mapping.pop(IMPL_NAME, None)
             self._registry_restore = None
-        self.reset()
+        self._hidden_states.clear()
+        self._kwargs.clear()
+        self._k_idx.clear()
+        self._set_prefix_cache(False)

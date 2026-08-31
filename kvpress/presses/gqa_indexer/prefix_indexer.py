@@ -89,11 +89,13 @@ Measure it before training rather than after: :func:`score_variance_profile` rep
 
 Scope
 -----
-Training and **prefill-time** scoring. Decode-time scoring would need the indexer's own ``K``/``V``
-cached across steps -- ``O(L)`` state and ``O(t)`` per step, the cost
-:mod:`~.scalar_indexer` exists to avoid -- and is deliberately not wired up here;
-:meth:`PrefixIndexer.score_keys` raises on a non-zero ``key_offset`` rather than silently
-scoring a suffix against its own truncated prefix.
+Training and **prefill-time** scoring by default. Decode-time scoring is opt-in through
+:meth:`PrefixIndexer.enable_cache`, which keeps the indexer's own ``K``/``V`` across calls --
+``O(L)`` state and ``O(t)`` per step, the cost :mod:`~.scalar_indexer` exists to avoid, so it is
+paid only when asked for. :class:`~.sparse_inference.SparseAttentionContext` enables it for the
+duration of the context, which is what lets an eval generate. Without it
+:meth:`PrefixIndexer.score_keys` raises on a non-zero ``key_offset`` rather than silently scoring
+a suffix against its own truncated prefix.
 """
 
 from __future__ import annotations
@@ -193,6 +195,9 @@ class PrefixIndexer(ScalarIndexer):
         self.head_dim = config.head_dim
         self.value_dim = config.value_dim
 
+        self._cache_enabled = False
+        self._cache_k: torch.Tensor | None = None
+        self._cache_v: torch.Tensor | None = None
 
         self.w_pq = nn.Linear(config.hidden_size, config.head_dim, bias=False)
         self.w_pk = nn.Linear(config.hidden_size, config.head_dim, bias=False)
@@ -210,6 +215,30 @@ class PrefixIndexer(ScalarIndexer):
         self.w_a = nn.Linear(config.value_dim, readout_width, bias=False)
         if config.zero_init_prefix:
             nn.init.zeros_(self.w_a.weight)
+
+    def enable_cache(self) -> None:
+        """
+        Start caching the prefix attention's ``K``/``V`` so decode can score incrementally.
+
+        Without this a decode step cannot be scored at all: the readout reads key ``j``'s whole
+        prefix, and :meth:`score_keys` rejects a non-zero ``key_offset`` rather than silently
+        scoring a suffix against a truncated one. With it, prefill fills the cache and each step
+        appends its own ``k``/``v`` and attends against everything before it, so ``s_j`` is what a
+        full-prefix rescore would give -- at ``O(t)`` per step and ``head_dim + value_dim`` of
+        state per token per layer, instead of re-running the whole prefix.
+        """
+        self._cache_enabled = True
+        self._cache_k = None
+        self._cache_v = None
+
+    def disable_cache(self) -> None:
+        self._cache_enabled = False
+        self._cache_k = None
+        self._cache_v = None
+
+    @property
+    def cached_length(self) -> int:
+        return 0 if self._cache_k is None else int(self._cache_k.shape[2])
 
     def prefix_readout(
         self, x: torch.Tensor, *, keep: torch.Tensor | None = None
@@ -236,13 +265,43 @@ class PrefixIndexer(ScalarIndexer):
         not both, and a ``(B, 1, 1, Sk)`` key mask alone would drop causality. That mask is
         quadratic (67 MiB at ``Sk=8192``, ``B=1``), which is fine at training lengths and is why
         the training path packs full-length documents instead of padding.
+
+        When the cache is enabled the new ``k``/``v`` are appended to it first and the attention
+        runs against the whole cache. The first call has an empty cache, so it is an ordinary
+        causal prefill and keeps the flash path. Later calls have ``Sq < Sk``, where ``is_causal``
+        is wrong -- SDPA aligns it top-left, so it would hide the very prefix the cache exists to
+        keep -- hence a bottom-right mask, built only when the call carries more than one query
+        row. A single decode step sees every cached key and needs no mask at all.
         """
         bsz, k_len, _ = x.shape
         q = self.w_pq(x).view(bsz, k_len, 1, self.head_dim).transpose(1, 2)
         k = self.w_pk(x).view(bsz, k_len, 1, self.head_dim).transpose(1, 2)
         v = self.w_pv(x).view(bsz, k_len, 1, self.value_dim).transpose(1, 2)
 
-        if keep is None:
+        if self._cache_enabled:
+            if keep is not None:
+                raise ValueError(
+                    "the prefix cache does not support a padding mask: the cache is a running "
+                    "prefix, so a padded key would stay in every later step's attention. Pack "
+                    "sequences instead, or disable the cache."
+                )
+            fresh = self._cache_k is None
+            if not fresh:
+                k = torch.cat([self._cache_k, k], dim=2)
+                v = torch.cat([self._cache_v, v], dim=2)
+            self._cache_k, self._cache_v = k, v
+            if fresh:
+                a = nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+            else:
+                mask = None
+                if k_len > 1:
+                    total = k.shape[2]
+                    offset = total - k_len
+                    q_pos = torch.arange(k_len, device=x.device).unsqueeze(-1) + offset
+                    k_pos = torch.arange(total, device=x.device).unsqueeze(0)
+                    mask = (k_pos <= q_pos).view(1, 1, k_len, total)
+                a = nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        elif keep is None:
             a = nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
             causal = torch.ones((k_len, k_len), device=x.device, dtype=torch.bool).tril_()
@@ -275,10 +334,12 @@ class PrefixIndexer(ScalarIndexer):
             ``(B, Sk, hidden_size)``. Unlike the scalar arm this must be the sequence **from
             position 0**: the prefix attention reads it as the whole prefix.
         key_offset : int
-            Must be ``0``. A non-zero offset means ``hidden_states`` is a suffix, and the prefix
-            attention would then score each key against a *truncated* prefix -- silently, and
-            differently depending on how the prefill was split. Decode-time scoring needs the
-            indexer's own ``K``/``V`` carried across steps, which is out of scope here.
+            Absolute position of the first key, for the recency tilt. Must be ``0`` unless the
+            prefix cache is enabled: without a cache a non-zero offset means ``hidden_states`` is
+            a suffix, and the prefix attention would score each key against a *truncated* prefix
+            -- silently, and differently depending on how the prefill was split. With the cache
+            the earlier prefix is still there, so the offset is honoured and must equal the number
+            of keys already cached.
         mask : torch.Tensor, optional
             Keep-mask over keys, broadcastable to ``(B, Sk)``. Unlike the scalar arm this also
             excludes padded keys from every *other* key's prefix attention, not just from the
@@ -293,13 +354,19 @@ class PrefixIndexer(ScalarIndexer):
             raise ValueError(
                 f"hidden_states must be (B, Sk, hidden_size), got {tuple(hidden_states.shape)}"
             )
-        if key_offset != 0:
+        if key_offset != 0 and not self._cache_enabled:
             raise ValueError(
                 f"PrefixIndexer.score_keys requires key_offset=0, got {key_offset}. The score "
                 "reads the key's whole prefix, so a suffix would be scored against a truncated "
-                "one -- a silent dependence on how the prefill was chunked. Decode-time and "
-                "chunked scoring need the indexer's own K/V cached across calls, which this "
-                "scorer does not implement (see the module docstring's Scope section)."
+                "one -- a silent dependence on how the prefill was chunked. Call enable_cache() "
+                "to carry the indexer's own K/V across calls, which makes an offset meaningful."
+            )
+        if self._cache_enabled and key_offset != self.cached_length:
+            raise ValueError(
+                f"key_offset={key_offset} but the prefix cache holds {self.cached_length} keys. "
+                "The offset is the absolute position of the first new key, so a mismatch means "
+                "the cache and the sequence have diverged -- keys would be scored against the "
+                "wrong prefix and the recency tilt would be wrong too."
             )
         if hidden_states.dtype != self.weight_dtype:
             hidden_states = hidden_states.to(self.weight_dtype)
@@ -323,7 +390,10 @@ class PrefixIndexer(ScalarIndexer):
 
         if self.pos_slope:
             pos = torch.arange(
-                hidden_states.shape[1], device=scores.device, dtype=scores.dtype
+                key_offset,
+                key_offset + hidden_states.shape[1],
+                device=scores.device,
+                dtype=scores.dtype,
             )
             scores = scores + self.pos_slope * pos
 
@@ -333,6 +403,12 @@ class PrefixIndexer(ScalarIndexer):
             )
             scores = scores.masked_fill(~real, MASK_NEG)
         return scores
+
+    def project_k(self, hidden_states: torch.Tensor, cos=None, sin=None) -> torch.Tensor:
+        self._reject_rope(cos, sin)
+        return self.gate_key(
+            hidden_states, key_offset=self.cached_length, dtype=hidden_states.dtype
+        )
 
     def extra_repr(self) -> str:
         shape = f"hidden={self.config.hidden_size}, n_heads={self.n_heads}"

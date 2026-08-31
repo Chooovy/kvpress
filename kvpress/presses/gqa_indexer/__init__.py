@@ -62,6 +62,8 @@ from kvpress.presses.gqa_indexer.e2e_trainer import (
     STAGES,
     E2EIndexerTrainer,
     e2e_indexer_training_step,
+    e2e_indexer_delta_weighted_step,
+    e2e_indexer_longce_step,
 )
 from kvpress.presses.gqa_indexer.fused_loss import (
     accumulation_dtype,
@@ -124,6 +126,12 @@ from kvpress.presses.gqa_indexer.scalar_indexer import (
     ScalarIndexer,
     ScalarIndexerConfig,
 )
+from kvpress.presses.gqa_indexer.delta_loss import (
+    DEFAULT_LOGIT_CHUNK,
+    delta_weighted_loss,
+    delta_weights,
+    per_token_ce,
+)
 from kvpress.presses.gqa_indexer.prefix_indexer import (
     PrefixIndexer,
     PrefixIndexerConfig,
@@ -184,6 +192,8 @@ from kvpress.presses.gqa_indexer.train import (
     detect_scorer,
     detect_scorer_from_keys,
     infer_scalar_mid_dim,
+    infer_prefix_dims,
+    press_kwargs_from_checkpoint,
 )
 from kvpress.presses.gqa_indexer.qi_flex_attention import (
     HAS_FLEX,
@@ -258,6 +268,8 @@ __all__ = [
     "detect_scorer",
     "detect_scorer_from_keys",
     "infer_scalar_mid_dim",
+    "infer_prefix_dims",
+    "press_kwargs_from_checkpoint",
     "fused_indexer_ce_rows",
     "fused_indexer_loss",
     "accumulation_dtype",
@@ -268,6 +280,12 @@ __all__ = [
     "teacher_query_states",
     "E2EIndexerTrainer",
     "e2e_indexer_training_step",
+    "e2e_indexer_delta_weighted_step",
+    "e2e_indexer_longce_step",
+    "DEFAULT_LOGIT_CHUNK",
+    "delta_weights",
+    "delta_weighted_loss",
+    "per_token_ce",
     "STAGES",
     "SCOPES",
     "gated_attention",

@@ -56,6 +56,7 @@ if str(REPO_ROOT) not in sys.path:
 from kvpress import GQAIndexerPress  # noqa: E402
 from kvpress.presses.gqa_indexer import load_indexer_state_dict  # noqa: E402
 from kvpress.presses.gqa_indexer.sparse_support import streaming_topk_support  # noqa: E402
+from kvpress.presses.gqa_indexer.train import press_kwargs_from_checkpoint  # noqa: E402
 
 logger = logging.getLogger("probe_router_selection")
 
@@ -118,16 +119,38 @@ def build_model(model_path: str, dtype: torch.dtype, device: str):
 
 
 def attach_indexer(model, ckpt_path: str):
-    """Attach and load one indexer checkpoint, mirroring evaluate_sparse.py exactly."""
+    """
+    Attach and load one indexer checkpoint, mirroring evaluate_sparse.py exactly.
+
+    The scorer and its geometry come from :func:`press_kwargs_from_checkpoint`, the same helper
+    ``evaluate_sparse.py`` uses -- so a probe cannot score with a different router than the
+    evaluation does. Without that, a scalar or prefix checkpoint would be loaded into a freshly
+    built *pairwise* indexer, which fails on every key; and for a scorer that shares parameter
+    names it would be worse, loading a subset and probing a half-initialized router.
+    """
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state_dict = checkpoint.get("indexer", checkpoint)
+    config = checkpoint.get("config") or {}
     has_gate = any(str(key).endswith("gate_scale") for key in state_dict)
+    scorer, scorer_kwargs = press_kwargs_from_checkpoint(state_dict, config)
+    if scorer in ("scalar", "prefix") and "scalar_pos_slope" not in scorer_kwargs:
+        logger.warning(
+            "%s records no scalar_pos_slope; using the module default. pos_slope is not a "
+            "parameter, so a mismatch against training cannot be caught by weight loading.",
+            Path(ckpt_path).name,
+        )
+
     press = GQAIndexerPress(
-        compression_ratio=0.0, gate_scale=has_gate, scorer_attr="indexer"
+        compression_ratio=0.0,
+        gate_scale=has_gate,
+        scorer_attr="indexer",
+        scorer=scorer,
+        **scorer_kwargs,
     )
     press.post_init_from_model(model, force_reinit=True)
     load_indexer_state_dict(model, state_dict, "indexer")
-    return press, checkpoint.get("config", {})
+    logger.info("loaded %s (scorer=%s, %s)", Path(ckpt_path).name, scorer, scorer_kwargs or "{}")
+    return press, config
 
 
 @torch.no_grad()

@@ -493,3 +493,80 @@ def infer_scalar_mid_dim(state_dict, config: dict | None = None) -> int:
             "written by the mid_dim=0 linear form; the two disagree."
         )
     return 0
+
+
+def infer_prefix_dims(state_dict, config: dict | None = None) -> dict:
+    """
+    A prefix indexer's ``prefix_head_dim`` and ``prefix_value_dim``, from ``w_pq``/``w_pv``.
+
+    Both are parameter shapes, so they are read off the weights: a value taken from the config
+    could disagree with what actually loads, and only the shape can be right. The recorded config
+    is used as a **cross-check** -- a disagreement raises rather than silently preferring one,
+    because it means the checkpoint's own record of the run is inconsistent.
+
+    Note the asymmetry with :func:`infer_scalar_mid_dim`: a missing ``w_in`` is a legitimate
+    configuration (``mid_dim=0``), but a prefix indexer with no ``w_pq`` cannot exist, so that is
+    an error.
+    """
+    dims = {}
+    for key, suffix in (("prefix_head_dim", "w_pq.weight"), ("prefix_value_dim", "w_pv.weight")):
+        shape = next(
+            (int(t.shape[0]) for n, t in state_dict.items() if str(n).endswith(suffix)), None
+        )
+        if shape is None:
+            raise ValueError(
+                f"this checkpoint is a prefix indexer but holds no {suffix}, so its "
+                f"{key} cannot be recovered."
+            )
+        recorded = (config or {}).get(key)
+        if recorded is not None and int(recorded) != shape:
+            raise ValueError(
+                f"checkpoint records {key}={recorded} but {suffix} has width {shape}; the two "
+                "disagree, so the run's own record of its geometry is inconsistent."
+            )
+        dims[key] = shape
+    return dims
+
+
+def press_kwargs_from_checkpoint(
+    state_dict, config: dict | None = None, *, scorer: str | None = None
+) -> tuple[str, dict]:
+    """
+    The scorer name and the ``GQAIndexerPress`` kwargs a checkpoint needs, in one place.
+
+    Every evaluation entry point has to rebuild the *same* geometry the checkpoint was trained at,
+    and the failure mode when it does not is asymmetric: a wrong parameter *shape* fails loudly on
+    load, but ``pos_slope`` is not a parameter at all, so a wrong value there mis-scores silently
+    with every weight loading cleanly. Centralizing it means a new scorer is taught to the loaders
+    once instead of once per script -- the drift that let ``scorer='prefix'`` fall through to the
+    pairwise branch and pick up default dims.
+
+    Parameters
+    ----------
+    state_dict : mapping
+        The indexer weights (i.e. ``checkpoint["indexer"]``).
+    config : dict, optional
+        The checkpoint's recorded ``config``. Used for ``pos_slope``, which no weight carries, and
+        as a cross-check on the dims.
+    scorer : str, optional
+        Override the detected scorer. For a caller exposing ``--scorer``.
+
+    Returns
+    -------
+    (scorer, kwargs)
+        ``kwargs`` holds only the keys the named scorer accepts, so it can be splatted into
+        :class:`~.press.GQAIndexerPress` directly. ``gate_scale``, ``n_heads``, ``head_dim`` and
+        ``rope_dim`` are left to the caller: the first is read from the weights and the rest are
+        CLI concerns.
+    """
+    config = config or {}
+    scorer = scorer or detect_scorer(state_dict, config)
+    kwargs: dict = {}
+    if scorer in ("scalar", "prefix"):
+        kwargs["scalar_mid_dim"] = infer_scalar_mid_dim(state_dict, config)
+        recorded = config.get("scalar_pos_slope")
+        if recorded is not None:
+            kwargs["scalar_pos_slope"] = float(recorded)
+    if scorer == "prefix":
+        kwargs.update(infer_prefix_dims(state_dict, config))
+    return scorer, kwargs

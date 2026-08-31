@@ -8,6 +8,7 @@
 #   scripts/train_gqa_indexer_prefix_gy.sh identity       # THE FIRST RUN. 2 steps, asserts nesting
 #   scripts/train_gqa_indexer_prefix_gy.sh variance       # prefill-only diagnostic, no training
 #   scripts/train_gqa_indexer_prefix_gy.sh stage1_16k     # 16K, 600 steps, the A/B run
+#   LONGCE=1 scripts/train_gqa_indexer_prefix_gy.sh stage1_16k   # same, LongCE-weighted loss
 #   scripts/train_gqa_indexer_prefix_gy.sh stage1         # 8K -> 16K -> 32K curriculum
 #   scripts/train_gqa_indexer_prefix_gy.sh random_init    # ablation: branch NOT zero-initialized
 #   scripts/train_gqa_indexer_prefix_gy.sh linear         # MID_DIM=0, prefix branch on a linear score
@@ -107,6 +108,32 @@ COMPRESSION_RATIO="${COMPRESSION_RATIO:-0.5}"
 
 MAX_STEPS="${MAX_STEPS:-600}"
 
+# LongCE-weighted loss (LONGCE=1). Off by default, so existing invocations are unchanged.
+#
+# Replaces the plain mean with `sum_t w_t L_t / sum_t w_t`, where
+# `w_t = min(exp(L_t^short - L_t^long), gamma)` is read from a PRECOMPUTED cache. See
+# kvpress/presses/gqa_indexer/longce_weights.py for the derivation, and the LONGCE block in
+# scripts/train_gqa_indexer_scalar_gy.sh for why this weight is a different quantity from the
+# dense-vs-sparse delta gap that collapsed RULER 66.24 -> 37.53.
+#
+# ON THE SCALAR ARM THIS MEASURED 66.24 -> 73.71 (+7.47) at 8K, winning 9 of 13 tasks, with
+# niah_single_3 going 9.52 -> 100.00. That is the reason to try it here.
+#
+# THE SAME CACHE IS REUSED, and that is not a shortcut: the backbone is FROZEN, so `L^short` and
+# `L^long` are functions of the data and the backbone only -- they do not depend on the scorer at
+# all. A prefix-specific cache would be bit-identical, so rebuilding one would burn ~1.5 GPU-hours
+# to produce the same numbers. (The cache meta records model/seq_len/K/d/gamma; there is no scorer
+# field, because none is used.)
+#
+# NOTE ON THIS ARM'S PRIOR, given the header above: LONGCE changes the OBJECTIVE, not the prefix
+# branch, so it cannot manufacture a signal the branch does not have. If prefix+LongCE beats
+# prefix+plain by roughly what scalar+LongCE beat scalar+plain, that is the objective working again
+# -- NOT evidence for the prefix feature. The single-variable test for the feature is still
+# prefix-vs-scalar at a MATCHED objective, which is exactly what this run enables (both arms at
+# LongCE, everything else already matched).
+LONGCE="${LONGCE:-0}"
+LONGCE_CACHE="${LONGCE_CACHE:-/apdcephfs_gy8/share_303843174/guhao/datasets/longce_weights_16k}"
+
 cd "$(dirname "$0")/.."
 
 export TOKENIZERS_PARALLELISM=false
@@ -122,6 +149,31 @@ fi
 liger_arg() { [[ "$LIGER" != "0" ]] && echo "--liger"; }
 ffn_sp_arg() { [[ "$FFN_SP" != "1" ]] && echo "--ffn-sp-size $FFN_SP"; }
 gate_sparsity_arg() { [[ "${GATE_SPARSITY:-1}" != "0" ]] && echo "--gate-sparsity"; }
+
+# `return 0` is load-bearing: these are used inside variable ASSIGNMENTS and command substitutions,
+# and under `set -e` a substitution that exits non-zero kills the script SILENTLY with no output. A
+# bare `[[ cond ]] && echo` returns 1 whenever the condition is false, which is exactly that case.
+#
+# --take-from head is NOT optional and travels with the flag: cached weights are per-position and each
+# stage reads a PREFIX of them, which is only valid because the losses are causal. `random` would pair
+# position i's weight with a different token; the trainer rejects the combination for that reason.
+longce_args() {
+  [[ "$LONGCE" != "0" ]] && echo "--longce-weights $LONGCE_CACHE --take-from head"
+  return 0
+}
+
+longce_suffix() {
+  [[ "$LONGCE" != "0" ]] && echo "_longce"
+  return 0
+}
+
+if [[ "$LONGCE" != "0" && ! -d "$LONGCE_CACHE" ]]; then
+  echo "LONGCE=1 needs a precomputed weight cache at $LONGCE_CACHE" >&2
+  echo "  build it:  scripts/precompute_longce_weights.sh 16384" >&2
+  echo "  or point LONGCE_CACHE= at an existing one (the scalar arm's cache is reusable --" >&2
+  echo "  the weights depend on the frozen backbone and the data, not on the scorer)" >&2
+  exit 1
+fi
 
 # --scorer prefix plus the branch geometry. Zero-init is the DEFAULT in the trainer, so the flag is
 # only ever passed to turn it OFF -- which keeps the nesting property from depending on this script.
@@ -152,10 +204,13 @@ case "$MODE" in
     #
     # Also prints the parameter counts, so the capacity difference against the scalar arm is on the
     # record before any loss is compared.
+    # LAYERS is deliberately UNQUOTED: --layers takes nargs="+" of int, so a quoted "0 17 35" arrives
+    # as one string and argparse rejects it ("invalid int value: '0 17 35'"), which made this mode --
+    # the one the header says to run FIRST -- unrunnable at its own default.
     exec python -m scripts.prefix_indexer_identity_check \
       --model "$MODEL" --mid-dim "$MID_DIM" \
       --prefix-head-dim "$PREFIX_HEAD_DIM" --prefix-value-dim "$PREFIX_VALUE_DIM" \
-      --seq-len "${SEQ_LEN:-4096}" --layers "${LAYERS:-0 17 35}"
+      --seq-len "${SEQ_LEN:-4096}" --layers ${LAYERS:-0 17 35}
     ;;
 
   variance)
@@ -206,9 +261,14 @@ case "$MODE" in
       random_init) PREFIX_ZERO_INIT=0 ;;
       linear)      MID_DIM=0 ;;
     esac
-    SUB="${MODE}_mid${MID_DIM}_v${PREFIX_VALUE_DIM}"
+    SUB="${MODE}_mid${MID_DIM}_v${PREFIX_VALUE_DIM}$(longce_suffix)"
+    # `random` normally, but LONGCE requires `head` (cached weights are per-position prefixes), so
+    # longce_args supplies it and this default drops out. Passing both would leave argparse taking the
+    # LAST one, which is why this is a variable rather than a second flag.
+    TAKE_FROM_ARG="--take-from random"
+    [[ "$LONGCE" != "0" ]] && TAKE_FROM_ARG=""
     exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer_e2e \
-      --data-root "$DATA_ROOT" --model "$MODEL" $(data_args) $(prefix_args) \
+      --data-root "$DATA_ROOT" --model "$MODEL" $(data_args) $(prefix_args) $(longce_args) \
       --schedule "${SCHEDULE:-8192:300,16384:300,32768:900}" \
       --max-steps "${MAX_STEPS:-600}" \
       --stage dense --pin-mode "$PIN_MODE" --n-sink "$N_SINK" $(liger_arg) \
@@ -217,7 +277,7 @@ case "$MODE" in
       --compression-ratio "$COMPRESSION_RATIO" \
       --peak-lr "$PEAK_LR" --final-lr "$FINAL_LR" \
       --warmup-frac "$WARMUP_FRAC" --stable-frac "$STABLE_FRAC" \
-      --batch-size 1 --take-from random --shuffle-buffer 64 \
+      --batch-size 1 $TAKE_FROM_ARG --shuffle-buffer 64 \
       --num-workers "${WORKERS:-2}" \
       --out "$OUT/$SUB" --metrics-file "$OUT/$SUB/metrics.jsonl" \
       --save-every "${SAVE_EVERY:-100}" --log-every "${LOG_EVERY:-10}"

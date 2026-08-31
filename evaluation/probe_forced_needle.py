@@ -197,8 +197,16 @@ def answer_one(model, tokenizer, context_ids, question_ids, context_length, max_
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--distill-ckpt", required=True)
-    parser.add_argument("--e2e-ckpt", required=True)
+    parser.add_argument(
+        "--ckpt",
+        action="append",
+        metavar="NAME=PATH",
+        help="an arm to probe, as NAME=PATH; repeat for more. Each checkpoint's scorer "
+        "(pairwise/scalar/prefix) and geometry are read from the checkpoint itself, so arms of "
+        "different kinds are comparable in one run. Falls back to --distill-ckpt/--e2e-ckpt.",
+    )
+    parser.add_argument("--distill-ckpt", default=None)
+    parser.add_argument("--e2e-ckpt", default=None)
     parser.add_argument("--data-dir", default="16384")
     parser.add_argument("--task", default="niah_multikey_3")
     parser.add_argument("--n-samples", type=int, default=20)
@@ -209,6 +217,23 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--out", default="evaluation/forced_needle_probe.json")
     args = parser.parse_args()
+
+    # NAME=PATH pairs, or the legacy two-flag form. Ordered, so the summary table reads in the
+    # order the arms were given.
+    arms: list[tuple[str, str]] = []
+    for entry in args.ckpt or []:
+        if "=" not in entry:
+            raise SystemExit(f"--ckpt takes NAME=PATH, got {entry!r}")
+        name, path = entry.split("=", 1)
+        arms.append((name, path))
+    for name, path in (("distill", args.distill_ckpt), ("e2e", args.e2e_ckpt)):
+        if path:
+            arms.append((name, path))
+    if not arms:
+        raise SystemExit("pass at least one --ckpt NAME=PATH (or --distill-ckpt/--e2e-ckpt)")
+    missing = [p for _, p in arms if not Path(p).is_file()]
+    if missing:
+        raise SystemExit(f"checkpoint(s) not found: {missing}")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if not torch.cuda.is_available():
@@ -266,7 +291,7 @@ def main() -> None:
 
         record = {"answer": answer, "span": span, "span_text": decoded_span,
                   "context_len": context_ids.shape[1]}
-        for name, checkpoint in (("distill", args.distill_ckpt), ("e2e", args.e2e_ckpt)):
+        for name, checkpoint in arms:
             press = attach_indexer(model, checkpoint)[0]
             for arm, forced in (("off", None), ("forced", span)):
                 text, injections = answer_one(
@@ -281,10 +306,12 @@ def main() -> None:
 
         records.append(record)
         logger.info(
-            "sample %d span=%s  distill off=%s forced=%s | e2e off=%s forced=%s",
+            "sample %d span=%s  %s",
             len(records), span,
-            record["distill_off_correct"], record["distill_forced_correct"],
-            record["e2e_off_correct"], record["e2e_forced_correct"],
+            " | ".join(
+                f"{name} off={record[f'{name}_off_correct']} forced={record[f'{name}_forced_correct']}"
+                for name, _ in arms
+            ),
         )
 
     if not records:
@@ -295,13 +322,15 @@ def main() -> None:
     out.write_text(json.dumps(records, indent=2))
 
     print(f"\n{len(records)} samples, topk={args.topk}, forced span = key+value (~70 tok)\n")
-    print(f"{'checkpoint':<10} {'off':>8} {'forced':>8} {'delta':>8}")
-    for name in ("distill", "e2e"):
+    print(f"{'checkpoint':<14} {'off':>8} {'forced':>8} {'delta':>8}")
+    for name, _ in arms:
         off = sum(r[f"{name}_off_correct"] for r in records) / len(records)
         forced = sum(r[f"{name}_forced_correct"] for r in records) / len(records)
-        print(f"{name:<10} {off:8.3f} {forced:8.3f} {forced - off:+8.3f}")
-    print("\nIf e2e's 'forced' recovers towards distill's 'off', the regression is a selection")
-    print("failure. If it does not, selection is not the bottleneck.")
+        print(f"{name:<14} {off:8.3f} {forced:8.3f} {forced - off:+8.3f}")
+    print("\nReading it: 'forced' injects the needle's key+value span into every row's support at")
+    print("every layer, at equal budget. If an arm's forced >> its off, that arm's failure IS a")
+    print("selection failure and the fix belongs in what the router learns to select. If forced")
+    print("stays near off, selection is not the bottleneck and the effort belongs elsewhere.")
 
 
 if __name__ == "__main__":

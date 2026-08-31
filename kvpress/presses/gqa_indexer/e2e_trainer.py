@@ -80,6 +80,7 @@ from kvpress.presses.gqa_indexer.gate_pin import (
     pins_self,
 )
 from kvpress.presses.gqa_indexer.triton_fused_loss import HAS_TRITON
+from kvpress.presses.gqa_indexer.delta_loss import DEFAULT_LOGIT_CHUNK
 from kvpress.presses.gqa_indexer.gated_attention import gated_attention
 from kvpress.presses.gqa_indexer.press import GQAIndexerPress, get_language_model
 from kvpress.presses.gqa_indexer.sparse_support import resolve_topk, streaming_topk_support
@@ -785,3 +786,210 @@ def e2e_indexer_training_step(
                 f"E2EIndexerTrainer pointed at {model.config._attn_implementation!r}."
             )
         return out.loss
+
+
+def _final_hidden_states(
+    model: nn.Module,
+    *,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """
+    The backbone's final hidden states, ``(B, L, H)`` -- no ``lm_head``, no loss.
+
+    Calls the **base** model rather than the ``*ForCausalLM`` wrapper, which is what keeps the
+    ``(L, vocab)`` logits from being built at all; :func:`~.delta_loss.per_token_ce` then applies
+    ``lm_head`` in chunks. This is also why ``--liger`` needs no special handling on this path: the
+    fused kernel lives in the wrapper's loss, and the wrapper is not on it.
+    """
+    base = model.model if hasattr(model, "model") else model
+    out = base(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+    if hasattr(model, "model") and getattr(model.model, "norm", None) is not None:
+        # `base(...)` already applies the final norm in every HF decoder this targets; asserting
+        # rather than re-applying, because a double norm would be a silently wrong loss.
+        pass
+    return hidden
+
+
+def e2e_indexer_delta_weighted_step(
+    model: nn.Module,
+    trainer: E2EIndexerTrainer,
+    *,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    labels: torch.Tensor | None = None,
+    lam: float = 0.1,
+    logit_chunk: int = DEFAULT_LOGIT_CHUNK,
+) -> tuple[torch.Tensor, dict]:
+    """
+    One step of the **delta-weighted** objective: ``sum_t w_t L_t / sum_t w_t``.
+
+    ``w_t = clamp(L_t^dense - L_t^sparse, 0) + lam``, detached. See
+    :mod:`~kvpress.presses.gqa_indexer.delta_loss` for why the gap has to enter as a weight rather
+    than as the target, and why the ``lam`` floor is load-bearing.
+
+    Two forward passes over the same tokens:
+
+    * **dense** -- under ``no_grad`` and *outside* ``trainer.hooks``, so the model runs its own
+      attention with no gate. This is the reference the weighting is measured against; if the gate
+      were still installed, ``delta`` would be identically zero and the objective would silently
+      collapse to the ordinary mean. Checked, not assumed: :attr:`E2EIndexerTrainer.layers_gated`
+      must be ``0`` after it.
+    * **sparse** -- inside the hooks, with the graph, exactly as
+      :func:`e2e_indexer_training_step` runs it.
+
+    Returns
+    -------
+    (loss, stats)
+        ``stats`` carries the diagnostics from :func:`~.delta_loss.delta_weighted_loss` plus
+        ``dense_loss`` and ``sparse_loss`` (plain means, for comparison against an existing run's
+        curve). Watch ``delta_positive_frac``: near zero means the weighting has nothing to work
+        with and the second forward pass is being paid for nothing.
+    """
+    from kvpress.presses.gqa_indexer.delta_loss import (
+        delta_weighted_loss,
+        delta_weights,
+        per_token_ce,
+        valid_mask,
+    )
+
+    target = input_ids if labels is None else labels
+    lm_head = model.get_output_embeddings()
+    if lm_head is None:
+        raise RuntimeError("model exposes no output embeddings, so per-token CE cannot be formed")
+
+    # --- dense reference: no hooks, no grad, no gate ---------------------------------------
+    # Zeroed first: `layers_gated` accumulates across calls and `hooks()` resets it on entry, so a
+    # stale count from the previous step would make the check below fire on a correct dense pass.
+    # The check is worth keeping precise rather than dropping -- if the gate were still installed
+    # here, every delta would be ~0 and the objective would silently become the ordinary mean.
+    trainer.layers_gated = 0
+    with torch.no_grad():
+        dense_hidden = _final_hidden_states(
+            model, input_ids=input_ids, attention_mask=attention_mask
+        )
+        dense_loss = per_token_ce(lm_head, dense_hidden, target, chunk_size=logit_chunk)
+        del dense_hidden
+    if trainer.layers_gated != 0:
+        raise RuntimeError(
+            f"the dense reference pass ran {trainer.layers_gated} gated layer(s), so it is not a "
+            "dense reference at all and every delta would be ~0 -- collapsing this objective to "
+            "the ordinary mean while still reporting a plausible loss."
+        )
+
+    # --- gated pass: the one that carries the router's gradient ----------------------------
+    with trainer.hooks(model):
+        sparse_hidden = _final_hidden_states(
+            model, input_ids=input_ids, attention_mask=attention_mask
+        )
+        if trainer.layers_gated == 0:
+            raise RuntimeError(
+                "no layer ran the gated attention: the model kept its own attention "
+                "implementation. This usually means the model's config is not the one "
+                f"E2EIndexerTrainer pointed at {model.config._attn_implementation!r}."
+            )
+        sparse_loss = per_token_ce(lm_head, sparse_hidden, target, chunk_size=logit_chunk)
+
+    mask = valid_mask(target)
+    delta = dense_loss - sparse_loss.detach()
+    weights = delta_weights(dense_loss, sparse_loss, lam=lam, mask=mask)
+    loss, stats = delta_weighted_loss(sparse_loss, weights, delta=delta, mask=mask)
+
+    with torch.no_grad():
+        n_valid = int(mask.sum())
+        stats["dense_loss"] = float(dense_loss[mask].mean()) if n_valid else 0.0
+        stats["sparse_loss"] = float(sparse_loss.detach()[mask].mean()) if n_valid else 0.0
+    return loss, stats
+
+
+def e2e_indexer_longce_step(
+    model: nn.Module,
+    trainer: E2EIndexerTrainer,
+    *,
+    input_ids: torch.Tensor,
+    weights: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    labels: torch.Tensor | None = None,
+    scored: torch.Tensor | None = None,
+    logit_chunk: int = DEFAULT_LOGIT_CHUNK,
+) -> tuple[torch.Tensor, dict]:
+    """
+    One step of the **LongCE-weighted** objective: ``sum_t w_t L_t / sum_t w_t``.
+
+    ``w_t = min(exp(L_t^short - L_t^long), gamma)`` comes from the *cache*, not from this step. That
+    is the whole structural difference from :func:`e2e_indexer_delta_weighted_step`, and it is what
+    makes this cheaper rather than more expensive: the backbone is frozen, so the weights are a
+    property of the data and there is nothing here to recompute. **One** forward pass, the gated one
+    -- against delta's two -- so peak memory and step time should match the plain path, not exceed
+    it.
+
+    The weighting itself was validated offline before any training: ``spearman(w, L_long)`` measured
+    -0.001 to -0.029 across 8K/16K/32K, i.e. the weight is decorrelated from the loss it multiplies.
+    That is precisely what the delta arm failed, and why it collapsed RULER from 66.24 to ~35.2 by
+    concentrating on the high-loss tail where irreducible entropy lives. See
+    :mod:`~kvpress.presses.gqa_indexer.longce_weights` and
+    :mod:`evaluation.probe_longce_key_tokens`.
+
+    Parameters
+    ----------
+    weights : torch.Tensor
+        ``(B, L-1)`` or ``(N,)`` cached weights on the next-token index, matching what
+        :func:`~.delta_loss.per_token_ce` returns. Detached downstream; a file-sourced tensor should
+        not carry a graph, and if it did the objective would become optimizable by getting worse.
+    scored : torch.Tensor, optional
+        ``(B, L-1)`` or ``(N,)`` marking positions that had a short-context counterfactual. Used for
+        diagnostics only -- the cache already stores 1.0 at unscored positions, which is this
+        weighting's neutral value.
+
+    Returns
+    -------
+    (loss, stats)
+        ``stats`` carries ``weight_participation`` -- the number to judge this run by, directly
+        comparable to the failed delta run's 0.13-0.18 and to the offline 0.66-0.87 -- plus
+        ``sparse_loss``, the plain mean, so the curve stays comparable to the plain arm's.
+    """
+    from kvpress.presses.gqa_indexer.delta_loss import per_token_ce, valid_mask
+    from kvpress.presses.gqa_indexer.longce_weights import longce_weighted_loss
+
+    target = input_ids if labels is None else labels
+    lm_head = model.get_output_embeddings()
+    if lm_head is None:
+        raise RuntimeError("model exposes no output embeddings, so per-token CE cannot be formed")
+
+    with trainer.hooks(model):
+        sparse_hidden = _final_hidden_states(
+            model, input_ids=input_ids, attention_mask=attention_mask
+        )
+        if trainer.layers_gated == 0:
+            raise RuntimeError(
+                "no layer ran the gated attention: the model kept its own attention "
+                "implementation. This usually means the model's config is not the one "
+                f"E2EIndexerTrainer pointed at {model.config._attn_implementation!r}."
+            )
+        sparse_loss = per_token_ce(lm_head, sparse_hidden, target, chunk_size=logit_chunk)
+
+    flat_weights = weights.reshape(-1).to(sparse_loss.device, dtype=torch.float32)
+    if flat_weights.shape != sparse_loss.shape:
+        # Worth an explicit check rather than letting broadcasting paper over it: a weight vector
+        # off by one position still multiplies elementwise without complaint, and the resulting run
+        # would train the wrong tokens while every logged number stayed plausible.
+        raise ValueError(
+            f"cached weights flatten to {tuple(flat_weights.shape)} but the per-token loss is "
+            f"{tuple(sparse_loss.shape)}. The cache was built at a different sequence length than "
+            "this stage draws, so the weights do not line up with the tokens."
+        )
+    flat_scored = None
+    if scored is not None:
+        flat_scored = scored.reshape(-1).to(sparse_loss.device, dtype=torch.bool)
+
+    mask = valid_mask(target)
+    loss, stats = longce_weighted_loss(
+        sparse_loss, flat_weights, mask=mask, scored=flat_scored
+    )
+    with torch.no_grad():
+        n_valid = int(mask.sum())
+        # The plain mean, so this run's curve can be read against the plain arm's 1.89 -- the
+        # weighted number cannot be, because it is a different objective.
+        stats["sparse_loss"] = float(sparse_loss.detach()[mask].mean()) if n_valid else 0.0
+    return loss, stats

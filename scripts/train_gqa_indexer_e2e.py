@@ -48,6 +48,32 @@ What differs from distillation, and why
   ``log(L)`` because the softmax it normalizes over gets wider, which puts a ``log 2`` step in
   the curve at every curriculum boundary. An LM loss has no such term, so the raw number is
   already comparable and ``loss_minus_log_seq`` is not emitted.
+
+The RULER SFT mode
+------------------
+``--sft-ruler`` swaps the longmino corpus for RULER rows and masks the loss down to the **gold
+answer's tokens** (:mod:`kvpress.presses.gqa_indexer.sft_data`). Everything else -- the gate, the
+trainer, the WSD schedule, the checkpoint format -- is the same code, so an SFT checkpoint loads
+into the press exactly like a stage-1 one. Intended use is a short decay pass on top of a trained
+router::
+
+    python -m scripts.train_gqa_indexer_e2e --sft-ruler SNAPSHOT --sft-config 16384 \\
+        --init-from stage1_16k/final.pt --schedule 24576:400 --peak-lr 1e-4
+
+Three things to know before reading its curve:
+
+* **The backbone stays frozen**, so this cannot teach an answer format or memorize an answer into
+  a weight -- the only thing the gradient can move is the router. Judge the run on the RULER
+  metric, not on the loss.
+* **~0.1% of positions carry gradient** (a 16K prompt against a 3-45 token answer), so the loss is
+  both noisy and incomparable to any longmino number.
+* ``--stage dense`` is effectively required. Under ``--stage sparse`` an unselected key's gradient
+  is *identically zero* (``test_full_scope_gradients_are_independent``), so a router that currently
+  misses the needle gets no signal to start selecting it -- which is the one thing this mode exists
+  to fix. The sparse scope is also unaffordable here: its backward runs through the gather
+  *reference* (the Triton sparse kernel has no ``autograd.Function``), which retains
+  ``O(Hkv * Sq * topk * D)`` per layer -- measured ~39 GiB/layer at ``Sq=16384, topk=512``, i.e.
+  well over a TiB across 36 layers, against the 72 GiB a dense 16K step actually peaks at.
 """
 
 from __future__ import annotations
@@ -68,10 +94,13 @@ if str(REPO_ROOT) not in sys.path:
 
 from kvpress import GQAIndexerPress  # noqa: E402
 from kvpress.presses.gqa_indexer import (  # noqa: E402
+    DEFAULT_LOGIT_CHUNK,
     DEFAULT_POS_SLOPE,
     PIN_MODES,
     E2EIndexerTrainer,
     e2e_indexer_training_step,
+    e2e_indexer_delta_weighted_step,
+    e2e_indexer_longce_step,
     indexer_state_dict,
     load_indexer_state_dict,
 )
@@ -80,6 +109,13 @@ from kvpress.presses.gqa_indexer.data import (  # noqa: E402
     LengthSchedule,
     describe_subsets,
     read_index,
+)
+from kvpress.presses.gqa_indexer.sft_data import (  # noqa: E402
+    ALL_TASKS,
+    TASK_GROUPS,
+    RulerSFTConfig,
+    build_ruler_sft_dataloader,
+    resolve_tasks,
 )
 
 # Imported, not reimplemented: these are exactly the pieces that must not differ between the two
@@ -121,7 +157,7 @@ def save(
         "indexer": indexer_state_dict(model, args.scorer_attr),
         "step": step,
         "config": {
-            "objective": "e2e_lm_loss",
+            "objective": "ruler_sft_answer_only" if args.sft_ruler else "e2e_lm_loss",
             "model": args.model,
             # Which router produced these weights. Without it the two arms' checkpoints are
             # indistinguishable, and --init-from would load one into the other -- the parameter
@@ -147,6 +183,14 @@ def save(
             "gate_budget_ratio": args.gate_budget_ratio,
             "schedule": args.schedule,
             "subsets": list(args.subsets),
+            # The SFT data provenance. `sft_tasks` in particular is not recoverable from the
+            # weights, and it is the variable that decides whether a RULER number is a
+            # generalization claim (train niah, score vt/cwe/fwe/qa) or an in-distribution one.
+            "sft_ruler": args.sft_ruler,
+            "sft_config": args.sft_config,
+            "sft_tasks": list(resolve_tasks(args.sft_tasks)) if args.sft_ruler else None,
+            "sft_max_len": args.sft_max_len if args.sft_ruler else None,
+            "sft_append_eos": args.sft_append_eos if args.sft_ruler else None,
             "topk": args.topk,
             "peak_lr": args.peak_lr,
             "final_lr": args.final_lr,
@@ -275,7 +319,7 @@ def apply_liger_fused_ce(model, model_name: str) -> bool:
     return True
 
 
-def check_liger_loss_unchanged(model, trainer, input_ids, tol: float = 2e-2) -> None:
+def check_liger_loss_unchanged(model, trainer, input_ids, labels=None, tol: float = 2e-2) -> None:
     """
     Assert the fused loss head gives the same loss as the unfused one, on one batch.
 
@@ -288,6 +332,13 @@ def check_liger_loss_unchanged(model, trainer, input_ids, tol: float = 2e-2) -> 
     Worth checking at all because a mismatch here means ``skip_logits`` is routing to a different
     objective, and the run would still descend and still look healthy.
 
+    ``labels`` matters more here than it looks: under ``--sft-ruler`` they are mostly ``-100``, and
+    the fused and unfused paths reach the ignore-index by different routes (Liger pads and shifts
+    inside its kernel; the unfused path goes through ``model.loss_function``). A masked-label
+    disagreement is exactly the kind of thing that would otherwise surface as a plausible-looking
+    loss over the wrong token set, so the check runs on the *real* labels rather than on the
+    default ``input_ids``.
+
     The tolerance is loose because the two paths accumulate the same sum in a different order --
     chunked fp32 against one large fp32 reduction -- so they agree to roughly bf16 precision on the
     logits, not to fp32 exactness. Anything beyond that is a real difference, not rounding.
@@ -297,10 +348,10 @@ def check_liger_loss_unchanged(model, trainer, input_ids, tol: float = 2e-2) -> 
     """
     with torch.no_grad():
         fused = e2e_indexer_training_step(
-            model, trainer, input_ids=input_ids, skip_logits=True
+            model, trainer, input_ids=input_ids, labels=labels, skip_logits=True
         )
         unfused = e2e_indexer_training_step(
-            model, trainer, input_ids=input_ids, skip_logits=False
+            model, trainer, input_ids=input_ids, labels=labels, skip_logits=False
         )
     gap = abs(float(fused) - float(unfused))
     if gap > tol:
@@ -319,7 +370,12 @@ def check_liger_loss_unchanged(model, trainer, input_ids, tol: float = 2e-2) -> 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     data = parser.add_argument_group("data")
-    data.add_argument("--data-root", required=True, help="longmino_256k_filtered root")
+    data.add_argument(
+        "--data-root",
+        default=None,
+        help="longmino_256k_filtered root. Required unless --sft-ruler is given, which reads "
+        "RULER instead and never touches this corpus.",
+    )
     data.add_argument(
         "--tokenized",
         default=None,
@@ -335,6 +391,50 @@ def main() -> int:
     data.add_argument("--min-tokens", type=int, default=None)
     data.add_argument("--num-workers", type=int, default=2)
     data.add_argument("--batch-size", type=int, default=1)
+
+    sft = parser.add_argument_group("ruler sft")
+    sft.add_argument(
+        "--sft-ruler",
+        default=None,
+        help="train on RULER with the loss masked to the gold ANSWER's tokens instead of on "
+        "longmino. Takes a parquet file, a HuggingFace-snapshot directory (<dir>/<config>/"
+        "test-*.parquet) or a repo id. The prompt is built by the eval pipeline's own "
+        "preprocess(), so the router trains on exactly the prompt it is scored on. Intended as a "
+        "short decay pass on top of --init-from, not as a from-scratch objective: the backbone is "
+        "frozen, so the only thing the gradient can move is the router's selection.",
+    )
+    sft.add_argument(
+        "--sft-config",
+        default=None,
+        help="RULER context-length config to read, e.g. 16384. Required when --sft-ruler names a "
+        "directory or a repo id (a bare parquet file already identifies one).",
+    )
+    sft.add_argument(
+        "--sft-tasks",
+        nargs="+",
+        default=None,
+        help=f"which RULER tasks to train on: individual names, or a group from "
+        f"{tuple(TASK_GROUPS)} (default: all {len(ALL_TASKS)}). THIS IS THE FLAG THAT DECIDES "
+        "WHAT THE EVAL NUMBER MEANS: '--sft-tasks niah' leaves vt/cwe/fwe/qa_1/qa_2 untrained, so "
+        "their scores measure whether the router learned to retrieve rather than to fit a "
+        "template, while 'all' makes every scored task in-distribution.",
+    )
+    sft.add_argument(
+        "--sft-max-len",
+        type=int,
+        default=None,
+        help="skip any RULER row whose prompt+answer exceeds this (default: the schedule's "
+        "longest stage). Rows are DROPPED, never truncated -- a needle lives at a fixed depth and "
+        "may be in the cut, and cwe/fwe answers are counts over the whole list. The drop is "
+        "task-skewed, so the per-task table is logged before training starts.",
+    )
+    sft.add_argument(
+        "--sft-append-eos",
+        action="store_true",
+        help="append EOS to the target. Off by default: the backbone is frozen so there is no "
+        "stopping behaviour to teach, and on the string_match_all tasks (whose gold answer is "
+        "several comma-separated references) rewarding an early stop costs score.",
+    )
 
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--model", default="Qwen/Qwen3-8B")
@@ -513,6 +613,62 @@ def main() -> int:
     gate.add_argument("--force-sink", type=int, default=0, help="sparse-stage reserved slots")
 
     optim = parser.add_argument_group("optimization")
+    optim.add_argument(
+        "--delta-weight",
+        action="store_true",
+        help="train on the DELTA-WEIGHTED loss `sum_t w_t L_t / sum_t w_t` with "
+        "`w_t = clamp(L_t^dense - L_t^sparse, 0) + --delta-lambda`, instead of the plain mean. "
+        "The point is where the router's gradient goes: a high L_t can be irreducible entropy, "
+        "missing knowledge, or retrieval failure, and only the last is the router's to fix. "
+        "Reweighting by L_t itself (a power mean or an LSE) promotes the first hardest of all, "
+        "since irreducible-entropy positions sit permanently at the top of the loss distribution "
+        "and their loss does not move with the support. The dense gap isolates the third. "
+        "Costs one extra forward per step (no_grad, no gate, so compute rather than memory) and "
+        "is NOT compatible with --sft-ruler, which is rejected. Watch delta_positive_frac in the "
+        "metrics: near zero means the weighting has nothing to work with.",
+    )
+    optim.add_argument(
+        "--delta-lambda",
+        type=float,
+        default=0.1,
+        help="the weight floor in `clamp(delta, 0) + lambda`. Load-bearing: at 0, a position the "
+        "router has already brought up to dense quality gets weight 0 and stops receiving gradient, "
+        "so nothing maintains it. Large values recover the ordinary mean continuously (measured: "
+        "the loss is within 5.6e-10 of the plain mean at lambda=1e6), which makes this the knob "
+        "that interpolates between the two objectives rather than a tolerance.",
+    )
+    optim.add_argument(
+        "--delta-logit-chunk",
+        type=int,
+        default=DEFAULT_LOGIT_CHUNK,
+        help="rows per lm_head call when forming per-token CE. Per-token loss needs the logits, "
+        "which is exactly what --liger's fused CE avoids materializing, so this path chunks them "
+        "instead: 0.3 GiB per 1024 rows at Qwen3's 151936-wide vocabulary against 2.5 GiB for a "
+        "whole 8K sequence. Sound because `sum w_t L_t` is LINEAR in L_t and so decomposes across "
+        "chunks -- a power mean would need every L_t before its outer exponent.",
+    )
+    optim.add_argument(
+        "--longce-weights",
+        default=None,
+        help="root of a LongCE weight cache from scripts/precompute_longce_weights.py. Trains on "
+        "`sum_t w_t L_t / sum_t w_t` with `w_t = min(exp(L^short_t - L^long_t), gamma)` read from "
+        "the cache. Unlike --delta-weight this costs NO extra forward pass: the backbone is frozen, "
+        "so the weights are a property of the data rather than of the router's current state, and "
+        "they were computed once offline. The weighting was validated before training -- "
+        "spearman(w, L_long) = -0.001..-0.029 across 8K/16K/32K, i.e. decorrelated from the loss it "
+        "multiplies, which is exactly what --delta-weight failed. Requires --tokenized and "
+        "--take-from head (the cache stores prefixes), and is incompatible with --delta-weight and "
+        "--sft-ruler. Watch weight_participation in the metrics: the failed delta run sat at "
+        "0.13-0.18 and offline this measured 0.66-0.87.",
+    )
+    optim.add_argument(
+        "--longce-require-all",
+        action="store_true",
+        help="fail if a drawn document has no cached weights, instead of falling back to weight 1 "
+        "for it. Off by default so a partial cache (--max-docs-per-shard) still trains, with the "
+        "uncached fraction reported as longce_cache_miss_frac in the metrics; on for a run that "
+        "must be exactly the cached objective.",
+    )
     optim.add_argument("--schedule", default="8192:300,16384:300,32768:300", help="SEQ_LEN:STEPS,...")
     optim.add_argument(
         "--max-steps",
@@ -586,6 +742,88 @@ def main() -> int:
             "warm start that restarts the schedule and Adam, the second continues an interrupted "
             "run with both preserved. Pick one."
         )
+    if not args.sft_ruler and not args.data_root:
+        parser.error("--data-root is required unless --sft-ruler is given")
+    if args.sft_ruler:
+        # Validated rather than silently accepted, because both of these fail *late* and
+        # confusingly: a bad task name would only surface once the frame is filtered to nothing,
+        # and a missing --sft-config would glob the snapshot root and find no parquet.
+        try:
+            args.sft_tasks = list(resolve_tasks(args.sft_tasks))
+        except ValueError as exc:
+            parser.error(str(exc))
+        if Path(args.sft_ruler).is_dir() and not args.sft_config:
+            parser.error(
+                f"--sft-ruler {args.sft_ruler} is a directory, so --sft-config is needed to pick a "
+                "context-length config (e.g. --sft-config 16384)"
+            )
+        if args.stage == "sparse":
+            # Refused, not warned: an unselected key's gradient under the sparse scope is
+            # identically zero (tests/presses/test_gqa_indexer_e2e.py::
+            # test_full_scope_gradients_are_independent), so a router that currently misses the
+            # needle would receive NO signal to start selecting it -- which is the only thing this
+            # mode can teach. The run would descend on the rows it already gets right and look
+            # healthy. The sparse backward is also unaffordable at these lengths: it goes through
+            # the gather reference (the Triton kernel has no autograd.Function), retaining
+            # ~39 GiB/layer at Sq=16384, topk=512.
+            parser.error(
+                "--sft-ruler needs --stage dense. Under --stage sparse an unselected key's "
+                "gradient is exactly zero, so the router cannot learn to start selecting a key it "
+                "currently misses -- and the sparse backward runs through the gather reference, "
+                "which retains ~39 GiB per layer at Sq=16384/topk=512."
+            )
+        if args.batch_size != 1:
+            parser.error(
+                f"--sft-ruler needs --batch-size 1 (got {args.batch_size}): RULER prompts differ "
+                "by thousands of tokens, so a larger batch would need padding plus an "
+                "attention_mask threaded through the gate's selector and normalizer. Use "
+                "--global-batch-size / --accum-steps to reach the batch you want."
+            )
+    if args.longce_weights:
+        # All four are configuration contradictions, so they surface before any device is touched.
+        if args.delta_weight:
+            parser.error(
+                "--longce-weights and --delta-weight are two different weightings of the same "
+                "loss; running both would multiply them into a third that neither was validated "
+                "as. Pick one."
+            )
+        if args.sft_ruler:
+            parser.error(
+                "--longce-weights and --sft-ruler are incompatible. The cache is keyed by longmino "
+                "doc_id and its weights describe full documents, whereas SFT rows are RULER "
+                "prompts; and under SFT only the 3-45 answer tokens carry gradient, which are "
+                "already the positions the objective wants. Use LongCE on the longmino stages."
+            )
+        if not args.tokenized:
+            parser.error(
+                "--longce-weights needs --tokenized: the cache is keyed by the pretokenized "
+                "corpus's doc_ids, which the on-the-fly text loader does not produce."
+            )
+        if args.take_from != "head":
+            # The cache stores one vector per document and each stage reads a PREFIX of it, which is
+            # sound only because the losses are causal. A random window is not a prefix, so its
+            # tokens would not match the digest -- caught at the first lookup, but far better
+            # rejected here with the reason than as a checksum failure 200 steps in.
+            parser.error(
+                f"--longce-weights requires --take-from head (got {args.take_from!r}). Cached "
+                "weights are per-position and each stage truncates them to a prefix; a random "
+                "window would pair position i's weight with a different token entirely."
+            )
+    if args.delta_weight and args.sft_ruler:
+        # Reported alongside the other argument-level rejections rather than after the GPU probe:
+        # this is a configuration contradiction and should surface without a device.
+        #
+        # Under SFT ~0.1% of positions carry gradient (a 13.6K-22.4K prompt against a 3-45 token
+        # answer, sft_data.py), so a step's loss is a mean over ~8 x 20 tokens. Reweighting 20
+        # positions by their dense gap is high variance and pointless: they are ALL answer tokens,
+        # i.e. all positions the objective already wants, so there is no "the average drowned the
+        # important part" problem for the weighting to fix.
+        parser.error(
+            "--delta-weight and --sft-ruler are incompatible. Delta weighting reallocates gradient "
+            "across a full sequence of losses, but SFT puts gradient on only the 3-45 answer "
+            "tokens -- reweighting those is noise, and they are all positions the objective "
+            "already wants. Use --delta-weight on the longmino stages, plain SFT afterwards."
+        )
     if not torch.cuda.is_available():
         parser.error("no CUDA device; indexer training needs a GPU")
 
@@ -611,7 +849,27 @@ def main() -> int:
     torch.manual_seed(args.seed + dp_rank)
     out_dir = Path(args.out)
 
-    if args.tokenized:
+    if args.sft_ruler:
+        # The SFT cap defaults to the schedule's longest stage, so --schedule stays the single
+        # place a run's length is stated. --sft-max-len overrides it when the cap and the stage
+        # length should differ.
+        if args.sft_max_len is None:
+            args.sft_max_len = max(seq_len for seq_len, _ in schedule.stages)
+        logger.info(
+            "RULER SFT: %s (config=%s), %d task(s) %s, max_len=%d, append_eos=%s. Loss is masked "
+            "to the gold ANSWER only -- with the backbone frozen the router's selection is the "
+            "ONLY thing that can move, so judge this run on the RULER metric, not on the loss "
+            "(~0.1%% of positions carry gradient).",
+            args.sft_ruler, args.sft_config, len(args.sft_tasks), list(args.sft_tasks),
+            args.sft_max_len, args.sft_append_eos,
+        )
+        untrained = [task for task in ALL_TASKS if task not in args.sft_tasks]
+        if untrained:
+            logger.info(
+                "held out of training (their eval scores stay a generalization claim): %s",
+                untrained,
+            )
+    elif args.tokenized:
         index = read_index(args.tokenized)
         if not index.get("complete", True):
             logger.warning(
@@ -646,12 +904,25 @@ def main() -> int:
         )
     seqs_per_step = dp_world_size * args.batch_size * args.accum_steps
     tokens = sum(sl * st for sl, st in schedule.stages) * seqs_per_step
-    logger.info(
-        "%d replica(s) x batch_size %d x accum %d = %d sequences/step; %d optimizer steps over %s "
-        "= %.0fM tokens",
-        dp_world_size, args.batch_size, args.accum_steps, seqs_per_step, total,
-        " -> ".join(f"{sl // 1024}K" for sl, _ in schedule.stages), tokens / 1e6,
-    )
+    if args.sft_ruler:
+        # The schedule's seq_len is only a CAP under SFT -- a RULER row is whatever length it is --
+        # so the usual tokens figure would be an upper bound presented as a count. Report the
+        # sequence budget instead and leave the token total to the metrics file, which sums the
+        # real lengths per step.
+        logger.info(
+            "%d replica(s) x batch_size %d x accum %d = %d sequences/step; %d optimizer steps "
+            "= %d RULER rows (seq_len from --schedule is a CAP here, not a sample shape, so the "
+            "token total is only known per step -- see sft_target_tokens in --metrics-file)",
+            dp_world_size, args.batch_size, args.accum_steps, seqs_per_step, total,
+            total * seqs_per_step,
+        )
+    else:
+        logger.info(
+            "%d replica(s) x batch_size %d x accum %d = %d sequences/step; %d optimizer steps over "
+            "%s = %.0fM tokens",
+            dp_world_size, args.batch_size, args.accum_steps, seqs_per_step, total,
+            " -> ".join(f"{sl // 1024}K" for sl, _ in schedule.stages), tokens / 1e6,
+        )
     logger.info(
         "schedule: %s (%d steps); WSD warmup %d -> peak %.1e, stable %d, decay %d -> %.1e",
         ", ".join(f"{n}x{s}" for s, n in schedule.stages), total,
@@ -802,6 +1073,10 @@ def main() -> int:
     # Checked once, on the first real batch (see check_liger_loss_unchanged).
     liger_check_pending = bool(args.liger)
     current_len, loader, iterator = None, None, None
+    # Rebuilt at each stage boundary alongside the loader: the cache verifies a token digest taken
+    # at the stage's own seq_len, so it has to know which width the loader is drawing.
+    longce_cache = None
+    longce_missing, longce_seen = 0, 0
     window: list[float] = []
     started = time.time()
     step = 0
@@ -827,15 +1102,59 @@ def main() -> int:
                     )
                 else:
                     logger.info("step %d: starting at seq_len=%d", step, seq_len)
-                loader = loader_for(
-                    seq_len, args, tokenizer, dp_rank, dp_world_size,
-                    batch_size=args.batch_size,
-                )
-                iterator = iter(loader)
+                if args.sft_ruler:
+                    # Built once and reused across stages: RULER rows have their own natural
+                    # lengths, so seq_len is a *cap* here rather than the shape of a sample, and
+                    # rebuilding per stage would restart the same row stream from the top. The cap
+                    # itself comes from --sft-max-len, which defaults to the longest stage.
+                    if loader is None:
+                        loader = build_ruler_sft_dataloader(
+                            RulerSFTConfig(
+                                source=args.sft_ruler,
+                                config=args.sft_config,
+                                tasks=tuple(args.sft_tasks),
+                                max_len=args.sft_max_len,
+                                append_eos=args.sft_append_eos,
+                                seed=args.seed,
+                            ),
+                            tokenizer,
+                            batch_size=args.batch_size,
+                            num_workers=args.num_workers,
+                            rank=dp_rank,
+                            world_size=dp_world_size,
+                        )
+                        iterator = iter(loader)
+                else:
+                    loader = loader_for(
+                        seq_len, args, tokenizer, dp_rank, dp_world_size,
+                        batch_size=args.batch_size,
+                    )
+                    iterator = iter(loader)
+                    if args.longce_weights:
+                        # Reopened per stage because the digest to verify against is the one taken at
+                        # THIS seq_len. Constructing it here also means an unusable cache (missing,
+                        # too narrow, no digest at this width) fails at the stage boundary with a
+                        # message naming the fix, rather than at the first lookup.
+                        from kvpress.presses.gqa_indexer.longce_weights import LongCEWeightCache
+
+                        longce_cache = LongCEWeightCache(args.longce_weights, seq_len=seq_len)
+                        longce_missing, longce_seen = 0, 0
+                        if rank == 0:
+                            logger.info("LongCE weight cache: %s", longce_cache.summary())
                 current_len = seq_len
 
             optimizer.zero_grad(set_to_none=True)
             accumulated = 0.0
+            # Diagnostics from the last micro-batch's delta weighting; stays None without
+            # --delta-weight so the metrics record simply omits those keys.
+            delta_stats = None
+            # SFT only: how many positions actually carried loss this step, and over which tasks.
+            # Worth recording because it is the denominator the loss is a mean over -- at ~0.1% of
+            # positions it moves a lot between a 3-token qa_2 answer and a 35-token multivalue one,
+            # and a loss change that is really a mix change would otherwise be invisible.
+            sft_target_tokens = 0
+            sft_seq_tokens = 0
+            sft_tasks_seen: list[str] = []
             # Decided BEFORE the forward, because the diagnostic is computed inside it. Only on
             # steps that get logged, and only on the LAST micro-batch of an accumulation group:
             # it costs a second streaming pass over the keys plus an (Sq, Sk) history mask, and
@@ -854,23 +1173,113 @@ def main() -> int:
                     logger.info(
                         "step %d: corpus exhausted at seq_len=%d, restarting", step, seq_len
                     )
+                    if args.sft_ruler and rank == 0 and hasattr(loader.dataset, "format_stats"):
+                        # One full pass just finished, so the kept/dropped table is complete.
+                        # Logged HERE rather than up front because the filter runs lazily -- and
+                        # with num_workers>0 the workers own their own copies, so this reflects
+                        # only the main process's share unless num_workers=0.
+                        logger.info(
+                            "RULER SFT rows after one pass (this reader):\n%s",
+                            loader.dataset.format_stats(),
+                        )
                     iterator = iter(loader)
-                    batch = next(iterator)
+                    try:
+                        batch = next(iterator)
+                    except StopIteration:
+                        # A restart that immediately ends means the loader yields NOTHING. Under
+                        # SFT that is the expected shape of one specific mistake -- --sft-max-len
+                        # below every row's prompt+answer length, which drops the whole corpus --
+                        # and a bare StopIteration here would surface as an opaque crash from
+                        # inside the accumulation loop. See scripts/ruler_sft_scan.py for the
+                        # per-task keep table this is telling you to consult.
+                        stats = (
+                            loader.dataset.format_stats()
+                            if hasattr(loader.dataset, "format_stats") else "(no stats)"
+                        )
+                        raise RuntimeError(
+                            "the data loader yielded no samples at all"
+                            + (
+                                f", so every RULER row was filtered out: --sft-max-len "
+                                f"{args.sft_max_len} is below every row's prompt+answer length. "
+                                f"Run `python -m scripts.ruler_sft_scan --ruler {args.sft_ruler} "
+                                f"--config {args.sft_config} --sweep` and pick a cap from the keep "
+                                f"table.\n{stats}"
+                                if args.sft_ruler
+                                else ". Check --subsets and --schedule against the corpus."
+                            )
+                        ) from None
 
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
+                # None outside SFT, where the model defaults labels to input_ids (ordinary
+                # next-token prediction). Under SFT this is input_ids with the prompt set to -100,
+                # so only the gold answer's positions contribute.
+                labels = (
+                    batch["labels"].to(device, non_blocking=True) if "labels" in batch else None
+                )
+                if args.sft_ruler:
+                    sft_target_tokens += int(batch["n_target"].sum())
+                    sft_seq_tokens += int(input_ids.numel())
+                    sft_tasks_seen.extend(batch["tasks"])
                 if liger_check_pending:
                     # On the first real batch, before any optimizer step: prove the fused kernel
                     # is numerically equivalent. Done here rather than on random ids so the check
                     # runs at the shape and dtype the run actually uses.
-                    check_liger_loss_unchanged(model, trainer, input_ids)
+                    check_liger_loss_unchanged(model, trainer, input_ids, labels=labels)
                     liger_check_pending = False
-                # skip_logits must be explicit: liger's default gates on self.training, and
-                # this backbone stays in eval() to keep dropout off, so the default would
-                # silently fall back to materializing the logits.
-                loss = e2e_indexer_training_step(
-                    model, trainer, input_ids=input_ids,
-                    skip_logits=True if args.liger else None,
-                )
+                if args.delta_weight:
+                    # Delta-weighted objective: put the router's gradient where routing can
+                    # actually change the loss. Liger is not consulted -- this path calls the base
+                    # model and applies lm_head in chunks itself, so the fused-CE kernel is not on
+                    # it either way.
+                    loss, delta_stats = e2e_indexer_delta_weighted_step(
+                        model, trainer, input_ids=input_ids, labels=labels,
+                        lam=args.delta_lambda, logit_chunk=args.delta_logit_chunk,
+                    )
+                elif longce_cache is not None:
+                    # LongCE: weights come from the cache, so there is no second forward pass. The
+                    # lookup verifies a token digest per document and raises on a mismatch -- see
+                    # LongCEWeightCache.lookup for why that has to be fatal rather than a warning.
+                    batch_weights = []
+                    for row, doc_id in enumerate(batch["doc_ids"]):
+                        longce_seen += 1
+                        if doc_id in longce_cache:
+                            batch_weights.append(
+                                torch.from_numpy(
+                                    longce_cache.lookup(doc_id, input_ids[row])
+                                )
+                            )
+                        elif args.longce_require_all:
+                            raise RuntimeError(
+                                f"no cached LongCE weights for doc {doc_id}, and "
+                                "--longce-require-all was passed. Extend the cache with "
+                                "scripts/precompute_longce_weights.py, or drop the flag to let "
+                                "uncached documents fall back to weight 1."
+                            )
+                        else:
+                            # 1.0 is this weighting's neutral value, so an uncached document
+                            # contributes exactly as it would under the plain mean. Counted and
+                            # reported as longce_cache_miss_frac rather than silently tolerated:
+                            # a high miss rate means the run is mostly the plain objective.
+                            longce_missing += 1
+                            batch_weights.append(
+                                torch.ones(input_ids.shape[1] - 1, dtype=torch.float32)
+                            )
+                    loss, delta_stats = e2e_indexer_longce_step(
+                        model, trainer, input_ids=input_ids, labels=labels,
+                        weights=torch.stack(batch_weights).to(device, non_blocking=True),
+                        logit_chunk=args.delta_logit_chunk,
+                    )
+                    delta_stats["longce_cache_miss_frac"] = (
+                        longce_missing / longce_seen if longce_seen else 0.0
+                    )
+                else:
+                    # skip_logits must be explicit: liger's default gates on self.training, and
+                    # this backbone stays in eval() to keep dropout off, so the default would
+                    # silently fall back to materializing the logits.
+                    loss = e2e_indexer_training_step(
+                        model, trainer, input_ids=input_ids, labels=labels,
+                        skip_logits=True if args.liger else None,
+                    )
                 (loss / args.accum_steps).backward()
                 accumulated += float(loss) / args.accum_steps
 
@@ -904,21 +1313,37 @@ def main() -> int:
                 gate_sparsity = trainer.mean_gate_sparsity()
                 history_attention_mass = trainer.mean_history_attention_mass()
                 peak = torch.cuda.max_memory_allocated() / 1024**3
-                logger.info(
-                    "step %4d/%d L=%-6d lm_loss %.4f (avg %.4f) |g| %.3f lr %.2e "
-                    "gate %.4f sparsity %s history_mass %s peak %.1f GiB %.1f s/step",
-                    step, args.total_steps, seq_len, accumulated,
-                    sum(window) / len(window), float(grad_norm),
-                    lr_schedule.get_last_lr()[0],
-                    gate_scale if gate_scale is not None else float("nan"),
-                    # Fraction of each row's history the gate effectively spreads over. 1.00 is a
-                    # flat gate (no selectivity learned, whatever gate_scale says); falling
-                    # towards 0 is the router concentrating, which is what eviction needs.
-                    f"{gate_sparsity:.3f}" if gate_sparsity is not None else "off",
-                    f"{history_attention_mass:.3f}"
-                    if history_attention_mass is not None else "off",
-                    peak, (time.time() - started) / (step - start_step + 1),
-                )
+                if args.sft_ruler:
+                    # A separate line rather than more columns on the shared one: the SFT loss is
+                    # a mean over ~1e-3 of the positions, so "loss" here means something different
+                    # enough that reporting its denominator alongside it is the point.
+                    logger.info(
+                        "step %4d/%d SFT answer_loss %.4f (avg %.4f) |g| %.3f lr %.2e "
+                        "gate %.4f sup_tokens %d/%d (%.3f%%) tasks %s peak %.1f GiB %.1f s/step",
+                        step, args.total_steps, accumulated, sum(window) / len(window),
+                        float(grad_norm), lr_schedule.get_last_lr()[0],
+                        gate_scale if gate_scale is not None else float("nan"),
+                        sft_target_tokens, sft_seq_tokens,
+                        100 * sft_target_tokens / max(sft_seq_tokens, 1),
+                        ",".join(sorted(set(sft_tasks_seen))),
+                        peak, (time.time() - started) / (step - start_step + 1),
+                    )
+                else:
+                    logger.info(
+                        "step %4d/%d L=%-6d lm_loss %.4f (avg %.4f) |g| %.3f lr %.2e "
+                        "gate %.4f sparsity %s history_mass %s peak %.1f GiB %.1f s/step",
+                        step, args.total_steps, seq_len, accumulated,
+                        sum(window) / len(window), float(grad_norm),
+                        lr_schedule.get_last_lr()[0],
+                        gate_scale if gate_scale is not None else float("nan"),
+                        # Fraction of each row's history the gate effectively spreads over. 1.00 is
+                        # a flat gate (no selectivity learned, whatever gate_scale says); falling
+                        # towards 0 is the router concentrating, which is what eviction needs.
+                        f"{gate_sparsity:.3f}" if gate_sparsity is not None else "off",
+                        f"{history_attention_mass:.3f}"
+                        if history_attention_mass is not None else "off",
+                        peak, (time.time() - started) / (step - start_step + 1),
+                    )
                 if metrics_handle:
                     metrics_handle.write(
                         json.dumps(
@@ -958,13 +1383,47 @@ def main() -> int:
                                 "pin_mode": trainer.gate_pin_mode,
                                 "gate_budget": trainer.gate_budget,
                                 "gate_budget_ratio": trainer.gate_budget_ratio,
+                                # Delta-weighting diagnostics (null unless --delta-weight).
+                                # delta_positive_frac is THE readout: near zero means the dense
+                                # and sparse passes agree everywhere, so every weight falls back
+                                # to lambda and the objective is the ordinary mean with a second
+                                # forward pass paid for nothing. weight_participation ~1.0 means
+                                # the same thing from the weights' side.
+                                # Weighted-objective diagnostics (absent unless --delta-weight or
+                                # --longce-weights). `weight_participation` is THE readout for
+                                # both: the effective fraction of positions carrying the objective.
+                                # The failed delta arm sat at 0.13-0.18, meaning it trained only the
+                                # high-loss tail; LongCE measured 0.66-0.87 offline. ~1.0 means the
+                                # weighting is doing nothing whatever the loss says. Emitted by
+                                # whichever keys the active objective produced rather than a fixed
+                                # list, so neither path has to carry the other's fields.
+                                **({} if delta_stats is None else {
+                                    **{
+                                        key: value
+                                        for key, value in delta_stats.items()
+                                        if key != "n_weighted"
+                                    },
+                                    **(
+                                        {"delta_lambda": args.delta_lambda}
+                                        if args.delta_weight
+                                        else {}
+                                    ),
+                                }),
                                 "peak_gib": peak,
                                 "batch_size": args.batch_size,
                                 "accum_steps": args.accum_steps,
                                 # Sequences x seq_len actually consumed by this optimizer step.
                                 # Includes accum: the whole point of --global-batch-size is that
                                 # this figure does not move with --ffn-sp-size.
-                                "tokens": seqs_per_step * seq_len,
+                                # Under SFT the rows have their own natural lengths, so the real
+                                # token count is summed from the batches instead of assumed.
+                                "tokens": sft_seq_tokens if args.sft_ruler
+                                else seqs_per_step * seq_len,
+                                # SFT only. `loss` above is a mean over sft_target_tokens
+                                # positions, not over `tokens` -- so a loss move that is really a
+                                # task-mix move is only visible with these alongside it.
+                                "sft_target_tokens": sft_target_tokens if args.sft_ruler else None,
+                                "sft_tasks": sorted(set(sft_tasks_seen)) if args.sft_ruler else None,
                             }
                         )
                         + "\n"

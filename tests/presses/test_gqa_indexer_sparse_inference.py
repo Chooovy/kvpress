@@ -114,6 +114,48 @@ def test_dma_prefill_and_decode_use_value_states():
 
 
 @torch.no_grad()
+def test_prefix_scorer_decodes_with_a_cached_prefix():
+    """The prefix arm decodes, and its cache stays in lockstep with the model's KV.
+
+    The prefix readout is a function of the key's whole prefix, so ``score_keys`` refuses a
+    suffix outright: without the indexer caching its own K/V, a decode step could not be scored
+    at all. This is the test that the context enables that cache, advances it by exactly one key
+    per step, and tears it down on exit -- a leak would silently score the next generation
+    against the previous one's prefix.
+    """
+    model = _tiny_model()
+    press = GQAIndexerPress(
+        compression_ratio=0.0,
+        scorer="prefix",
+        scalar_mid_dim=16,
+        prefix_head_dim=8,
+        prefix_value_dim=8,
+        prefix_zero_init=False,
+    )
+    press.post_init_from_model(model)
+    ids = torch.randint(0, model.config.vocab_size, (1, 20))
+
+    with SparseAttentionContext(
+        model, press, topk=8, force_sink=2, force_local=2, query_independent=False
+    ):
+        indexer = press.get_indexer(model.model.layers[0].self_attn)
+        assert indexer.cached_length == 0
+
+        out = model(input_ids=ids, use_cache=True)
+        cache = out.past_key_values
+        assert indexer.cached_length == 20
+
+        next_id = out.logits[:, -1:].argmax(-1)
+        for expected in (21, 22):
+            out = model(input_ids=next_id, past_key_values=cache, use_cache=True)
+            assert indexer.cached_length == expected == cache.get_seq_length()
+            next_id = out.logits[:, -1:].argmax(-1)
+        assert torch.isfinite(out.logits).all()
+
+    assert press.get_indexer(model.model.layers[0].self_attn).cached_length == 0
+
+
+@torch.no_grad()
 def test_small_topk_runs_and_differs_from_dense():
     """A genuinely sparse budget produces finite output that differs from full attention."""
     model = _tiny_model()

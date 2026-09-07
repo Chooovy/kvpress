@@ -74,10 +74,13 @@ import torch
 from torch import nn
 
 from kvpress.presses.gqa_indexer.gate_pin import (
+    DEFAULT_N_LOCAL,
+    local_width,
     check_pin_mode,
     history_lse,
     pinned_mask,
-    pins_self,
+    pins_local,
+    pins_sink,
 )
 from kvpress.presses.gqa_indexer.triton_fused_loss import HAS_TRITON
 from kvpress.presses.gqa_indexer.delta_loss import DEFAULT_LOGIT_CHUNK
@@ -113,22 +116,100 @@ def _sink_history_attention_mass(
         if group_size > 1:
             sink_key = sink_key.repeat_interleave(group_size, dim=1)
         scale = q.shape[-1] ** -0.5 if scaling is None else float(scaling)
-        sink_logits = torch.einsum(
-            "bhqd,bhsd->bhqs", q.float(), sink_key.float()
-        ) * scale
+        sink_logits = torch.einsum("bhqd,bhsd->bhqs", q.float(), sink_key.float()) * scale
 
         q_pos = torch.arange(q_len, device=q.device) + query_offset
         sink_pos = torch.arange(sink_count, device=q.device)
         visible_sink = sink_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
-        sink_mass = torch.where(
-            visible_sink, torch.exp(sink_logits - row_lse.unsqueeze(-1)), 0.0
-        ).sum(-1)
+        sink_mass = torch.where(visible_sink, torch.exp(sink_logits - row_lse.unsqueeze(-1)), 0.0).sum(-1)
 
         visible_keys = (q_pos + 1).clamp(max=k_len)
         valid = visible_keys > visible_sink.sum(-1)
         if not bool(valid.any()):
             return None
         return float((1.0 - sink_mass)[..., valid].mean())
+
+
+def _pinned_attention_mass(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    row_lse: torch.Tensor,
+    *,
+    scaling: float | None,
+    n_sink: int,
+    n_local: int = 0,
+    query_offset: int | None = None,
+    chunk: int = 512,
+) -> float | None:
+    """
+    Mean attention probability on **non-pinned** history, without materializing ``(Sq, Sk)``.
+
+    Uses the softmax identity: ``row_lse`` already normalizes the whole row, so the non-pinned
+    mass is ``1 - sum_{pinned} exp(logit - row_lse)``. Only the pinned pairs are scored, which is
+    ``O(Sq * (n_sink + n_local))`` rather than ``O(Sq * Sk)`` -- at 8K that is 1M elements per
+    head against 67M.
+
+    The local window is chunked over queries. Gathering it directly would build a
+    ``(B, H, Sq, w, D)`` tensor (137 GiB at 8K, w=128, D=128); a query chunk instead needs only
+    the ``C + w`` keys its window can reach, so each block is ~42 MiB at ``chunk=512``.
+
+    **Sink and window overlap** for the first ``n_sink + n_local`` queries, so window keys below
+    ``n_sink`` are excluded -- double-counting them would report a mass above 1 and make the
+    metric read as if the router had negative influence.
+
+    Diagnostic only: runs under ``no_grad`` and touches no training tensor.
+    """
+    q_len, k_len = q.shape[2], k.shape[2]
+    if query_offset is None:
+        query_offset = k_len - q_len
+    n_sink = max(0, min(n_sink, k_len))
+    n_local = max(0, n_local)
+    if n_sink == 0 and n_local == 0:
+        return None
+    scale = q.shape[-1] ** -0.5 if scaling is None else float(scaling)
+
+    with torch.no_grad():
+        group_size = q.shape[1] // k.shape[1]
+        kv = k.repeat_interleave(group_size, dim=1) if group_size > 1 else k
+        q_pos = torch.arange(q_len, device=q.device) + query_offset
+        pinned_mass = torch.zeros(q.shape[:3], device=q.device, dtype=torch.float32)
+
+        if n_sink > 0:
+            logits = torch.einsum("bhqd,bhsd->bhqs", q.float(), kv[:, :, :n_sink].float()) * scale
+            sink_pos = torch.arange(n_sink, device=q.device).unsqueeze(0)
+            visible = sink_pos <= q_pos.unsqueeze(1)
+            pinned_mass += torch.where(
+                visible, torch.exp(logits - row_lse.unsqueeze(-1)), 0.0
+            ).sum(-1)
+
+        if n_local > 0:
+            for start in range(0, q_len, chunk):
+                stop = min(start + chunk, q_len)
+                qp = q_pos[start:stop]
+                lo = max(0, int(qp[0]) - n_local + 1)
+                hi = min(k_len, int(qp[-1]) + 1)
+                if hi <= lo:
+                    continue
+                logits = torch.einsum(
+                    "bhqd,bhkd->bhqk", q[:, :, start:stop].float(), kv[:, :, lo:hi].float()
+                ) * scale
+                k_pos = torch.arange(lo, hi, device=q.device).unsqueeze(0)
+                age = qp.unsqueeze(1) - k_pos
+                keep = (age >= 0) & (age < n_local) & (k_pos >= n_sink)
+                pinned_mass[:, :, start:stop] += torch.where(
+                    keep, torch.exp(logits - row_lse[:, :, start:stop].unsqueeze(-1)), 0.0
+                ).sum(-1)
+
+        # A row whose visible keys are ALL pinned has no history to report on; counting it would
+        # drag the mean toward 0 for a reason that is arithmetic rather than about the router.
+        visible_keys = (q_pos + 1).clamp(max=k_len)
+        n_sink_vis = torch.clamp(q_pos + 1, max=n_sink)
+        window_lo = torch.clamp(q_pos - n_local + 1, min=n_sink)
+        n_local_vis = (q_pos - window_lo + 1).clamp(min=0) if n_local > 0 else torch.zeros_like(q_pos)
+        valid = visible_keys > (n_sink_vis + n_local_vis)
+        if not bool(valid.any()):
+            return None
+        return float((1.0 - pinned_mass)[..., valid].mean())
 
 
 @dataclass
@@ -205,9 +286,27 @@ class E2EIndexerTrainer:
     # sparse -- so `stage="sparse"` needs no second flag to say what the scope already implies.
     pin_mode: str | None = None
     n_sink: int | None = None
+    #: Width of the always-attended causal window for the ``local`` pin modes, in tokens.
+    #: Keys inside it are read at gate 0 AND held out of the normalizer, so the router never
+    #: spends budget on a neighbour and only ranks what lies beyond the window -- the same
+    #: division of labour ``force_local`` already assumes at inference. Ignored by every other
+    #: mode; ``self`` is fixed at width 1.
+    n_local: int = DEFAULT_N_LOCAL
     gate_budget: float = 1.0
     gate_budget_ratio: float | None = None
     key_tile: int = 1024
+
+    #: C1/C2 split point, in absolute key positions. ``None`` gates the whole sequence, which is
+    #: the default objective. When set, keys ``>= split`` (the C2 suffix) are pinned out of the
+    #: gate, so only the C1 prefix is under eviction pressure while C2 is read densely.
+    #:
+    #: This changes WHICH decision the LM loss supervises. With no split, most of a position's
+    #: loss is explained by its immediate neighbours -- but at inference those neighbours are
+    #: kept for free by ``force_local``, so that gradient trains a decision the router never has
+    #: to make. Under a split, every C2 query is at least ``|C2|`` tokens from every C1 key, so
+    #: no C1 key can be saved by a local window and its retention is decided by the router
+    #: alone. See :mod:`~kvpress.presses.gqa_indexer.split_loss`.
+    split: int | None = None
 
     freeze: bool = True
 
@@ -261,7 +360,7 @@ class E2EIndexerTrainer:
                 "the frozen dense model and lets the router satisfy the loss without learning any "
                 "ranking. This is the ablation baseline; use pin_mode='self' (or 'sink') to train."
             )
-        if pins_self(self.gate_pin_mode) and not HAS_TRITON:
+        if pins_local(self.gate_pin_mode) and not HAS_TRITON:
             # Only a problem without the kernel: a query-dependent pin cannot fold into the
             # concatenated QK, so the fallback builds the logits explicitly and no tile knob
             # reduces that. Said at construction rather than left to an OOM traceback.
@@ -381,7 +480,8 @@ class E2EIndexerTrainer:
                 "upcast %d gate_scale scalar(s) to fp32 (value %.6f): at bf16's ~3.0e-4 spacing "
                 "there, a warmup learning rate rounds every step back and the gate would stay "
                 "frozen at initialization.",
-                converted, values[0],
+                converted,
+                values[0],
             )
         indexer_params = {id(p) for p in self.indexer_parameters(model)}
         if not indexer_params:
@@ -402,6 +502,7 @@ class E2EIndexerTrainer:
         kwargs: dict,
         *,
         value_states: torch.Tensor | None = None,
+        query_offset: int = 0,
     ) -> tuple:
         """
         The indexer's ``(q_idx, k_idx)`` for this layer, with gradients.
@@ -409,18 +510,39 @@ class E2EIndexerTrainer:
         Hidden-state scorers use the same ``hidden_states`` and RoPE tables as the layer. A
         value-based scorer receives the layer's actual post-projection ``value_states``. In both
         cases this is exactly the input the press uses at inference.
+
+        ``query_offset`` is the absolute position of query row 0. It only matters to a scorer
+        whose query side carries position -- the scalar arm with ``decay=True`` -- and is passed
+        through :meth:`~.scalar_indexer.ScalarIndexer.project_q` only when that scorer accepts
+        it, so the other scorers keep their existing two-argument call.
         """
         indexer = self.press.get_indexer(module)
         cos, sin = self.press.get_rope_tables(indexer, kwargs)
+        q_kwargs = {}
+        if getattr(indexer, "decay", False):
+            q_kwargs["query_offset"] = query_offset
+            q_kwargs["n_kv_heads"] = self._n_kv_heads(module, indexer)
         return (
-            indexer.project_q(hidden_states, cos, sin),
+            indexer.project_q(hidden_states, cos, sin, **q_kwargs),
             indexer.project_k(hidden_states, cos, sin, value_states=value_states),
             indexer.require_gate_scale(),
         )
 
-    def select_support(
-        self, q_idx: torch.Tensor, k_idx: torch.Tensor, k_len: int, attention_mask
-    ) -> torch.Tensor:
+    @staticmethod
+    def _n_kv_heads(module: nn.Module, indexer) -> int:
+        """The layer's KV head count, for routing each head to its own score column.
+
+        ``project_q`` defaults this to the indexer's own ``n_heads``, which is right for the
+        per-head configuration but silently wrong for the ``n_heads=1`` shared-score ablation --
+        there the gate needs one selector row per *model* KV head, not one in total.
+        """
+        config = getattr(module, "config", None)
+        n_kv = getattr(config, "num_key_value_heads", None) if config is not None else None
+        if n_kv is None:
+            n_kv = getattr(module, "num_key_value_heads", None)
+        return int(n_kv) if n_kv else int(indexer.n_heads)
+
+    def select_support(self, q_idx: torch.Tensor, k_idx: torch.Tensor, k_len: int, attention_mask) -> torch.Tensor:
         """
         The sparse stage's per-row top-k support, ``(B, Hkv, Sq, topk)``.
 
@@ -436,9 +558,7 @@ class E2EIndexerTrainer:
         if attention_mask is not None:
             from kvpress.presses.gqa_indexer.indexer import build_indexer_mask
 
-            mask = build_indexer_mask(
-                q_idx.shape[2], k_len, q_idx.device, attention_mask=attention_mask
-            )
+            mask = build_indexer_mask(q_idx.shape[2], k_len, q_idx.device, attention_mask=attention_mask)
         support, _ = streaming_topk_support(
             q_idx,
             k_idx,
@@ -484,7 +604,15 @@ class E2EIndexerTrainer:
         kwargs = self._kwargs.pop(layer_idx, {})
 
         q_idx, k_idx, gate_scale = self.indexer_qk(
-            module, hidden_states, kwargs, value_states=value
+            module,
+            hidden_states,
+            kwargs,
+            value_states=value,
+            # Bottom-right alignment, the same convention gated_attention derives internally for
+            # causality. Equals 0 for the full-sequence training forward, but deriving it rather
+            # than hard-coding 0 keeps the decay correct if a partial-sequence forward is ever
+            # added here.
+            query_offset=key.shape[2] - query.shape[2],
         )
         self.gate_scales[layer_idx] = float(gate_scale.detach())
         self.layers_gated += 1
@@ -505,8 +633,12 @@ class E2EIndexerTrainer:
                     attention_mask,
                 )
 
+        # history_attention_mass scores only the sink keys and infers the rest from the row
+        # normalizer, which assumes history = "everything past the sink". A split pins the C2
+        # tail out of history too, so that inference no longer holds and the metric is skipped
+        # rather than reported wrong.
         measure_history_mass = (
-            self.measure_sparsity and self.scope == "full" and self.gate_pin_mode == "sink"
+            self.measure_sparsity and self.scope == "full" and pins_sink(self.gate_pin_mode) and self.split is None
         )
         attention = gated_attention(
             query,
@@ -526,14 +658,14 @@ class E2EIndexerTrainer:
             dropout_p=dropout if self.scope == "full" else 0.0,
             pin_mode="none" if self.scope == "sparse" else self.gate_pin_mode,
             n_sink=self.sink_count,
+            n_local=self.n_local,
+            pin_from=None if self.scope == "sparse" else self.split,
             key_tile=self.key_tile,
             return_row_lse=measure_history_mass,
         )
         if measure_history_mass:
             out, row_lse = attention
-            self.history_attention_mass[layer_idx] = self._history_attention_mass(
-                query, key, row_lse, scaling
-            )
+            self.history_attention_mass[layer_idx] = self._history_attention_mass(query, key, row_lse, scaling)
         else:
             out = attention
         # The attention interface contract is (B, Sq, H, D) -- the layer reshapes to
@@ -585,12 +717,8 @@ class E2EIndexerTrainer:
 
         impl_name = "kvpress_gqa_indexer_gated"
 
-        def gated_attention_impl(
-            module, query, key, value, attention_mask, scaling=None, dropout=0.0, **_
-        ):
-            return self.gated_forward(
-                module, query, key, value, attention_mask, scaling, dropout
-            ), None
+        def gated_attention_impl(module, query, key, value, attention_mask, scaling=None, dropout=0.0, **_):
+            return self.gated_forward(module, query, key, value, attention_mask, scaling, dropout), None
 
         configs = [model.config]
         text_config = getattr(model.config, "text_config", None)
@@ -606,9 +734,7 @@ class E2EIndexerTrainer:
         handles = []
         try:
             for layer in get_language_model(model).layers:
-                handles.append(
-                    layer.self_attn.register_forward_pre_hook(self._capture_hook, with_kwargs=True)
-                )
+                handles.append(layer.self_attn.register_forward_pre_hook(self._capture_hook, with_kwargs=True))
             for cfg in configs:
                 cfg._attn_implementation = impl_name
             yield self
@@ -624,9 +750,7 @@ class E2EIndexerTrainer:
             self._hidden_states.clear()
             self._kwargs.clear()
 
-    def _gate_participation(
-        self, q_idx, k_idx, gate_scale, k_len: int, attention_mask
-    ) -> float | None:
+    def _gate_participation(self, q_idx, k_idx, gate_scale, k_len: int, attention_mask) -> float | None:
         """
         Mean **participation ratio** of the gate, as a fraction of each row's history length.
 
@@ -660,15 +784,22 @@ class E2EIndexerTrainer:
             return None
 
         compact_causal = attention_mask is None and self.gate_pin_mode in ("none", "sink")
-        pinned = None if compact_causal else pinned_mask(
-            self.gate_pin_mode, q_idx.shape[2], k_len, q_idx.device, n_sink=self.sink_count
+        pinned = (
+            None
+            if compact_causal
+            else pinned_mask(
+                self.gate_pin_mode,
+                q_idx.shape[2],
+                k_len,
+                q_idx.device,
+                n_sink=self.sink_count,
+                n_local=self.n_local,
+            )
         )
         if pinned is None and not compact_causal:
             # pin_mode="none": every visible key is history. history_lse still needs a mask
             # tensor, so build the all-false one it expects.
-            pinned = torch.zeros(
-                (q_idx.shape[2], k_len), dtype=torch.bool, device=q_idx.device
-            )
+            pinned = torch.zeros((q_idx.shape[2], k_len), dtype=torch.bool, device=q_idx.device)
 
         # no_grad throughout: this is a diagnostic. Leaving it in the graph would retain the
         # streaming kernel's backward state for a term the objective never uses.
@@ -677,19 +808,16 @@ class E2EIndexerTrainer:
             if attention_mask is not None:
                 from kvpress.presses.gqa_indexer.indexer import build_indexer_mask
 
-                causal_keep = build_indexer_mask(
-                    q_idx.shape[2], k_len, q_idx.device, attention_mask=attention_mask
-                ) == 0
+                causal_keep = (
+                    build_indexer_mask(q_idx.shape[2], k_len, q_idx.device, attention_mask=attention_mask) == 0
+                )
             common = dict(
                 pinned=pinned,
                 causal_keep=causal_keep,
                 key_tile=self.key_tile,
-                n_sink=(self.sink_count if self.gate_pin_mode == "sink" else 0)
-                if compact_causal else None,
+                n_sink=(self.sink_count if self.gate_pin_mode == "sink" else 0) if compact_causal else None,
             )
-            lse, history_len = history_lse(
-                q_idx, k_idx, gate_scale=gate_scale, return_history_count=True, **common
-            )
+            lse, history_len = history_lse(q_idx, k_idx, gate_scale=gate_scale, return_history_count=True, **common)
             lse2 = history_lse(q_idx, k_idx, gate_scale=2.0 * gate_scale, **common)
 
             # sum p^2 = exp(lse2 - 2*lse), so PR = exp(2*lse - lse2).
@@ -712,11 +840,22 @@ class E2EIndexerTrainer:
         row_lse: torch.Tensor | None,
         scaling: float | None,
     ) -> float | None:
-        """Actual non-pinned attention mass for the fused, sink-pinned full-scope path."""
-        if row_lse is None or self.gate_pin_mode != "sink":
+        """Actual non-pinned attention mass for the fused full-scope path.
+
+        THE readout for whether the budget leaves the router any influence: under a fixed
+        ``gate_budget`` the pinned set takes ``|pinned| : B`` of the mass, so widening the pin
+        (``sink`` -> ``local+sink`` moves 4 -> 132) silently shrinks the router's share. That is
+        invisible in ``gate_sparsity``, which is measured *within* history.
+        """
+        if row_lse is None or not pins_sink(self.gate_pin_mode):
             return None
-        return _sink_history_attention_mass(
-            q, k, row_lse, scaling=scaling, n_sink=self.sink_count
+        return _pinned_attention_mass(
+            q,
+            k,
+            row_lse,
+            scaling=scaling,
+            n_sink=self.sink_count,
+            n_local=local_width(self.gate_pin_mode, self.n_local),
         )
 
     def mean_gate_sparsity(self) -> float | None:
@@ -866,9 +1005,7 @@ def e2e_indexer_delta_weighted_step(
     # here, every delta would be ~0 and the objective would silently become the ordinary mean.
     trainer.layers_gated = 0
     with torch.no_grad():
-        dense_hidden = _final_hidden_states(
-            model, input_ids=input_ids, attention_mask=attention_mask
-        )
+        dense_hidden = _final_hidden_states(model, input_ids=input_ids, attention_mask=attention_mask)
         dense_loss = per_token_ce(lm_head, dense_hidden, target, chunk_size=logit_chunk)
         del dense_hidden
     if trainer.layers_gated != 0:
@@ -880,9 +1017,7 @@ def e2e_indexer_delta_weighted_step(
 
     # --- gated pass: the one that carries the router's gradient ----------------------------
     with trainer.hooks(model):
-        sparse_hidden = _final_hidden_states(
-            model, input_ids=input_ids, attention_mask=attention_mask
-        )
+        sparse_hidden = _final_hidden_states(model, input_ids=input_ids, attention_mask=attention_mask)
         if trainer.layers_gated == 0:
             raise RuntimeError(
                 "no layer ran the gated attention: the model kept its own attention "
@@ -958,9 +1093,7 @@ def e2e_indexer_longce_step(
         raise RuntimeError("model exposes no output embeddings, so per-token CE cannot be formed")
 
     with trainer.hooks(model):
-        sparse_hidden = _final_hidden_states(
-            model, input_ids=input_ids, attention_mask=attention_mask
-        )
+        sparse_hidden = _final_hidden_states(model, input_ids=input_ids, attention_mask=attention_mask)
         if trainer.layers_gated == 0:
             raise RuntimeError(
                 "no layer ran the gated attention: the model kept its own attention "
@@ -984,9 +1117,7 @@ def e2e_indexer_longce_step(
         flat_scored = scored.reshape(-1).to(sparse_loss.device, dtype=torch.bool)
 
     mask = valid_mask(target)
-    loss, stats = longce_weighted_loss(
-        sparse_loss, flat_weights, mask=mask, scored=flat_scored
-    )
+    loss, stats = longce_weighted_loss(sparse_loss, flat_weights, mask=mask, scored=flat_scored)
     with torch.no_grad():
         n_valid = int(mask.sum())
         # The plain mean, so this run's curve can be read against the plain arm's 1.89 -- the

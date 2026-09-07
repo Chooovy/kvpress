@@ -89,6 +89,7 @@ from kvpress.presses.gqa_indexer.fused_trainer import (
     teacher_query_states,
 )
 from kvpress.presses.gqa_indexer.gate_pin import (
+    DEFAULT_N_LOCAL,
     PIN_MODES,
     check_pin_mode,
     gate_from_score,
@@ -122,9 +123,18 @@ from kvpress.presses.gqa_indexer.indexer import (
     slice_rope_tables,
 )
 from kvpress.presses.gqa_indexer.scalar_indexer import (
+    DEFAULT_DECAY_INIT,
+    DEFAULT_DECAY_REF,
     DEFAULT_POS_SLOPE,
     ScalarIndexer,
     ScalarIndexerConfig,
+)
+from kvpress.presses.gqa_indexer.split_loss import (
+    DEFAULT_SPLIT_FRAC,
+    e2e_indexer_split_step,
+    resolve_split,
+    split_context_loss,
+    split_labels,
 )
 from kvpress.presses.gqa_indexer.delta_loss import (
     DEFAULT_LOGIT_CHUNK,
@@ -145,6 +155,33 @@ from kvpress.presses.gqa_indexer.loss import (
     masked_log_softmax,
     masked_softmax,
     normalize_indexer_target,
+)
+from kvpress.presses.gqa_indexer.memory import (
+    DEFAULT_KERNEL_LR,
+    DEFAULT_LOG_GAMMA,
+    DEFAULT_SCALAR_EPS,
+    DEFAULT_SCALAR_LR,
+    DEFAULT_TAU,
+    MemoryConfig,
+    MemoryKernel,
+    fuse_memory,
+    memory_mass_share,
+    memory_terms,
+)
+from kvpress.presses.gqa_indexer.memory_schedule import (
+    block_horizons,
+    block_memory_states,
+    entry_block,
+    evicted_counts,
+    expand_blocks_to_rows,
+    ingestion_horizon,
+)
+from kvpress.presses.gqa_indexer.memory_trainer import (
+    IMPL_NAME as MEMORY_ATTENTION_IMPL_NAME,
+    SCHEDULES as MEMORY_SCHEDULES,
+    MemoryTrainer,
+    memory_lm_step,
+    memory_longce_step,
 )
 from kvpress.presses.gqa_indexer.press import GQAIndexerPress
 from kvpress.presses.gqa_indexer.sparse_inference import (
@@ -189,8 +226,14 @@ from kvpress.presses.gqa_indexer.train import (
     load_indexer_state_dict,
 )
 from kvpress.presses.gqa_indexer.train import (
+    MEMORY_ATTR,
+    load_memory_state_dict,
+    memory_state_dict,
+)
+from kvpress.presses.gqa_indexer.train import (
     detect_scorer,
     detect_scorer_from_keys,
+    infer_scalar_decay,
     infer_scalar_mid_dim,
     infer_prefix_dims,
     press_kwargs_from_checkpoint,
@@ -240,8 +283,39 @@ __all__ = [
     "PrefixIndexer",
     "PrefixIndexerConfig",
     "score_variance_profile",
+    "DEFAULT_DECAY_INIT",
+    "DEFAULT_DECAY_REF",
     "DEFAULT_POS_SLOPE",
+    "DEFAULT_SPLIT_FRAC",
+    "e2e_indexer_split_step",
+    "resolve_split",
+    "split_context_loss",
+    "split_labels",
     "GQAIndexerPress",
+    "MemoryConfig",
+    "MemoryKernel",
+    "MemoryTrainer",
+    "MEMORY_ATTENTION_IMPL_NAME",
+    "MEMORY_SCHEDULES",
+    "MEMORY_ATTR",
+    "DEFAULT_LOG_GAMMA",
+    "DEFAULT_SCALAR_LR",
+    "DEFAULT_SCALAR_EPS",
+    "DEFAULT_KERNEL_LR",
+    "DEFAULT_TAU",
+    "fuse_memory",
+    "memory_mass_share",
+    "memory_terms",
+    "memory_lm_step",
+    "memory_longce_step",
+    "memory_state_dict",
+    "load_memory_state_dict",
+    "block_horizons",
+    "block_memory_states",
+    "entry_block",
+    "evicted_counts",
+    "expand_blocks_to_rows",
+    "ingestion_horizon",
     "SparseAttentionContext",
     "SPARSE_ATTENTION_IMPL_NAME",
     "build_indexer_mask",
@@ -267,6 +341,7 @@ __all__ = [
     "load_indexer_state_dict",
     "detect_scorer",
     "detect_scorer_from_keys",
+    "infer_scalar_decay",
     "infer_scalar_mid_dim",
     "infer_prefix_dims",
     "press_kwargs_from_checkpoint",
@@ -299,6 +374,7 @@ __all__ = [
     "pad_value_to_width",
     "triton_gated_attention",
     "gated_kernels_available",
+    "DEFAULT_N_LOCAL",
     "PIN_MODES",
     "check_pin_mode",
     "gate_from_score",

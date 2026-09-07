@@ -107,8 +107,9 @@ from kvpress.presses.gqa_indexer.gate_pin import (
     gate_from_score,
     history_lse,
     is_query_dependent,
+    local_width,
     pinned_mask,
-    pins_self,
+    pins_local,
     pins_sink,
 )
 from kvpress.presses.gqa_indexer.sparse_attention import sparse_gqa_attention_reference
@@ -199,13 +200,9 @@ def check_gate_shapes(
 
     idx_dim = q_idx.shape[-1]
     if q_idx.shape[:3] != (bsz, n_kv_heads, q_len):
-        raise ValueError(
-            f"q_idx must be (B={bsz}, Hkv={n_kv_heads}, Sq={q_len}, Di), got {tuple(q_idx.shape)}"
-        )
+        raise ValueError(f"q_idx must be (B={bsz}, Hkv={n_kv_heads}, Sq={q_len}, Di), got {tuple(q_idx.shape)}")
     if k_idx.shape != (bsz, k_len, idx_dim):
-        raise ValueError(
-            f"k_idx must be (B={bsz}, Sk={k_len}, Di={idx_dim}), got {tuple(k_idx.shape)}"
-        )
+        raise ValueError(f"k_idx must be (B={bsz}, Sk={k_len}, Di={idx_dim}), got {tuple(k_idx.shape)}")
 
     return bsz, n_heads, n_kv_heads, n_heads // n_kv_heads, q_len, k_len, idx_dim
 
@@ -224,19 +221,29 @@ def _gate_lse(
 ) -> torch.Tensor:
     """Return the row shift for raw, fixed-budget, or row-wise ratio-budget gating."""
     if gate_budget_ratio is None and gate_budget == 0:
-        return torch.zeros(
-            q_idx.shape[:3], device=q_idx.device, dtype=accumulation_dtype(q_idx, k_idx)
-        )
+        return torch.zeros(q_idx.shape[:3], device=q_idx.device, dtype=accumulation_dtype(q_idx, k_idx))
 
     if gate_budget_ratio is None:
         return history_lse(
-            q_idx, k_idx, gate_scale=gate_scale, pinned=pinned, causal_keep=causal_keep,
-            key_tile=key_tile, n_sink=n_sink, query_offset=query_offset,
+            q_idx,
+            k_idx,
+            gate_scale=gate_scale,
+            pinned=pinned,
+            causal_keep=causal_keep,
+            key_tile=key_tile,
+            n_sink=n_sink,
+            query_offset=query_offset,
         ) - math.log(gate_budget)
 
     lse, n_history = history_lse(
-        q_idx, k_idx, gate_scale=gate_scale, pinned=pinned, causal_keep=causal_keep,
-        key_tile=key_tile, return_history_count=True, n_sink=n_sink,
+        q_idx,
+        k_idx,
+        gate_scale=gate_scale,
+        pinned=pinned,
+        causal_keep=causal_keep,
+        key_tile=key_tile,
+        return_history_count=True,
+        n_sink=n_sink,
         query_offset=query_offset,
     )
     budget = n_history.to(lse.dtype) * gate_budget_ratio
@@ -325,6 +332,8 @@ def gated_attention_reference(
     query_offset: int | None = None,
     pin_mode: str = "none",
     n_sink: int = 0,
+    n_local: int = 0,
+    pin_from: int | None = None,
     key_tile: int = 1024,
 ) -> torch.Tensor:
     """
@@ -375,19 +384,29 @@ def gated_attention_reference(
     # At least fp32 for the softmax, matching every kernel path here -- but not narrower than
     # the caller's dtype, or an fp64 reference test would measure its own rounding.
     acc = accumulation_dtype(q, k, v, q_idx, k_idx)
-    logits = torch.einsum(
-        "bhqd,bhkd->bhqk", q.to(acc), _expand_kv(k.to(acc), group_size)
-    ) * scale
+    logits = torch.einsum("bhqd,bhkd->bhqk", q.to(acc), _expand_kv(k.to(acc), group_size)) * scale
     score = torch.einsum("bhqd,bkd->bhqk", q_idx.to(acc), k_idx.to(acc)) * _as_acc(gate_scale, acc)
 
     pinned = pinned_mask(
-        pin_mode, q_len, k_len, q.device, n_sink=n_sink, query_offset=query_offset
+        pin_mode,
+        q_len,
+        k_len,
+        q.device,
+        n_sink=n_sink,
+        query_offset=query_offset,
+        pin_from=pin_from,
+        n_local=n_local,
     )
     if pinned is None:
         gate = score
     else:
         lse = _gate_lse(
-            q_idx, k_idx, gate_scale, gate_budget, gate_budget_ratio, pinned,
+            q_idx,
+            k_idx,
+            gate_scale,
+            gate_budget,
+            gate_budget_ratio,
+            pinned,
             causal_keep=_visible(mask, q_len, k_len, q.device, query_offset),
             key_tile=key_tile,
         )
@@ -452,6 +471,8 @@ def gated_attention_full(
     query_offset: int | None = None,
     pin_mode: str = "none",
     n_sink: int = 0,
+    n_local: int = 0,
+    pin_from: int | None = None,
     key_tile: int = 1024,
     block_m: int = 64,
     block_n: int = 64,
@@ -498,17 +519,37 @@ def gated_attention_full(
     if query_offset is None:
         query_offset = k_len - q_len
 
-    compact_sink = pin_mode == "sink" and mask is None
-    pinned = None if compact_sink else pinned_mask(
-        pin_mode, q_len, k_len, q.device, n_sink=n_sink, query_offset=query_offset
+    # A tail pin is query-independent, like `sink`, but the compact sink path rebuilds visibility
+    # from `n_sink` alone and has no way to express "and not the tail". So an explicit pinned mask
+    # is materialized instead, which routes the normalizer through history_mask and correctly
+    # confines the gate's budget to the prefix. O(Sq * Sk) bool -- acceptable because the fused
+    # kernel below consumes `pin_from` directly and never sees this tensor.
+    has_tail = pin_from is not None and 0 <= pin_from < k_len
+    compact_sink = pin_mode == "sink" and mask is None and not has_tail
+    pinned = (
+        None
+        if compact_sink
+        else pinned_mask(
+            pin_mode,
+            q_len,
+            k_len,
+            q.device,
+            n_sink=n_sink,
+            query_offset=query_offset,
+            pin_from=pin_from,
+            n_local=n_local,
+        )
     )
     lse = None
-    if pin_mode != "none":
+    if pin_mode != "none" or has_tail:
         lse = _gate_lse(
-            q_idx, k_idx, gate_scale, gate_budget, gate_budget_ratio, pinned,
-            causal_keep=None if compact_sink else _visible(
-                mask, q_len, k_len, q.device, query_offset
-            ),
+            q_idx,
+            k_idx,
+            gate_scale,
+            gate_budget,
+            gate_budget_ratio,
+            pinned,
+            causal_keep=None if compact_sink else _visible(mask, q_len, k_len, q.device, query_offset),
             key_tile=key_tile,
             n_sink=n_sink if compact_sink else None,
             query_offset=query_offset,
@@ -522,15 +563,18 @@ def gated_attention_full(
     if mask is None and gated_kernels_available(q, k, v, q_idx, k_idx):
         zeros_lse = lse is None
         return triton_gated_attention(
-            q, k, v, q_idx, k_idx,
-            torch.zeros(
-                (q.shape[0], k.shape[1], q_len), device=q.device, dtype=torch.float32
-            ) if zeros_lse else lse,
+            q,
+            k,
+            v,
+            q_idx,
+            k_idx,
+            torch.zeros((q.shape[0], k.shape[1], q_len), device=q.device, dtype=torch.float32) if zeros_lse else lse,
             gate_scale=_as_tensor(gate_scale, q.device),
             scaling=scale,
             query_offset=query_offset,
             n_sink=n_sink if pins_sink(pin_mode) else 0,
-            pin_self=pins_self(pin_mode),
+            n_local=local_width(pin_mode, n_local),
+            pin_from=pin_from if has_tail else -1,
             block_m=block_m,
             block_n=block_n,
             return_row_lse=return_row_lse,
@@ -538,21 +582,42 @@ def gated_attention_full(
 
     if is_query_dependent(pin_mode):
         out = gated_attention_pinned_self(
-            q, k, v, q_idx, k_idx,
-            scaling=scale, gate_scale=gate_scale, gate_budget=gate_budget,
-            gate_budget_ratio=gate_budget_ratio, mask=mask,
+            q,
+            k,
+            v,
+            q_idx,
+            k_idx,
+            scaling=scale,
+            gate_scale=gate_scale,
+            gate_budget=gate_budget,
+            gate_budget_ratio=gate_budget_ratio,
+            mask=mask,
             query_offset=query_offset,
-            pin_mode=pin_mode, n_sink=n_sink, key_tile=key_tile,
+            pin_mode=pin_mode,
+            n_sink=n_sink,
+            n_local=n_local,
+            key_tile=key_tile,
         )
         return (out, None) if return_row_lse else out
 
-    if compact_sink:
+    if pinned is not None:
+        # Query-independent by construction here (sink and/or tail), so row 0 carries the whole
+        # per-key pattern and the fold applies unchanged.
+        history = ~pinned[0]
+    elif compact_sink:
         history = torch.arange(k_len, device=q.device) >= min(n_sink, k_len)
     else:
-        history = None if pinned is None else ~pinned[0]
+        history = None
     query, key = build_concat_qk(
-        q, k, q_idx, k_idx, scale=scale, gate_scale=gate_scale, group_size=group_size,
-        lse=lse, history=history,
+        q,
+        k,
+        q_idx,
+        k_idx,
+        scale=scale,
+        gate_scale=gate_scale,
+        group_size=group_size,
+        lse=lse,
+        history=history,
     )
 
     is_causal = False
@@ -560,9 +625,7 @@ def gated_attention_full(
         if q_len == k_len and query_offset == 0:
             is_causal = True  # top-left == bottom-right here, so take SDPA's own fast path
         else:
-            mask = causal_mask_bottom_right(
-                q_len, k_len, q.device, query.dtype, query_offset
-            )
+            mask = causal_mask_bottom_right(q_len, k_len, q.device, query.dtype, query_offset)
 
     # V is widened to the concatenated query width so flash/mem-efficient stay eligible; without
     # it SDPA drops to the math backend and retains the whole attention matrix. See
@@ -600,6 +663,7 @@ def gated_attention_pinned_self(
     query_offset: int | None = None,
     pin_mode: str = "self",
     n_sink: int = 0,
+    n_local: int = 0,
     key_tile: int = 1024,
 ) -> torch.Tensor:
     """
@@ -631,25 +695,27 @@ def gated_attention_pinned_self(
     acc = accumulation_dtype(q, k, v, q_idx, k_idx)
 
     pinned = pinned_mask(
-        pin_mode, q_len, k_len, q.device, n_sink=n_sink, query_offset=query_offset
+        pin_mode,
+        q_len,
+        k_len,
+        q.device,
+        n_sink=n_sink,
+        query_offset=query_offset,
+        n_local=n_local,
     )
     if pinned is None:
         raise ValueError(f"gated_attention_pinned_self needs a pinning mode, got {pin_mode!r}")
 
     visible = _visible(mask, q_len, k_len, q.device, query_offset)
     if visible is None:
-        visible = causal_mask_bottom_right(
-            q_len, k_len, q.device, torch.float32, query_offset
-        )[0, 0] == 0
-    lse = _gate_lse(
-        q_idx, k_idx, gate_scale, gate_budget, gate_budget_ratio, pinned, visible, key_tile
-    )
+        visible = causal_mask_bottom_right(q_len, k_len, q.device, torch.float32, query_offset)[0, 0] == 0
+    lse = _gate_lse(q_idx, k_idx, gate_scale, gate_budget, gate_budget_ratio, pinned, visible, key_tile)
     score = torch.einsum("bhqd,bkd->bhqk", q_idx.to(acc), k_idx.to(acc)) * _as_acc(gate_scale, acc)
     gate = gate_from_score(score, lse, pinned)
 
-    logits = torch.einsum(
-        "bhqd,bhkd->bhqk", q.to(acc), _expand_kv(k.to(acc), group_size)
-    ) * scale + _expand_kv(gate, group_size)
+    logits = torch.einsum("bhqd,bhkd->bhqk", q.to(acc), _expand_kv(k.to(acc), group_size)) * scale + _expand_kv(
+        gate, group_size
+    )
     logits = logits.masked_fill(~visible, -float("inf"))
     if mask is not None and mask.dtype != torch.bool:
         # `visible` already folded in which pairs are allowed; anything else the mask carries
@@ -690,9 +756,7 @@ def gated_attention_sparse(
     """
     _, _, _, group_size, _, k_len, _ = check_gate_shapes(q, k, v, q_idx, k_idx)
     scale = q.shape[-1] ** -0.5 if scaling is None else float(scaling)
-    query, key = build_concat_qk(
-        q, k, q_idx, k_idx, scale=scale, gate_scale=gate_scale, group_size=group_size
-    )
+    query, key = build_concat_qk(q, k, q_idx, k_idx, scale=scale, gate_scale=gate_scale, group_size=group_size)
     out, _ = sparse_gqa_attention_reference(
         query,
         key,
@@ -723,6 +787,8 @@ def gated_attention(
     dropout_p: float = 0.0,
     pin_mode: str = "none",
     n_sink: int = 0,
+    n_local: int = 0,
+    pin_from: int | None = None,
     key_tile: int = 1024,
     return_row_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
@@ -752,10 +818,23 @@ def gated_attention(
                 "scope='sparse' to restrict the gate to a support"
             )
         return gated_attention_full(
-            q, k, v, q_idx, k_idx,
-            scaling=scaling, gate_scale=gate_scale, gate_budget=gate_budget,
-            gate_budget_ratio=gate_budget_ratio, mask=mask, dropout_p=dropout_p,
-            query_offset=query_offset, pin_mode=pin_mode, n_sink=n_sink, key_tile=key_tile,
+            q,
+            k,
+            v,
+            q_idx,
+            k_idx,
+            scaling=scaling,
+            gate_scale=gate_scale,
+            gate_budget=gate_budget,
+            gate_budget_ratio=gate_budget_ratio,
+            mask=mask,
+            dropout_p=dropout_p,
+            query_offset=query_offset,
+            pin_mode=pin_mode,
+            n_sink=n_sink,
+            n_local=n_local,
+            pin_from=pin_from,
+            key_tile=key_tile,
             return_row_lse=return_row_lse,
         )
 
@@ -776,9 +855,22 @@ def gated_attention(
             "attention and there is no no-op to pin against. Use pin_mode='none' here, and pin "
             "in the full-scope stage."
         )
+    if pin_from is not None:
+        raise ValueError(
+            "pin_from is a full-scope quantity: it splits the key axis into a gated prefix and "
+            "an ungated suffix, and under scope='sparse' the suffix is whatever the top-k "
+            "happened to select. Use scope='full' for the C1/C2 objective."
+        )
     out = gated_attention_sparse(
-        q, k, v, q_idx, k_idx, indices,
-        scaling=scaling, gate_scale=gate_scale, query_offset=query_offset,
+        q,
+        k,
+        v,
+        q_idx,
+        k_idx,
+        indices,
+        scaling=scaling,
+        gate_scale=gate_scale,
+        query_offset=query_offset,
     )
     return (out, None) if return_row_lse else out
 

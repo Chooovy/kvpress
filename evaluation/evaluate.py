@@ -66,6 +66,13 @@ class EvaluationConfig:
     max_context_length: Optional[int] = None
     query_aware: bool = False
     needle_depth: Optional[int] = None
+    # Qwen3-style thinking mode. False (the pipeline's own default) makes the chat template emit a
+    # PRE-CLOSED, empty "<think>\n\n</think>" before the answer, which suppresses the reasoning
+    # block; True leaves the turn open so the model opens <think> itself. Not a cosmetic switch on
+    # the math benchmarks -- non-thinking Qwen3-8B scored 0.167 on aime25 here, and thinking traces
+    # are several times longer, so max_new_tokens has to be raised with it or the trace is truncated
+    # before it ever reaches \boxed{}.
+    enable_thinking: bool = False
 
     # Decoding parameters
     compression_interval: Optional[int] = None
@@ -75,6 +82,23 @@ class EvaluationConfig:
     # Output and logging
     output_dir: str = "./results"
     log_level: str = "INFO"
+
+    # Data-parallel sharding, mirroring evaluate_sparse.py. num_shards > 1 makes this process
+    # evaluate only its slice of the contexts and write a parquet shard *without* scoring: a
+    # per-shard metric is a per-task mean over an arbitrary subset of rows and is not comparable to
+    # anything. Use evaluate_sharded.py, which launches the shards and scores their union once.
+    shard_index: int = 0
+    num_shards: int = 1
+    # Sharding axis, mirroring evaluate_sparse.py. "context" is the default and right for every
+    # benchmark with long shared contexts. "row" exists for the reasoning benchmarks: math500 and
+    # aime25 put the whole problem in `question` and leave `context` a single space, so ALL rows
+    # share ONE context and the round-robin over contexts hands every row to shard 0 while the other
+    # GPUs idle. There is no prefill to share at 4 tokens, so splitting by row costs nothing there.
+    shard_by: str = "context"
+    # Set by evaluate_sharded.py so every shard writes into the one directory the driver chose.
+    # get_results_dir uniquifies by appending a counter when the directory exists, so N shards each
+    # calling it would race and land in N different directories.
+    results_dir: Optional[str] = None
 
     # Model-specific parameters
     model_kwargs: Optional[Dict[str, Any]] = None
@@ -126,6 +150,15 @@ class EvaluationConfig:
             assert self.needle_depth is not None, "needle_depth must be set for needle_in_haystack"
             assert self.max_context_length is not None, "max_context_length must be set for needle_in_haystack"
 
+        assert self.num_shards >= 1, f"num_shards must be >= 1, got {self.num_shards}"
+        assert (
+            0 <= self.shard_index < self.num_shards
+        ), f"shard_index must be in [0, {self.num_shards}), got {self.shard_index}"
+        assert self.shard_by in (
+            "context",
+            "row",
+        ), f"shard_by must be 'context' or 'row', got {self.shard_by!r}"
+
     def get_results_dir(self, output_dir: Path) -> Path:
         """
         Generates the unique save directory and filenames based on configuration parameters.
@@ -140,6 +173,14 @@ class EvaluationConfig:
         Path
             The path to the results directory
         """
+        # A sharded run has its directory chosen once by the driver: every shard must write into
+        # the same one, and the uniquifying branch below would otherwise give each shard a
+        # different suffix.
+        if self.results_dir is not None:
+            config_dir = Path(self.results_dir)
+            config_dir.mkdir(parents=True, exist_ok=True)
+            return config_dir
+
         # Build directory name components
         components = [
             self.dataset,
@@ -159,6 +200,13 @@ class EvaluationConfig:
             components.append(f"max_context{self.max_context_length}")
         if self.query_aware:
             components.append("query_aware")
+        if self.enable_thinking:
+            # Part of the directory name, not just the saved config: thinking mode changes the
+            # PROMPT, so a thinking run and a non-thinking one are different measurements. Without
+            # this they collide in one directory, and since run_evaluation skips a directory that
+            # already holds predictions.csv + metrics.json, the second run would silently report the
+            # first one's numbers.
+            components.append("thinking")
         if self.key_channel_compression_ratio is not None:
             components.append(f"key_channel_cr{self.key_channel_compression_ratio:.2f}")
         if self.needle_depth is not None and self.dataset == "needle_in_haystack":
@@ -372,6 +420,33 @@ class EvaluationRunner:
             df["context"] = df["context"] + df["question"]  # type: ignore[index]
             df["question"] = ""  # type: ignore[index]
 
+        # Shard AFTER sampling and needle insertion, so every shard derives its slice from the
+        # identical full frame -- the union over shards is then exactly the unsharded row set.
+        if self.config.num_shards > 1:
+            full = len(df)
+            contexts = df["context"].drop_duplicates()
+            if self.config.shard_by == "row":
+                # One context shared by every row (math500/aime25): context sharding would put the
+                # whole dataset on shard 0. Nothing is lost by splitting rows here -- the "context"
+                # is a single space, so there is no prefill to amortize.
+                df = df.iloc[self.config.shard_index :: self.config.num_shards]
+            else:
+                # Round-robin over contexts (not rows): a context's questions share one prefill, so
+                # splitting them across shards would re-prefill the same long context in each --
+                # which matters more here than in the sparse path, since KVzip's scoring pass costs
+                # 2-3x prefill on top.
+                mine = set(contexts.iloc[self.config.shard_index :: self.config.num_shards])
+                df = df[df["context"].isin(mine)]
+            logger.info(
+                "Shard %d/%d by %s: %d of %d rows (%d contexts in the full frame)",
+                self.config.shard_index,
+                self.config.num_shards,
+                self.config.shard_by,
+                len(df),
+                full,
+                len(contexts),
+            )
+
         self.df = df
         logger.info(f"Dataset processed with {len(self.df)} entries.")
 
@@ -445,6 +520,7 @@ class EvaluationRunner:
                     press=self.press,
                     max_new_tokens=max_new_tokens,
                     max_context_length=self.config.max_context_length,
+                    enable_thinking=self.config.enable_thinking,
                 )
                 self.df.loc[index, "predicted_answer"] = output["answer"]  # type: ignore[union-attr]
                 torch.cuda.empty_cache()  # Clear CUDA cache to free up memory
@@ -471,6 +547,7 @@ class EvaluationRunner:
                     press=self.press,
                     max_new_tokens=max_new_tokens,
                     max_context_length=self.config.max_context_length,
+                    enable_thinking=self.config.enable_thinking,
                 )
                 self.df.loc[df_group.index, "predicted_answer"] = output["answers"]  # type: ignore[union-attr]
                 # Store the actual compression ratio used (if the press has one)
@@ -542,6 +619,23 @@ class EvaluationRunner:
         self._load_and_prepare_dataset()
 
         self._run_inference()
+
+        if self.config.num_shards > 1:
+            # Write the shard and stop. Scoring happens once, over the union, in
+            # evaluate_sharded.py -- a per-shard metric would be a per-task mean over an arbitrary
+            # subset of rows, which is not comparable to anything.
+            #
+            # Parquet, not CSV: `answer` holds an ndarray of reference strings and the scorers
+            # iterate it. CSV stringifies it to "['2166941']", which then iterates CHARACTER by
+            # character -- 11 phantom references -- and a genuinely wrong prediction scores 0.27
+            # instead of 0.0. The corruption is silent and inflates the metric.
+            shard_file = results_dir / f"predictions_shard{self.config.shard_index}.parquet"
+            self.df.to_parquet(str(shard_file), index=True)  # type: ignore[union-attr]
+            logger.info(
+                "Shard %d wrote %d rows to %s", self.config.shard_index, len(self.df), shard_file  # type: ignore[arg-type]
+            )
+            return
+
         self._save_results(predictions_filename)
         self._calculate_and_save_metrics(metrics_filename)
         self.config.save_config(config_filename)

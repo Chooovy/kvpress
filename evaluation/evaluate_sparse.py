@@ -85,6 +85,13 @@ class SparseEvaluationConfig:
     # The trained indexer
     indexer_ckpt: str = ""
 
+    # The trained linear memory over the evicted keys (kvpress.presses.gqa_indexer.memory). Empty
+    # runs plain sparse attention, which is the baseline this arm is measured against. The geometry
+    # comes from the checkpoint's recorded config; the router it was trained against is recorded
+    # there too and cross-checked against --indexer_ckpt, because a memory read over a different
+    # router's support is summarizing keys that router did not evict -- and no weight shape says so.
+    memory_ckpt: str = ""
+
     # Sparse-attention budget (defaults match the sparse training stage)
     topk: int = 512
     force_sink: int = 4
@@ -119,6 +126,11 @@ class SparseEvaluationConfig:
     max_new_tokens: Optional[int] = None
     max_context_length: Optional[int] = None
     needle_depth: Optional[int] = None
+    # Qwen3-style thinking mode, matching evaluate.py's flag so the two arms can be compared. False
+    # makes the chat template emit a PRE-CLOSED, empty "<think>\n\n</think>", suppressing the
+    # reasoning block; True leaves the turn open. Raise max_new_tokens with it -- thinking traces are
+    # several times longer, and a truncated trace never reaches \boxed{} at all.
+    enable_thinking: bool = False
 
     # Data-parallel sharding. num_shards > 1 makes this process evaluate only its slice of the
     # (already sampled) rows and write predictions to a parquet shard file instead of scoring:
@@ -128,6 +140,12 @@ class SparseEvaluationConfig:
     # process and are prefilled once -- splitting them would re-prefill the same context per shard.
     shard_index: int = 0
     num_shards: int = 1
+    # Sharding axis. "context" is the default and right for every benchmark with long shared
+    # contexts. "row" exists for the reasoning benchmarks: math500 and aime25 put the whole problem
+    # in `question` and leave `context` a single space, so ALL rows share ONE context and the
+    # round-robin over contexts hands every row to shard 0 while the other GPUs sit idle. There is
+    # no prefill to share at 4 tokens, so splitting by row costs nothing there.
+    shard_by: str = "context"
 
     # Output
     output_dir: str = "./results_sparse"
@@ -157,6 +175,9 @@ class SparseEvaluationConfig:
         assert 0 <= self.shard_index < self.num_shards, (
             f"shard_index must be in [0, {self.num_shards}), got {self.shard_index}"
         )
+        assert self.shard_by in ("context", "row"), (
+            f"shard_by must be 'context' or 'row', got {self.shard_by!r}"
+        )
         if self.dataset == "needle_in_haystack":
             assert self.needle_depth is not None, "needle_depth must be set for needle_in_haystack"
             assert (
@@ -178,12 +199,22 @@ class SparseEvaluationConfig:
             f"topk{self.topk}",
             Path(self.indexer_ckpt).stem,
         ]
+        if self.memory_ckpt:
+            # Part of the directory name, not just the config blob: without it a memory run and the
+            # plain sparse run it is compared against land in the SAME directory, and the second one
+            # silently reads as the first's numbers.
+            components.append(f"memory-{Path(self.memory_ckpt).stem}")
         if self.fraction < 1.0:
             components.append(f"fraction{self.fraction:.3f}")
         if self.max_context_length is not None:
             components.append(f"max_context{self.max_context_length}")
         if self.needle_depth is not None and self.dataset == "needle_in_haystack":
             components.append(f"needle_depth{self.needle_depth}")
+        if self.enable_thinking:
+            # Part of the directory name for the same reason as in evaluate.py: thinking mode changes
+            # the prompt, so it is a different measurement and must not share a directory with the
+            # non-thinking run of the same (dataset, topk).
+            components.append("thinking")
 
         config_dir = Path(self.output_dir) / "__".join(filter(None, components))
         if config_dir.exists():  # never overwrite an existing run
@@ -354,10 +385,11 @@ class SparseEvaluationRunner:
             )
         except ValueError as exc:
             raise SystemExit(
-                f"{exc} Use --scorer pairwise, --scorer scalar, --scorer prefix or --scorer dma."
+                f"{exc} Use --scorer pairwise, --scorer scalar, --scorer prefix, --scorer dma or "
+                "--scorer kvzip."
             ) from exc
 
-        if scorer in ("scalar", "prefix"):
+        if scorer in ("scalar", "prefix", "kvzip"):
             # pos_slope is NOT a parameter -- it is added inside score_keys and never stored -- so
             # a wrong value mis-scores silently with every weight loading cleanly. The CLI wins
             # over the checkpoint's record; if neither has it, say so rather than quietly taking
@@ -382,6 +414,24 @@ class SparseEvaluationRunner:
             scorer_kwargs["head_dim"] = cfg.head_dim
             scorer_kwargs["rope_dim"] = cfg.rope_dim
 
+        # The memory's geometry has to be known before the press is built, since the press is what
+        # constructs the modules. Read from the checkpoint rather than exposed as flags: rank and
+        # mid_dim ARE parameter shapes, so taking them from anywhere else risks a mismatch that
+        # loading would then have to catch.
+        memory_kwargs: dict = {}
+        memory_sd = None
+        memory_config: dict = {}
+        if cfg.memory_ckpt:
+            memory_payload = torch.load(cfg.memory_ckpt, map_location="cpu", weights_only=False)
+            memory_sd = memory_payload.get("memory", memory_payload)
+            memory_config = memory_payload.get("config") or {}
+            memory_kwargs = {
+                "memory": True,
+                "memory_rank": memory_config.get("memory_rank", 16),
+                "memory_mid_dim": memory_config.get("memory_mid_dim", 256),
+                "memory_per_head": memory_config.get("memory_per_head", True),
+            }
+
         press = GQAIndexerPress(
             compression_ratio=0.0,
             gate_scale=has_gate,
@@ -389,6 +439,7 @@ class SparseEvaluationRunner:
             scorer=scorer,
             n_heads=cfg.n_heads,
             **scorer_kwargs,
+            **memory_kwargs,
         )
         press.post_init_from_model(model)
         load_indexer_state_dict(model, indexer_sd, "indexer")
@@ -400,6 +451,40 @@ class SparseEvaluationRunner:
             ckpt_config or None,
         )
 
+        if memory_sd is not None:
+            from kvpress.presses.gqa_indexer.train import load_memory_state_dict
+
+            load_memory_state_dict(model, memory_sd, press.memory_attr)
+            trained_router = memory_config.get("init_router")
+            if trained_router and Path(trained_router) != Path(cfg.indexer_ckpt):
+                # A warning rather than an error, because a moved or copied checkpoint path is a
+                # legitimate reason for these to differ. But it is worth saying loudly: the memory
+                # summarizes exactly the keys ITS router evicted, so reading it over a different
+                # router's support is a silent mismatch -- every tensor loads, every number looks
+                # plausible, and the state stands for the wrong set of keys.
+                logger.warning(
+                    "the memory was trained against router %s but this run uses %s. The memory "
+                    "summarizes the keys that router evicted, so a different router's support "
+                    "makes it meaningless -- and nothing downstream can detect that.",
+                    trained_router,
+                    cfg.indexer_ckpt,
+                )
+            for name in ("force_sink", "force_local"):
+                trained = memory_config.get(name)
+                if trained is not None and int(trained) != int(getattr(cfg, name)):
+                    logger.warning(
+                        "the memory was trained at %s=%s but this run uses %s. That changes which "
+                        "keys are evicted, so the state is read over a different partition than it "
+                        "was built over.",
+                        name, trained, getattr(cfg, name),
+                    )
+            logger.info(
+                "Loaded memory from %s (rank=%s, ckpt config=%s)",
+                cfg.memory_ckpt,
+                memory_kwargs["memory_rank"],
+                memory_config or None,
+            )
+
         pipeline = SparseGenerationPipeline(model=model, tokenizer=tokenizer, device=model.device)
         pipeline.configure_sparse(
             press,
@@ -408,6 +493,7 @@ class SparseEvaluationRunner:
             force_local=cfg.force_local,
             block_k=cfg.block_k,
             precision=cfg.precision,
+            memory=bool(cfg.memory_ckpt),
         )
         self.pipeline = pipeline
 
@@ -436,17 +522,23 @@ class SparseEvaluationRunner:
         if cfg.num_shards > 1:
             full = len(df)
             contexts = df["context"].drop_duplicates()
-            # Round-robin over contexts (not rows): a context's questions share one prefill, so
-            # splitting them across shards would re-prefill the same long context in each.
-            mine = set(contexts.iloc[cfg.shard_index :: cfg.num_shards])
-            df = df[df["context"].isin(mine)]
+            if cfg.shard_by == "row":
+                # One context shared by every row (math500/aime25): context sharding would put the
+                # whole dataset on shard 0. Nothing is lost by splitting rows here -- the "context"
+                # is a single space, so there is no prefill to amortize.
+                df = df.iloc[cfg.shard_index :: cfg.num_shards]
+            else:
+                # Round-robin over contexts (not rows): a context's questions share one prefill, so
+                # splitting them across shards would re-prefill the same long context in each.
+                mine = set(contexts.iloc[cfg.shard_index :: cfg.num_shards])
+                df = df[df["context"].isin(mine)]
             logger.info(
-                "Shard %d/%d: %d of %d rows (%d of %d contexts)",
+                "Shard %d/%d by %s: %d of %d rows (%d contexts in the full frame)",
                 cfg.shard_index,
                 cfg.num_shards,
+                cfg.shard_by,
                 len(df),
                 full,
-                len(mine),
                 len(contexts),
             )
         self.df = df
@@ -469,6 +561,7 @@ class SparseEvaluationRunner:
                 press=None,
                 max_new_tokens=max_new_tokens,
                 max_context_length=cfg.max_context_length,
+                enable_thinking=cfg.enable_thinking,
             )
             self.df.loc[group.index, "predicted_answer"] = output["answers"]
             if torch.cuda.is_available():

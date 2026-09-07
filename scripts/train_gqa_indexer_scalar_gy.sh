@@ -58,20 +58,145 @@ WARMUP_FRAC="${WARMUP_FRAC:-0.10}"
 STABLE_FRAC="${STABLE_FRAC:-0.60}"
 
 LIGER="${LIGER:-1}"
-FFN_SP="${FFN_SP:-8}"
+# Defaults to NGPU: FFN_SP=NGPU makes all ranks ONE sequence-parallel group, i.e. a single
+# data-parallel replica, which is the configuration the 16K stage was tuned at. An explicit
+# FFN_SP= is respected -- it must DIVIDE the world size, or the trainer rejects it (a group short
+# a rank would not tile the sequence).
+FFN_SP="${FFN_SP:-$NGPU}"
+if (( NGPU % FFN_SP != 0 )); then
+  echo "FFN_SP=$FFN_SP must divide NGPU=$NGPU" >&2
+  exit 1
+fi
+
+# C1/C2 split-context objective (SPLIT=1). Off by default.
+#
+# Splits each sequence into a gated prefix C1 and a PINNED suffix C2, and takes the loss on C2:
+#
+#   context: [ C1 .............. | C2 ......... ]
+#   gate:    [ soft-evicted      | pinned dense ]
+#   loss:    [ ignored           | counted      ]
+#
+# WHY, in one sentence: under the default objective most of a position's loss is explained by its
+# immediate neighbours, and at inference force_local=64 keeps those for free -- so a large share of
+# the router's gradient trains a decision it never has to make. Every C2 query is at least |C2|
+# tokens past every C1 key, so no C1 key can be rescued by a local window and its retention is
+# decided by the router alone. Verified: with the loss on C2 only, ALL router gradient lands on C1
+# keys and exactly zero on pinned sink/C2 keys.
+#
+# C2 is PINNED, not ungated -- the distinction is load-bearing. If a (C2 query, C1 key) pair simply
+# dropped the gate term, dL/d(score) for that C1 key would be identically zero and the router would
+# learn nothing about the one thing this objective exists to teach. Pinning instead exempts only
+# C2's OWN keys (they read at dense weight) while C1 stays gated including when C2 reads it.
+#
+# THE COST OF THAT CHOICE, and why SPLIT_BUDGET_RATIO exists: pinning C2 also removes it from the
+# gate's normalizer, and with a FIXED budget the gate divides its mass as budget : |pinned|. So
+# pinning 4096 keys hands C1 a log(4101) = 8.3 nat handicap -- on exactly the region being trained.
+# The first split run demonstrated it: gate_sparsity collapsed to 0.055 (vs 0.163-0.174 unsplit)
+# and RULER 8K came out at 12.77 against the baseline's 73.71. A ratio budget scales with the
+# history length, so the handicap cannot arise; the trainer now REJECTS a split without one.
+#
+# Composes with LONGCE (weights then reweight within C2). Mutually exclusive with DELTA and
+# --sft-ruler, both of which also decide which positions carry loss.
+#
+#   SPLIT=1 LONGCE=1 scripts/train_gqa_indexer_scalar_gy.sh split_smoke    # 20 steps, READ FIRST
+#   SPLIT=1 LONGCE=1 scripts/train_gqa_indexer_scalar_gy.sh stage1_16k     # -> ..._split0.5r0.5
+#
+# WATCH TWO NUMBERS in --metrics-file:
+#   c2_positions    -- how many positions carried gradient (~4030 at 8K, frac 0.5, gap 64). Too
+#                      few and the curve is noise, the problem --sft-ruler has at ~0.1%.
+#   gate_sparsity   -- must stay comparable to the unsplit arms (0.16-0.17 by step 300). Drifting
+#                      toward 0.05 is the collapse above, and it scores near zero at eval.
+# The loss itself is NOT comparable to the unsplit run's -- a mean over a different, longer-range
+# set of positions -- so judge this arm on RULER, not on the curve.
+SPLIT="${SPLIT:-0}"
+SPLIT_FRAC="${SPLIT_FRAC:-0.5}"
+# 64 = one local window, removing the C2-head positions whose loss is still partly local.
+SPLIT_GAP="${SPLIT_GAP:-64}"
+# Row-wise budget: B_q = ratio * (number of visible, non-pinned history keys). Required under a
+# split -- see split_args below.
+SPLIT_BUDGET_RATIO="${SPLIT_BUDGET_RATIO:-0.5}"
 
 # Scalar router.
 MID_DIM="${MID_DIM:-256}"
+# SCORER=kvzip swaps the scalar MLP readout for Fast-KVzip's gate: a per-token q/k self-
+# interaction scored against a bank of KVZIP_BASE learnable reference keys, emitted as
+# log(share). decay and pos_slope are kept, so an A/B against the scalar arm has exactly one
+# variable. 2.5x the parameters of MID_DIM=256; MID_DIM is rejected for this scorer.
+SCORER="${SCORER:-scalar}"
+KVZIP_DIM="${KVZIP_DIM:-16}"
+KVZIP_BASE="${KVZIP_BASE:-16}"
 POS_SLOPE="${POS_SLOPE:-1e-6}"
+
+# TrimKV's per-key LIFETIME (DECAY=1). Off by default, so every existing invocation is unchanged.
+#
+# The plain scalar router gives each key one number, fixed for all time: s_j decides its rank at
+# every query position it will ever be read from. TrimKV's mechanism adds a second, learned number
+# per key -- how fast it decays:
+#
+#   gate_j(i) = s_j + log_beta_j * (i - j) / DECAY_REF        (log_beta <= 0)
+#
+# so a key's RANK can change over the sequence. A slowly-decaying key overtakes a faster-decaying
+# older one; a frozen score can never reorder. That is the whole hypothesis being tested, and it is
+# a strictly larger class -- log_beta = 0 recovers the plain arm exactly.
+#
+# COSTS NO KERNEL CHANGE. The form is still bilinear, so it folds into the existing gate at
+# Di = 2 * n_heads (16 for Qwen3-8B) with the pair per head being
+#   ki[j] = [s_j - log_beta_j * j / ref,  log_beta_j]     qi[i] = [1,  i / ref]
+# Verified exact to 2.4e-07 against an explicit per-pair reference, and the gated attention matches
+# its own reference to 6.7e-16. The fused kernel pads Di to the next power of two and masks the
+# tail, so the gate, its lse normalizer and the entire backward run unmodified.
+#
+# DECAY_REF IS LOAD-BEARING AND MUST STAY FIXED. It does three jobs at once:
+#   * gradient scale -- d(gate)/d(log_beta) = age, which hits 16384 at 16K against 1 for the score.
+#     Unnormalized, the lifetime head trains at ~1e4x the score head's rate off one shared LR.
+#   * irreversibility -- an absolute tilt keeps a dropped key from re-entering the top-k, which the
+#     eviction path and qi_flex's deadlines both rest on. Normalising by the LIVE sequence length
+#     instead breaks it (measured 27 re-entries vs 0).
+#   * precision -- the fold puts the position in a bf16 column. A raw 16383 rounds to 16384 and an
+#     age of 83 collapses to 64; dividing by ref keeps the column at O(1) where bf16 is fine.
+#
+# DECAY_INIT=-1.0 starts the lifetime ACTIVE (one nat of decay over a full 16K of age, against a
+# score of std ~1), deliberately unlike TrimKV. There, log_beta starts at ~-1.5e-8 and the only
+# thing pushing beta below 1 is its retention HINGE LOSS. This port has no hinge -- the log gate's
+# lse normalizer supplies the budget instead -- and that normalizer enforces a budget without
+# preferring short lifetimes, so an inert init risks log_beta never leaving 0 and the arm silently
+# collapsing back to the plain scalar router. DECAY_INIT=0 is that ablation.
+#
+#   DECAY=1 LONGCE=1 scripts/train_gqa_indexer_scalar_gy.sh decay_smoke    # 20 steps, READ FIRST
+#   DECAY=1 LONGCE=1 scripts/train_gqa_indexer_scalar_gy.sh stage1_16k     # -> ..._longce_decay
+#
+# WATCH, in --metrics-file: gate_sparsity (should CONCENTRATE, i.e. fall, not sit at ~1.0) and
+# peak_gib (Di doubles from 8 to 16, which is 8 extra fp32 numbers per token per layer -- ~0.02 GiB
+# at 16K across 36 layers, so it should be indistinguishable from the plain run).
+DECAY="${DECAY:-0}"
+DECAY_REF="${DECAY_REF:-16384}"
+DECAY_INIT="${DECAY_INIT:--1.0}"
 
 # Gate. pin_mode is not optional: a gate that is flat along the key axis cancels in the softmax,
 # so the model reverts to the frozen dense backbone and the LM loss is satisfied with no ranking
 # learned. Verified for this router too -- no-op distance 5.6e-17 unpinned against 0.44 with sink.
 PIN_MODE="${PIN_MODE:-sink}"
 N_SINK="${N_SINK:-4}"
+# Width of the always-attended causal window for PIN_MODE=local/local+sink. Keys within
+# N_LOCAL of the query are read at gate 0 AND held out of the gate's normalizer, so the
+# router never spends budget on a neighbour and ranks only what lies beyond the window --
+# the division of labour the eviction path already assumes at inference via force_local.
+# SP-KV sweeps {1,8,32,128,512} and reads gate densities 60.7/47.8/33.4/25.4/27.5%, i.e. a
+# WIDER window makes the router MORE willing to drop distant keys. 128 is their default.
+#
+#   PIN_MODE=local+sink scripts/train_gqa_indexer_scalar_gy.sh stage1_8k
+N_LOCAL="${N_LOCAL:-128}"
+# History's TOTAL gate multiplier under a fixed budget. Load-bearing and easy to misread: each
+# PINNED key sits at multiplier 1, so the mass splits |pinned| : GATE_BUDGET. Widening the pin
+# (sink=4 -> local+sink=132) therefore shrinks the router's share 20% -> 0.75% at B=1 unless B
+# moves with it. B = 0.25 * |pinned| keeps that share fixed across pin modes (B=33 for 132).
+GATE_BUDGET="${GATE_BUDGET:-1.0}"
 COMPRESSION_RATIO="${COMPRESSION_RATIO:-0.5}"
 
-MAX_STEPS="${MAX_STEPS:-600}"
+# 300 rather than 600: the router is a small MLP and converges by ~300 steps, so the second half
+# bought nothing measurable while doubling wall-clock (the 16K stage runs at 150 s/step under
+# contention). The LR curve over 0..300 is unchanged -- it is the same schedule truncated earlier.
+MAX_STEPS="${MAX_STEPS:-300}"
 
 # Delta-weighted loss (DELTA=1). Off by default, so existing invocations are unchanged.
 #
@@ -154,6 +279,12 @@ DELTA_LOGIT_CHUNK="${DELTA_LOGIT_CHUNK:-8192}"
 # is repeating DELTA's failure and should be stopped; ~1.0 means the weighting is inert (check
 # longce_cache_miss_frac, which says how many drawn documents had no cached weights).
 LONGCE="${LONGCE:-0}"
+# Window into each document: `head` takes a prefix, `random` a random slice. NOT cosmetic for an
+# A/B: LongCE REQUIRES head (its cache is keyed to per-position weights over a prefix, and the
+# trainer rejects `random`), so switching LongCE off silently switches the sampling to argparse's
+# `random` default too -- two variables, not one. Set TAKE_FROM=head on a no-LongCE run to hold
+# the data distribution fixed. Ignored while LONGCE!=0, where longce_args already supplies head.
+TAKE_FROM="${TAKE_FROM:-}"
 LONGCE_TRUNC="${LONGCE_TRUNC:-1024}"
 LONGCE_GAMMA="${LONGCE_GAMMA:-5.0}"
 LONGCE_CACHE="${LONGCE_CACHE:-/apdcephfs_gy8/share_303843174/guhao/datasets/longce_weights_16k}"
@@ -176,7 +307,50 @@ ffn_sp_arg() { [[ "$FFN_SP" != "1" ]] && echo "--ffn-sp-size $FFN_SP"; }
 # spreads its mass over every key. ~1.0 means nothing learned; falling towards 0 is concentration.
 gate_sparsity_arg() { [[ "${GATE_SPARSITY:-1}" != "0" ]] && echo "--gate-sparsity"; }
 
-scalar_args() { echo "--scorer scalar --scalar-mid-dim $MID_DIM --scalar-pos-slope $POS_SLOPE"; }
+scalar_args() {
+  if [[ "$SCORER" == "kvzip" ]]; then
+    echo "--scorer kvzip --scalar-pos-slope $POS_SLOPE --kvzip-dim $KVZIP_DIM --kvzip-base $KVZIP_BASE"
+  else
+    echo "--scorer scalar --scalar-mid-dim $MID_DIM --scalar-pos-slope $POS_SLOPE"
+  fi
+  return 0
+}
+# `return 0` is load-bearing here for the same reason as delta_args/longce_args below: these are
+# used inside variable ASSIGNMENTS, and under `set -e` a command substitution that exits non-zero
+# kills the script silently.
+decay_args() {
+  [[ "$DECAY" != "0" ]] && \
+    echo "--scalar-decay --scalar-decay-ref $DECAY_REF --scalar-decay-init $DECAY_INIT"
+  return 0
+}
+
+budget_suffix() {
+  [[ "$GATE_BUDGET" != "1.0" ]] && echo "_b${GATE_BUDGET}"
+  return 0
+}
+
+decay_suffix() {
+  [[ "$DECAY" != "0" ]] && echo "_decay"
+  return 0
+}
+
+# --gate-budget-ratio is NOT optional here and the trainer rejects the combination without it.
+# A fixed budget divides the gate's mass as budget : |pinned|, and a split pins the entire C2
+# suffix -- so C1 (the region being trained) takes a log(|C2| + n_sink) handicap: 8.3 nats at
+# 8K/split 4096. Measured on a 512-token probe, router-controlled attention mass falls 0.2391 ->
+# 0.0157 (15x) under a fixed budget and is restored to 0.53 at ratio=0.5. The first split run hit
+# exactly this: gate_sparsity collapsed to 0.055 (vs 0.163-0.174 unsplit) and RULER 8K was 12.77
+# against the baseline's 73.71.
+split_args() {
+  [[ "$SPLIT" != "0" ]] && \
+    echo "--split-frac $SPLIT_FRAC --split-gap $SPLIT_GAP --gate-budget-ratio $SPLIT_BUDGET_RATIO"
+  return 0
+}
+
+split_suffix() {
+  [[ "$SPLIT" != "0" ]] && echo "_split${SPLIT_FRAC}r${SPLIT_BUDGET_RATIO}"
+  return 0
+}
 
 # Emits nothing at DELTA=0, so the flags never reach the trainer and the default path is byte for
 # byte the one that produced the existing checkpoints.
@@ -206,6 +380,13 @@ delta_suffix() {
 # stores one weight vector per document and each stage reads a PREFIX of it, which is only valid
 # because the losses are causal. `random` would pair position i's weight with a different token, and
 # the trainer rejects the combination for that reason.
+take_from_arg() {
+  # Deliberately silent when LongCE is on: longce_args already passes head, and a second
+  # --take-from later on the command line would win and break the cache digest check.
+  [[ "$LONGCE" == "0" && -n "$TAKE_FROM" ]] && echo "--take-from $TAKE_FROM"
+  return 0
+}
+
 longce_args() {
   [[ "$LONGCE" != "0" ]] && \
     echo "--longce-weights $LONGCE_CACHE --take-from head"
@@ -252,7 +433,7 @@ case "$MODE" in
     exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer_e2e \
       --data-root "$DATA_ROOT" --model "$MODEL" $(scalar_args) \
       --subsets 8k_32k --schedule "${SCHEDULE:-16384:50}" \
-      --stage dense --pin-mode "$PIN_MODE" --n-sink "$N_SINK" $(liger_arg) $(ffn_sp_arg) \
+      --stage dense --pin-mode "$PIN_MODE" --n-sink "$N_SINK" --n-local "$N_LOCAL" $(liger_arg) $(ffn_sp_arg) \
       --num-workers 0 --log-every 1 --save-every 0 \
       --out "$OUT/smoke" --dry-run
     ;;
@@ -270,7 +451,7 @@ case "$MODE" in
     exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer_e2e \
       --data-root "$DATA_ROOT" --model "$MODEL" $(data_args) $(scalar_args) $(delta_args) \
       --schedule "${SCHEDULE:-16384:20}" \
-      --stage dense --pin-mode "$PIN_MODE" --n-sink "$N_SINK" $(liger_arg) $(ffn_sp_arg) \
+      --stage dense --pin-mode "$PIN_MODE" --n-sink "$N_SINK" --n-local "$N_LOCAL" $(liger_arg) $(ffn_sp_arg) \
       --global-batch-size "${GLOBAL_BATCH:-8}" $(gate_sparsity_arg) \
       --compression-ratio "$COMPRESSION_RATIO" \
       --peak-lr "$PEAK_LR" --final-lr "$FINAL_LR" \
@@ -298,7 +479,7 @@ case "$MODE" in
     exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer_e2e \
       --data-root "$DATA_ROOT" --model "$MODEL" $(data_args) $(scalar_args) $(longce_args) \
       --schedule "${SCHEDULE:-8192:20}" \
-      --stage dense --pin-mode "$PIN_MODE" --n-sink "$N_SINK" $(liger_arg) $(ffn_sp_arg) \
+      --stage dense --pin-mode "$PIN_MODE" --n-sink "$N_SINK" --n-local "$N_LOCAL" $(liger_arg) $(ffn_sp_arg) \
       --global-batch-size "${GLOBAL_BATCH:-8}" $(gate_sparsity_arg) \
       --compression-ratio "$COMPRESSION_RATIO" \
       --peak-lr "$PEAK_LR" --final-lr "$FINAL_LR" \
@@ -309,24 +490,80 @@ case "$MODE" in
       --save-every 0 --log-every 1
     ;;
 
+  decay_smoke)
+    # RUN THIS FIRST when trying DECAY. 20 steps at 8K with LongCE, metrics every step, and
+    # deliberately NOT --dry-run: the point is to read real numbers off --metrics-file.
+    #
+    # Three things to check before committing to 600 steps:
+    #   peak_gib       -- Di doubles (8 -> 16). The extra is ~0.02 GiB at 8K across 36 layers, so
+    #                     this should be indistinguishable from a plain LongCE 8K run. A large jump
+    #                     means something is materialising the (Sq, Sk) gate instead of folding it.
+    #   gate_sparsity  -- should be FALLING (concentrating). ~1.0 means the gate is inert.
+    #   loss           -- should track the plain LongCE run closely. decay_init=-1 is a real change
+    #                     to the initial gate, so a much worse step-1 loss means the init is too
+    #                     aggressive and DECAY_INIT should be softened toward 0.
+    DECAY=1
+    LONGCE="${LONGCE:-1}"
+    exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer_e2e \
+      --data-root "$DATA_ROOT" --model "$MODEL" $(data_args) $(scalar_args) $(longce_args) $(decay_args) \
+      --schedule "${SCHEDULE:-8192:20}" \
+      --stage dense --pin-mode "$PIN_MODE" --n-sink "$N_SINK" --n-local "$N_LOCAL" $(liger_arg) $(ffn_sp_arg) \
+      --global-batch-size "${GLOBAL_BATCH:-8}" $(gate_sparsity_arg) \
+      --compression-ratio "$COMPRESSION_RATIO" \
+      --peak-lr "$PEAK_LR" --final-lr "$FINAL_LR" \
+      --warmup-frac "$WARMUP_FRAC" --stable-frac "$STABLE_FRAC" \
+      --batch-size 1 --shuffle-buffer 64 \
+      --num-workers "${WORKERS:-2}" \
+      --out "$OUT/decay_smoke" --metrics-file "$OUT/decay_smoke/metrics.jsonl" \
+      --save-every 0 --log-every 1
+    ;;
+
+  split_smoke)
+    # RUN THIS FIRST when trying SPLIT. 20 steps at 8K with LongCE, metrics every step.
+    #
+    # Three things to check before committing to 600 steps:
+    #   c2_positions -- how many positions carried gradient. At split_frac=0.5, gap=64 and 8K
+    #                   this should be ~4030 per sequence. Far below that means the masking is
+    #                   wrong, and the run would be noise.
+    #   peak_gib     -- a split forces an explicit (Sq, Sk) pinned mask instead of the compact
+    #                   sink path, so a modest rise is EXPECTED here (unlike for DECAY). If it
+    #                   rises enough to threaten 16K, lower FFN_SP or run 8K only.
+    #   loss         -- NOT comparable to the unsplit run: different position set. Just check it
+    #                   descends and is finite.
+    SPLIT=1
+    LONGCE="${LONGCE:-1}"
+    exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer_e2e \
+      --data-root "$DATA_ROOT" --model "$MODEL" $(data_args) $(scalar_args) $(longce_args) $(decay_args) $(split_args) \
+      --schedule "${SCHEDULE:-8192:20}" \
+      --stage dense --pin-mode "$PIN_MODE" --n-sink "$N_SINK" --n-local "$N_LOCAL" $(liger_arg) $(ffn_sp_arg) \
+      --global-batch-size "${GLOBAL_BATCH:-8}" $(gate_sparsity_arg) \
+      --compression-ratio "$COMPRESSION_RATIO" \
+      --peak-lr "$PEAK_LR" --final-lr "$FINAL_LR" \
+      --warmup-frac "$WARMUP_FRAC" --stable-frac "$STABLE_FRAC" \
+      --batch-size 1 --shuffle-buffer 64 \
+      --num-workers "${WORKERS:-2}" \
+      --out "$OUT/split_smoke" --metrics-file "$OUT/split_smoke/metrics.jsonl" \
+      --save-every 0 --log-every 1
+    ;;
+
   stage1_16k|matched)
     # 16K for 600 steps on distillation's exact 8192:300,16384:300,32768:900 curve, truncated by
     # MAX_STEPS -- so the LR over 0..600 is identical (warmup 150, then flat peak) and the O(L^2)
     # 32K stage is never built. FFN_SP=8 on 8 GPUs is ONE data-parallel replica, so GLOBAL_BATCH=8
     # accumulates to match the 8 sequences/step the pairwise run sees.
     [[ "$MODE" == "matched" ]] && MID_DIM="${MID_DIM_MATCHED:-1152}"
-    SUB="${MODE}_mid${MID_DIM}$(delta_suffix)$(longce_suffix)"
+    SUB="${MODE}_mid${MID_DIM}$(delta_suffix)$(longce_suffix)$(decay_suffix)$(split_suffix)"
     # --take-from: `random` normally, but LONGCE requires `head` (cached weights are per-position
     # prefixes), so longce_args supplies it and this default drops out. Passing both would make
     # argparse take the LAST one, which is why it is a variable rather than a second flag.
     TAKE_FROM_ARG="--take-from random"
     [[ "$LONGCE" != "0" ]] && TAKE_FROM_ARG=""
     exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer_e2e \
-      --data-root "$DATA_ROOT" --model "$MODEL" $(data_args) $(scalar_args) $(delta_args) $(longce_args) \
+      --data-root "$DATA_ROOT" --model "$MODEL" $(data_args) $(scalar_args) $(delta_args) $(longce_args) $(decay_args) $(split_args) \
       --schedule "${SCHEDULE:-8192:300,16384:300,32768:900}" \
-      --max-steps "${MAX_STEPS:-600}" \
-      --stage dense --pin-mode "$PIN_MODE" --n-sink "$N_SINK" $(liger_arg) \
-      --ffn-sp-size "${FFN_SP_16K:-8}" \
+      --max-steps "${MAX_STEPS:-300}" \
+      --stage dense --pin-mode "$PIN_MODE" --n-sink "$N_SINK" --n-local "$N_LOCAL" $(liger_arg) \
+      --ffn-sp-size "${FFN_SP_16K:-$FFN_SP}" \
       --global-batch-size "${GLOBAL_BATCH:-8}" $(gate_sparsity_arg) \
       --compression-ratio "$COMPRESSION_RATIO" \
       --peak-lr "$PEAK_LR" --final-lr "$FINAL_LR" \
@@ -346,17 +583,19 @@ case "$MODE" in
     # case rather than a separate mode -- --resume-from checks the checkpoint's recorded
     # --schedule against the one passed, so a copy of this block that drifted by one flag would
     # be rejected here (or, worse, resume onto a different curve). One code path cannot drift.
-    STAGE1_SUB="stage1$(delta_suffix)"
+    STAGE1_SUB="stage1$(delta_suffix)$(longce_suffix)$(decay_suffix)$(budget_suffix)"
     exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer_e2e \
       --data-root "$DATA_ROOT" --model "$MODEL" $(data_args) $(scalar_args) $(delta_args) \
+      $(longce_args) $(decay_args) $(take_from_arg) \
       --schedule "${SCHEDULE:-8192:300,16384:300,32768:900}" \
       ${MAX_STEPS:+--max-steps $MAX_STEPS} \
-      --stage dense --pin-mode "$PIN_MODE" --n-sink "$N_SINK" $(liger_arg) $(ffn_sp_arg) \
+      --stage dense --pin-mode "$PIN_MODE" --n-sink "$N_SINK" --n-local "$N_LOCAL" $(liger_arg) $(ffn_sp_arg) \
       --global-batch-size "${GLOBAL_BATCH:-8}" $(gate_sparsity_arg) \
       --compression-ratio "$COMPRESSION_RATIO" \
+      --gate-budget "$GATE_BUDGET" \
       --peak-lr "$PEAK_LR" --final-lr "$FINAL_LR" \
       --warmup-frac "$WARMUP_FRAC" --stable-frac "$STABLE_FRAC" \
-      --batch-size "${BATCH_SIZE:-1}" --take-from random --shuffle-buffer 64 \
+      --batch-size "${BATCH_SIZE:-1}" --shuffle-buffer 64 \
       --num-workers "${WORKERS:-2}" ${RESUME:+--resume-from "$RESUME"} \
       --out "$OUT/$STAGE1_SUB" --metrics-file "$OUT/$STAGE1_SUB/metrics.jsonl" \
       --save-every "${SAVE_EVERY:-100}" --log-every "${LOG_EVERY:-10}"
@@ -388,9 +627,9 @@ case "$MODE" in
     exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer_e2e \
       --data-root "$DATA_ROOT" --model "$MODEL" $(data_args) $(scalar_args) $(delta_args) \
       --schedule "${SCHEDULE:-8192:300,16384:300,32768:900}" \
-      --max-steps "${MAX_STEPS:-600}" \
-      --stage dense --pin-mode "$PIN_MODE" --n-sink "$N_SINK" $(liger_arg) \
-      --ffn-sp-size "${FFN_SP_16K:-8}" \
+      --max-steps "${MAX_STEPS:-300}" \
+      --stage dense --pin-mode "$PIN_MODE" --n-sink "$N_SINK" --n-local "$N_LOCAL" $(liger_arg) \
+      --ffn-sp-size "${FFN_SP_16K:-$FFN_SP}" \
       --global-batch-size "${GLOBAL_BATCH:-8}" $(gate_sparsity_arg) \
       --compression-ratio "$COMPRESSION_RATIO" \
       --peak-lr "$PEAK_LR" --final-lr "$FINAL_LR" \
@@ -434,9 +673,11 @@ case "$MODE" in
     ;;
 
   *)
-    echo "usage: $0 {smoke|delta_smoke|longce_smoke|stage1_16k|matched|stage1|linear|ablate|stage2}" >&2
+    echo "usage: $0 {smoke|delta_smoke|longce_smoke|decay_smoke|split_smoke|stage1_16k|matched|stage1|linear|ablate|stage2}" >&2
     echo "  DELTA=1 switches stage1_16k/stage1/linear onto the delta-weighted loss;" >&2
     echo "  run delta_smoke first and read delta_positive_frac + peak_gib from its metrics" >&2
+    echo "  DECAY=1 adds TrimKV's learned per-key lifetime; run decay_smoke first" >&2
+  echo "  SPLIT=1 trains on future utility via a C1/C2 context split; run split_smoke first" >&2
     echo "  (tokenize with scripts/train_gqa_indexer.sh tokenize -- the corpus is shared)" >&2
     exit 1
     ;;

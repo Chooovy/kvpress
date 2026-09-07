@@ -43,7 +43,12 @@ import torch
 from torch import nn
 
 from kvpress.presses.gqa_indexer.press import GQAIndexerPress, get_language_model
-from kvpress.presses.gqa_indexer.qi_flex_attention import HAS_FLEX, qi_sparse_attention
+from kvpress.presses.gqa_indexer.qi_flex_attention import (
+    FLEX_BLOCK,
+    HAS_FLEX,
+    deadlines,
+    qi_sparse_attention,
+)
 from kvpress.presses.gqa_indexer.sparse_support import streaming_topk_support
 from kvpress.presses.gqa_indexer.triton_sparse_attention import sparse_gqa_attention
 
@@ -91,6 +96,11 @@ class SparseAttentionContext:
         kernel ~linearly under ``"ieee"`` (1.89x for 2x M, measured) and barely at all under
         ``"tf32"`` (1.09x). Pass ``"ieee"`` to reproduce the fp32 reference exactly, which is
         what the tests do; it is the wrong default for a bf16 model at length.
+    memory : bool
+        Fold the linear memory over the evicted keys into the same softmax as the retained ones
+        (:mod:`~kvpress.presses.gqa_indexer.memory`). Requires a press built with ``memory=True``,
+        its weights loaded, and ``flex_attention`` -- the fusion reads the retained branch's ``lse``,
+        which the gather kernel does not return, so this forces the flex path for decode rows too.
 
     Usage
     -----
@@ -111,6 +121,7 @@ class SparseAttentionContext:
         causal: bool = True,
         precision: str = "tf32",
         query_independent: bool | None = None,
+        memory: bool = False,
     ):
         if topk <= 0:
             raise ValueError(f"topk must be positive, got {topk}")
@@ -123,6 +134,12 @@ class SparseAttentionContext:
             )
         self.model = model
         self.press = press
+        self.memory = bool(memory)
+        if self.memory and not HAS_FLEX:
+            raise RuntimeError(
+                "memory=True needs flex_attention: the fusion reads the retained branch's lse, "
+                "which the gather kernel does not return."
+            )
         self.topk = int(topk)
         self.force_sink = int(force_sink)
         self.force_local = int(force_local)
@@ -136,6 +153,7 @@ class SparseAttentionContext:
         # declares itself query-independent and this torch has flex_attention".
         self._query_independent = query_independent
         self._use_qi = False
+        self._decay_active = False
 
         # Per-layer state, all keyed by layer_idx and reset on entry.
         self._hidden_states: dict[int, torch.Tensor] = {}
@@ -184,11 +202,19 @@ class SparseAttentionContext:
 
         indexer = self.press.get_indexer(module)
         cos, sin = self.press.get_rope_tables(indexer, kwargs)
-        # Same inputs the training path uses: hidden-state scorers ignore value_states, while DMA
-        # consumes the actual post-projection values for only this step's new tokens.
-        q_idx = indexer.project_q(hidden_states, cos, sin)  # (B, h, Sq, D)
         previous = self._k_idx.get(layer_idx)
         previous_len = 0 if previous is None else previous.shape[1]
+        # Absolute position of the first NEW token: 0 at prefill, the cache length at each decode
+        # step. A decay-carrying scorer folds -log_beta_j * j / ref into its key, so an offset of 0
+        # at decode would score every generated token as if it sat at position 0 -- its whole
+        # history would look infinitely old to it.
+        q_kwargs = {}
+        if self._decay_active:
+            q_kwargs["query_offset"] = previous_len
+            q_kwargs["n_kv_heads"] = key.shape[1]
+        # Same inputs the training path uses: hidden-state scorers ignore value_states, while DMA
+        # consumes the actual post-projection values for only this step's new tokens.
+        q_idx = indexer.project_q(hidden_states, cos, sin, **q_kwargs)  # (B, h, Sq, Di)
         value_states_new = value[:, :, previous_len:, :]
         if value_states_new.shape[2] != hidden_states.shape[1]:
             raise RuntimeError(
@@ -197,7 +223,11 @@ class SparseAttentionContext:
                 "append-only KV cache."
             )
         k_idx_new = indexer.project_k(
-            hidden_states, cos, sin, value_states=value_states_new
+            hidden_states,
+            cos,
+            sin,
+            value_states=value_states_new,
+            **({"key_offset": previous_len} if self._decay_active else {}),
         )  # (B, Sq, Di)
 
         # Indexer key-cache: initialize on prefill, append on each decode step. Entries stay in
@@ -213,6 +243,27 @@ class SparseAttentionContext:
                 "SparseAttentionContext per generation (its cache resets on entry)."
             )
 
+        # A cache shorter than the forced slots has nothing to select: force_sink + force_local
+        # already covers every key, so the support is the whole sequence and sparse attention IS
+        # dense attention. Short-circuiting is a correctness requirement, not an optimization --
+        # streaming_topk_support clamps topk down to k_len and *then* rejects
+        # force_sink + force_local > topk, so this case raises instead of trivially keeping
+        # everything. Reasoning benchmarks hit it constantly rather than as a corner case:
+        # math500's context is a single space (4 tokens once the chat template is applied), so 20
+        # of the 50 rows sampled at fraction 0.1 begin decoding at k_len < 68 = 4 + 64 and the run
+        # dies on its first question instead of producing a number.
+        #
+        # Deliberately narrow: k_len <= topk is also a no-op selection, but the gather path handles
+        # it correctly (topk is clamped to k_len), so it stays on the kernel and the precision
+        # plumbing that test_precision_reaches_the_kernel pins remains observable.
+        if k_len < self.force_sink + self.force_local:
+            return self._attend_dense(query, key, value, scaling)
+
+        if self.memory:
+            return self._attend_with_memory(
+                module, query, key, value, scaling, q_idx, k_idx, k_len
+            )
+
         # Query-independent scorers take the flex_attention path: the score is a fixed per-key
         # vector, so each key is selected by one contiguous interval of query rows and the whole
         # support is a per-key deadline instead of a (B, h, Sq, topk) index tensor. Same selection,
@@ -220,13 +271,27 @@ class SparseAttentionContext:
         # L=4096 for the select+attend pair. Only worth it when there is a query axis to amortize
         # the block-mask build over, so decode (Sq == 1) stays on the gather path.
         if self._use_qi and q_idx.shape[2] > 1:
+            # The deadline path needs ONE frozen per-key ranking. Without decay any query row
+            # gives it, since every row is identical. With decay the rows genuinely differ, so a
+            # row has to be chosen and the selection becomes an approximation of the exact
+            # per-row top-k the gather path below computes.
+            #
+            # The MIDDLE row, not row 0. Row 0 sees every key at age ~0, which is the one position
+            # where the lifetime term contributes nothing -- it throws the feature away and ranks
+            # purely by magnitude. Measured deadline-mask error against the exact per-row top-k
+            # (log_beta ~ U(-1,0) nats/ref, Sk=4096, take=512): row 0 4.52%, middle 1.64%, last
+            # 2.59%. The middle row minimizes the worst-case age error over the row range.
+            ref_row = q_idx.shape[2] // 2 if self._decay_active else 0
             out = qi_sparse_attention(
                 query,
                 key,
                 value,
-                # The per-key score IS one row of the score matrix; take row 0 rather than calling
-                # score_keys again, so this path cannot drift from what the gather path would score.
-                torch.einsum("bhqd,bkd->bhk", q_idx[:, :, :1], k_idx),
+                # The per-key score IS one row of the score matrix; take it from q_idx/k_idx
+                # rather than calling score_keys again, so this path cannot drift from what the
+                # gather path would score.
+                torch.einsum(
+                    "bhqd,bkd->bhk", q_idx[:, :, ref_row : ref_row + 1], k_idx
+                ),
                 self.topk,
                 force_sink=self.force_sink,
                 force_local=self.force_local,
@@ -257,6 +322,136 @@ class SparseAttentionContext:
         # The attention interface contract is (B, Sq, H, D); our op returns (B, H, Sq, D).
         return out.transpose(1, 2).contiguous()
 
+    def _attend_dense(self, query, key, value, scaling) -> torch.Tensor:
+        """
+        Plain causal attention, for a cache that already fits inside the support budget.
+
+        This is the *exact* answer, not an approximation: when ``k_len <= topk`` every key is
+        selected, so the sparse softmax and the dense one run over the same set. Routed through
+        SDPA rather than the gather kernel because the kernel's ``force_sink + force_local <= topk``
+        precondition is violated exactly when the sequence is this short (see the caller).
+
+        The mask is built explicitly and aligned BOTTOM-RIGHT (query row ``i`` sees key ``j`` iff
+        ``j <= k_len - q_len + i``), which is what ``is_causal=True`` does *not* do: SDPA aligns its
+        built-in mask top-left, so any call with ``Sq != Sk`` gets the wrong triangle. That case is
+        the common one here, not a corner -- the pipeline prefills the context and the question in
+        two separate forwards, so answering a 28-token question over a 4-token context arrives as
+        ``Sq=28, Sk=32``. Under top-left alignment its first row would attend to key 0 alone, and the
+        model degenerates into repeating text instead of answering. ``streaming_topk_support``
+        defaults to the same bottom-right convention, so this matches the path it replaces.
+        """
+        group = query.shape[1] // key.shape[1]
+        q_len, k_len = query.shape[2], key.shape[2]
+        key_idx = torch.arange(k_len, device=query.device)
+        q_pos = torch.arange(q_len, device=query.device).unsqueeze(-1) + (k_len - q_len)
+        attn_mask = key_idx <= q_pos  # (Sq, Sk), True = visible
+        out = torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key.repeat_interleave(group, dim=1),
+            value.repeat_interleave(group, dim=1),
+            attn_mask=attn_mask,
+            scale=scaling,
+        )  # (B, H, Sq, Dv)
+        return out.transpose(1, 2).contiguous()
+
+    def _attend_with_memory(
+        self, module, query, key, value, scaling, q_idx, k_idx, k_len: int
+    ) -> torch.Tensor:
+        """
+        Sparse attention plus the linear memory over the keys this row would have evicted.
+
+        Prefill and decode take different state constructions, and the difference is causality
+        rather than performance:
+
+        * **Prefill** (``Sq > 1``) builds a per-query-block state with
+          :func:`~.memory_schedule.block_memory_states`, the same function training uses. A single
+          state shared by every row would let row ``t`` read keys at positions ``> t``. That is not a
+          mild approximation -- measured at ``L=8192``, row 0 saw a state built from 6208 future
+          keys, and it took RULER 8K from 73.71 to **4.00** while the (causal) training curve looked
+          healthy throughout.
+        * **Decode** (``Sq == 1``) uses one state over the whole evicted set, which is causal by
+          construction: the single query sits after every key in the cache.
+
+        Either way the state is rebuilt from the current cache each call rather than carried across
+        steps. That is deliberate at eval scale: ``psi`` is ``O(L)``, and maintaining ``(H, z, W)``
+        incrementally means tracking exactly which keys crossed their deadline since the last step --
+        a second bookkeeping path that has to agree with ``deadlines()`` exactly or the two branches
+        double-count. The incremental form is a decode optimization, not a different model.
+        """
+        from kvpress.presses.gqa_indexer.memory import fuse_memory
+        from kvpress.presses.gqa_indexer.qi_flex_attention import _flex, qi_block_mask
+
+        memory = self.press.get_memory(module)
+        bsz, n_q_heads, q_len, _ = query.shape
+        n_kv_heads = key.shape[1]
+        group = n_q_heads // n_kv_heads
+        if bsz != 1:
+            raise NotImplementedError(
+                f"memory=True supports batch 1, got {bsz}: qi_block_mask is built with B=None."
+            )
+
+        # One row of the score matrix IS the per-key score for a query-independent scorer. Taken
+        # from q_idx/k_idx rather than by calling score_keys again, so this path cannot drift from
+        # what the selection uses -- the same reason the non-memory branch does it this way.
+        scores = torch.einsum("bhqd,bkd->bhk", q_idx[:, :, :1], k_idx)[0].float()
+        dl = deadlines(
+            scores, self.topk, force_sink=self.force_sink, force_local=self.force_local
+        )
+        block_mask = qi_block_mask(
+            dl,
+            q_len=q_len,
+            k_len=k_len,
+            n_q_heads=n_q_heads,
+            force_sink=self.force_sink,
+            force_local=self.force_local,
+            device=query.device,
+        )
+        o_s, lse_s = _flex()(
+            query,
+            key.repeat_interleave(group, dim=1),
+            value.repeat_interleave(group, dim=1),
+            block_mask=block_mask,
+            scale=scaling,
+            return_lse=True,
+        )
+
+        q_kv = query.view(bsz, n_kv_heads, group, q_len, query.shape[-1]).mean(2)
+        offset = k_len - q_len
+        if q_len > 1:
+            # PREFILL: a per-query-block state, exactly as training builds it. A single state shared
+            # by every row is **not** valid here -- it would let row t read keys at positions > t.
+            # Measured: at L=8192 row 0 saw a state built from 6208 future keys, and RULER 8K went
+            # from 73.71 to 4.00 while the training curve (which is causal) looked healthy. The
+            # streaming construction is the same code training uses, so the two cannot drift.
+            from kvpress.presses.gqa_indexer.memory_schedule import block_memory_states
+            from kvpress.presses.gqa_indexer.memory_trainer import MemoryTrainer
+
+            H, z, W, counts = block_memory_states(
+                memory,
+                key,
+                value,
+                dl,
+                q_len=q_len,
+                block=FLEX_BLOCK,
+                n_local=self.force_local,
+                scores=scores,
+            )
+            n, d = MemoryTrainer._read_per_block(
+                memory, q_kv, H, z, W, counts, block=FLEX_BLOCK
+            )
+        else:
+            # DECODE: one row, and it sits after every key in the cache, so a single state over the
+            # whole evicted set is causal by construction -- there is no future to leak.
+            enter = dl.to(torch.int64) + 1
+            weights = memory.ingest_weights(enter, k_len, scores=scores)
+            state = memory.ingest(key, value, weights)
+            counts = (enter <= k_len - 1).sum(-1)  # (Hkv,)
+            n_evicted = counts.view(1, -1, 1).expand(bsz, -1, q_len).float()
+            n, d = memory.read(q_kv, state, n_evicted)
+
+        out = fuse_memory(o_s, lse_s, n, d, group=group)
+        return out.transpose(1, 2).contiguous()
+
     # ------------------------------------------------------------------
     # Context management (mirrors E2EIndexerTrainer.hooks)
     # ------------------------------------------------------------------
@@ -284,6 +479,14 @@ class SparseAttentionContext:
         layers = get_language_model(self.model).layers
         scorer_is_qi = bool(
             getattr(self.press.get_indexer(layers[0].self_attn), "is_query_independent", False)
+        )
+        # A decay-carrying scalar scorer is still query-INDEPENDENT in the sense that matters
+        # (the query side carries only position, no content), so the flex path stays available.
+        # But its score is no longer constant along the query axis, which the deadline
+        # construction assumes, so the selection becomes approximate and the offsets have to be
+        # threaded. Both are gated on this flag.
+        self._decay_active = bool(
+            getattr(self.press.get_indexer(layers[0].self_attn), "decay", False)
         )
         if self._query_independent is None:
             self._use_qi = scorer_is_qi and HAS_FLEX

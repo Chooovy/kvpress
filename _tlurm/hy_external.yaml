@@ -1,0 +1,62 @@
+# document: https://hydra.cc/docs/tutorials/basic/your_first_app/simple_cli/
+# H200 使用指南: https://iwiki.woa.com/p/4019836574
+# taiji client升级指引 https://iwiki.woa.com/p/4016987116
+# usage: trun _tlurm/_hold_hy_r3_frontier.yaml
+
+# taiji_client config mode hunyun
+# this is a template for external clusters (hunyuan platform)
+
+
+# Typical usage:
+
+# trun _tlurm/hy_external.yaml --auto-commit exp \
+#     name="full_attention_baseline" \
+#     start_cmd="source scripts/taiji/init_shim.sh && bash scripts/pretrain_baseline_ruler.sh"
+
+
+train_code: 
+    project: rayleizhu/tlurm 
+    branch: master
+    commit: 47142f1c13e3dee38aafb37e0382514e2c793c3a
+is_pull_submodules: false
+start_cmd: "sleep 1h" # 启动命令，可选（为空则容器入口不跑任何脚本）
+gpu_name: "L20X"
+host_num: 1 # 几台GPU机器
+host_gpu_num: 8 # 每台GPU机器几张卡。支持使用vgpu，即填写0.x的卡数，卡数范围[0.05,1)，并且只能是0.05卡的倍数
+name: tlurm_example_${now:%Y%m%d-%H_%M_%S}
+business_flag: "TaiJi_HYAide_Ailab_R3_First" # 使用的业务标识/GPU应用组
+image_name: "mirrors.tencent.com/rayleizhu/taiji-cuda-dev:12.9"  # 镜像名
+
+### hy task requirements
+project_name: "预训练框架测试"
+train_stage: "Pretrain"
+thinking_type: "all"
+train_framework: "other"
+wsid: 10103 # get it here https://hunyuanaide.taiji.woa.com/
+
+model_local_file_path: "./"  # 模型训练代码在本地开发机的目录地址
+is_elasticity: false
+quota_type: "private"
+location: "wzw"
+exec_start_in_all_mpi_pods: true
+enable_rdma: false
+rdma_in_same_module: false
+enable_evicted_end_task: true
+keep_alive: false
+is_enable_fault_tolerance: false
+# enable_vscode: true
+
+is_resource_waiting: true  # 可选，资源不足时进入队列等待
+
+
+envs:
+    HUNYUAN_TASK_CATEGORY: "Agent"
+    HUNYUAN_TASK_DESCRIPTION: "Sparse Attention for Long Context"
+    HUNYUAN_TASK_MODEL_TYPE: "SFT"
+    HUNYUAN_TASK_START_MODEL_TYPE: "Qwen7B-dense"
+    HUNYUAN_TASK_DOMAIN: "Multimodal"
+    HUNYUAN_RESOURCE_USAGE: "production"
+    HUNYUAN_OUTPUT_BASE_MODEL: "7B-dense-4096"
+    HUNYUAN_TASK_DETAIL_CATEGORY: "Multimodal-Pretrain:GUIAgent"
+    TAIJI_DISABLE_DEPS: "true" # required for external cluster
+    TAIJI_DISABLE_JIZHICFS: "true" # required for external cluster

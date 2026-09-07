@@ -66,6 +66,66 @@ def test_full_topk_reduces_to_dense_attention():
 
 
 @torch.no_grad()
+def test_sequence_shorter_than_forced_slots_is_dense():
+    """
+    ``k_len < force_sink + force_local`` must attend densely, not raise.
+
+    The forced slots already cover every key at that length, so the support is the whole sequence
+    and the right answer is dense attention. But ``streaming_topk_support`` clamps ``topk`` down to
+    ``k_len`` first and only then rejects ``force_sink + force_local > topk``, so without the
+    short-circuit this raises ValueError -- on the *sequence being short*, which is not an error.
+
+    Not hypothetical: the reasoning benchmarks put the whole problem in the question and leave
+    ``context`` a single space (4 tokens after the chat template), so 20 of the 50 math500 rows
+    sampled at fraction 0.1 begin decoding at ``k_len`` in [32, 68) against the eval's default
+    ``force_sink=4, force_local=64``. The whole run died on its first question.
+    """
+    model = _tiny_model()
+    press = _press(model)
+    # 12 keys against 16 forced slots -- the regime that used to raise.
+    ids = torch.randint(0, model.config.vocab_size, (1, 12))
+
+    dense = model(input_ids=ids).logits
+    with SparseAttentionContext(model, press, topk=64, force_sink=4, force_local=12):
+        sparse = model(input_ids=ids).logits
+
+    assert torch.allclose(dense, sparse, atol=1e-4, rtol=1e-4), (
+        f"max abs diff {(dense - sparse).abs().max().item():.2e}"
+    )
+
+
+@torch.no_grad()
+def test_short_question_prefill_is_not_masked_top_left():
+    """
+    The dense fallback must align its causal mask BOTTOM-RIGHT, like the path it replaces.
+
+    The pipeline prefills context and question in two forwards, so the question arrives with
+    ``Sq != Sk`` (e.g. Sq=28 over Sk=32). ``F.scaled_dot_product_attention(is_causal=True)`` aligns
+    top-left, which would let the question's first row attend to key 0 alone; observably, Qwen3-8B
+    stopped answering math500 and emitted repeated boilerplate instead. Comparing against sdpa's
+    own bottom-right mask keeps the convention pinned.
+    """
+    model = _tiny_model()
+    press = _press(model)
+    context_ids = torch.randint(0, model.config.vocab_size, (1, 4))
+    question_ids = torch.randint(0, model.config.vocab_size, (1, 8))
+
+    reference = model(input_ids=torch.cat([context_ids, question_ids], dim=1)).logits[:, -8:]
+
+    # 12 total keys < force_sink + force_local, so both forwards take the dense fallback.
+    with SparseAttentionContext(model, press, topk=64, force_sink=4, force_local=12):
+        out = model(input_ids=context_ids, use_cache=True)
+        sparse = model(
+            input_ids=question_ids, past_key_values=out.past_key_values, use_cache=True
+        ).logits
+
+    assert torch.allclose(reference, sparse, atol=1e-4, rtol=1e-4), (
+        f"max abs diff {(reference - sparse).abs().max().item():.2e} -- the split prefill did not "
+        "reproduce the single-pass logits, so the fallback's mask is misaligned"
+    )
+
+
+@torch.no_grad()
 def test_decode_keeps_indexer_cache_in_lockstep():
     """Prefill then two decode steps must not trip the cache-length assertion, and must select."""
     model = _tiny_model()

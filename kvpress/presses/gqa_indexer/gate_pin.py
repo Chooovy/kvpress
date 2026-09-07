@@ -86,8 +86,14 @@ from kvpress.presses.gqa_indexer.fused_loss import accumulation_dtype
 logger = logging.getLogger(__name__)
 
 #: ``none`` leaves the no-op reachable and exists as the ablation baseline -- it is the
-#: behaviour before pinning was added. The other three close the hole.
-PIN_MODES = ("none", "sink", "self", "self+sink")
+#: behaviour before pinning was added. The others close the hole.
+PIN_MODES = ("none", "sink", "self", "self+sink", "local", "local+sink")
+
+#: Local window width in tokens for the ``local`` modes. SP-KV's default, and what its ablation
+#: picks: sweeping ``w`` over ``{1, 8, 32, 128, 512}`` gives gate densities
+#: 60.7 / 47.8 / 33.4 / **25.4** / 27.5 %. Handing the router a local window makes it *more*
+#: willing to drop distant keys, not less, and 128 is where that turns around.
+DEFAULT_N_LOCAL = 128
 
 
 def check_pin_mode(pin_mode: str) -> None:
@@ -97,23 +103,58 @@ def check_pin_mode(pin_mode: str) -> None:
 
 
 def pins_self(pin_mode: str) -> bool:
-    """Whether ``pin_mode`` exempts each query's own diagonal key."""
+    """Whether ``pin_mode`` exempts exactly each query's own diagonal key."""
     return pin_mode in ("self", "self+sink")
+
+
+def pins_local(pin_mode: str) -> bool:
+    """
+    Whether ``pin_mode`` exempts a **causal local window** ending at each query.
+
+    True for ``self`` too: a ``self`` pin *is* a window of width 1. Collapsing the two into one
+    predicate is what lets the kernel, the normalizer and the reference carry a single geometry
+    instead of two nearly-identical ones. :func:`local_width` gives the width that goes with the
+    mode.
+    """
+    return pins_self(pin_mode) or pin_mode in ("local", "local+sink")
+
+
+def local_width(pin_mode: str, n_local: int = DEFAULT_N_LOCAL) -> int:
+    """
+    Width of the pinned causal window: ``0`` when the mode has none, ``1`` for ``self``.
+
+    ``self`` deliberately ignores ``n_local``. That mode names an exact geometry -- the query's
+    own key and nothing else -- so honouring a width there would turn every existing
+    ``pin_mode="self"`` caller into a windowed one the moment a default moved, with no error
+    and a different trained router.
+    """
+    if pins_self(pin_mode):
+        return 1
+    if pin_mode in ("local", "local+sink"):
+        width = int(n_local)
+        if width < 1:
+            raise ValueError(
+                f"pin_mode={pin_mode!r} needs n_local >= 1, got {n_local}. Width 0 pins "
+                "nothing, which is pin_mode='sink' (or 'none') -- use those, so the "
+                "configuration says what it actually does."
+            )
+        return width
+    return 0
 
 
 def pins_sink(pin_mode: str) -> bool:
     """Whether ``pin_mode`` exempts the leading keys."""
-    return pin_mode in ("sink", "self+sink")
+    return pin_mode in ("sink", "self+sink", "local+sink")
 
 
 def is_query_dependent(pin_mode: str) -> bool:
     """
     Whether the pinned set differs per query row -- i.e. whether the concat fold is unavailable.
 
-    ``sink`` is query-independent and folds. ``self`` is not: the pinned column moves with the
-    row, and no shared key matrix can represent that.
+    ``sink`` is query-independent and folds. ``self`` and ``local`` are not: the pinned columns
+    move with the row, and no shared key matrix can represent that.
     """
-    return pins_self(pin_mode)
+    return pins_local(pin_mode)
 
 
 def pinned_mask(
@@ -124,31 +165,54 @@ def pinned_mask(
     *,
     n_sink: int = 0,
     query_offset: int | None = None,
+    pin_from: int | None = None,
+    n_local: int = DEFAULT_N_LOCAL,
 ) -> torch.Tensor | None:
     """
-    Which ``(query, key)`` pairs are exempt from the gate, ``(q_len, k_len)`` bool.
+      Which ``(query, key)`` pairs are exempt from the gate, ``(q_len, k_len)`` bool.
 
-    ``None`` for ``pin_mode="none"``, so callers can skip the whole pinning path rather than
-    carrying an all-False tensor through it.
+      ``None`` for ``pin_mode="none"`` *and* no ``pin_from``, so callers can skip the whole pinning
+      path rather than carrying an all-False tensor through it.
 
-    ``query_offset`` is the absolute position of the first query (default ``k_len - q_len``,
-    bottom-right alignment), matching :func:`~.indexer.build_indexer_mask` and
-    :func:`~.gated_attention.causal_mask_bottom_right`. A ``self`` pin is meaningless without
-    it: at ``Sq < Sk`` the diagonal is not at column ``i``.
+      ``query_offset`` is the absolute position of the first query (default ``k_len - q_len``,
+      bottom-right alignment), matching :func:`~.indexer.build_indexer_mask` and
+      :func:`~.gated_attention.causal_mask_bottom_right`. A ``self`` or ``local`` pin is
+      meaningless without it: at ``Sq < Sk`` the diagonal is not at column ``i``.
+
+    ``n_local`` is the width of the ``local`` modes' causal window (``0 <= t - s < w``), and is
+      ignored by every other mode -- ``self`` is fixed at width 1. This is SP-KV's always-available
+      sliding window: keys inside it are read at gate ``0`` AND excluded from the normalizer, so
+      the router never spends budget on a neighbour and ranks only what lies beyond the window.
+      That is the division of labour the eviction path already assumes at inference through
+      ``force_local``, which is the train/inference mismatch this pin removes.
+
+      ``pin_from`` pins every key at index ``>= pin_from`` -- the **tail pin** that carves a
+      sequence into a gated prefix and an ungated suffix. It is what the C1/C2 objective needs
+      (:mod:`~kvpress.presses.gqa_indexer.split_loss`): only the prefix is subject to eviction
+      pressure, while the suffix is read at full dense weight. Like ``sink`` and unlike ``local``
+      it is **query-independent** -- the same key set for every row -- so it folds into the concat
+      identity and costs the fused kernel one extra integer comparison.
     """
     check_pin_mode(pin_mode)
-    if pin_mode == "none":
-        return None
     if query_offset is None:
         query_offset = k_len - q_len
+    tail = None if pin_from is None or pin_from >= k_len else max(int(pin_from), 0)
+    if pin_mode == "none" and tail is None:
+        return None
 
     pinned = torch.zeros((q_len, k_len), dtype=torch.bool, device=device)
     if pins_sink(pin_mode) and n_sink > 0:
         pinned[:, : min(n_sink, k_len)] = True
-    if pins_self(pin_mode):
+    if tail is not None:
+        pinned[:, tail:] = True
+    width = local_width(pin_mode, n_local)
+    if width:
         q_pos = torch.arange(q_len, device=device).unsqueeze(-1) + query_offset
         k_pos = torch.arange(k_len, device=device).unsqueeze(0)
-        pinned |= k_pos == q_pos
+        # Causal by construction: 0 <= age < width. The lower bound matters at Sq < Sk,
+        # where a key can sit AFTER the query and would otherwise read as a negative age.
+        age = q_pos - k_pos
+        pinned |= (age >= 0) & (age < width)
     return pinned
 
 
@@ -201,22 +265,18 @@ class _HistoryLSE(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(
-        ctx, q_idx, k_idx, gate_scale, history, key_tile, acc, n_sink, query_offset
-    ):
+    def forward(ctx, q_idx, k_idx, gate_scale, history, key_tile, acc, n_sink, query_offset):
         bsz, n_heads, q_len, _ = q_idx.shape
         k_len = k_idx.shape[1]
         with torch.no_grad():
-            run_max = torch.full(
-                (bsz, n_heads, q_len), -float("inf"), device=q_idx.device, dtype=acc
-            )
+            run_max = torch.full((bsz, n_heads, q_len), -float("inf"), device=q_idx.device, dtype=acc)
             run_sum = torch.zeros_like(run_max)
             q_pos = torch.arange(q_len, device=q_idx.device).unsqueeze(-1) + query_offset
             for start in range(0, k_len, key_tile):
                 stop = min(start + key_tile, k_len)
-                logits = torch.einsum(
-                    "bhqd,bkd->bhqk", q_idx.to(acc), k_idx[:, start:stop].to(acc)
-                ) * gate_scale.to(acc)
+                logits = torch.einsum("bhqd,bkd->bhqk", q_idx.to(acc), k_idx[:, start:stop].to(acc)) * gate_scale.to(
+                    acc
+                )
                 if history is None:
                     k_pos = torch.arange(start, stop, device=q_idx.device).unsqueeze(0)
                     tile_history = (k_pos >= n_sink) & (k_pos <= q_pos)
@@ -231,18 +291,12 @@ class _HistoryLSE(torch.autograd.Function):
                     torch.exp(run_max - new_max),
                     torch.zeros_like(run_max),
                 )
-                safe_max = torch.where(
-                    torch.isfinite(new_max), new_max, torch.zeros_like(new_max)
-                )
-                run_sum = run_sum * rescale + torch.exp(
-                    logits - safe_max.unsqueeze(-1)
-                ).sum(dim=-1)
+                safe_max = torch.where(torch.isfinite(new_max), new_max, torch.zeros_like(new_max))
+                run_sum = run_sum * rescale + torch.exp(logits - safe_max.unsqueeze(-1)).sum(dim=-1)
                 run_max = new_max
 
             empty = ~torch.isfinite(run_max)
-            lse = torch.where(
-                empty, torch.zeros_like(run_max), run_max + torch.log(run_sum.clamp_min(1e-30))
-            )
+            lse = torch.where(empty, torch.zeros_like(run_max), run_max + torch.log(run_sum.clamp_min(1e-30)))
 
         ctx.save_for_backward(q_idx, k_idx, gate_scale, lse)
         ctx.history, ctx.key_tile, ctx.acc, ctx.empty = history, key_tile, acc, empty
@@ -263,9 +317,7 @@ class _HistoryLSE(torch.autograd.Function):
         # An empty-history row returned a constant 0, so it has no gradient path; zeroing the
         # incoming cotangent there keeps its (all -inf) weights from producing NaN below.
         grad = (grad_lse.to(acc) * ~ctx.empty).unsqueeze(-1)
-        q_pos = (
-            torch.arange(q_idx.shape[2], device=q_idx.device).unsqueeze(-1) + ctx.query_offset
-        )
+        q_pos = torch.arange(q_idx.shape[2], device=q_idx.device).unsqueeze(-1) + ctx.query_offset
 
         for start in range(0, k_len, key_tile):
             stop = min(start + key_tile, k_len)
@@ -371,13 +423,9 @@ def history_lse(
     if query_offset is None:
         query_offset = k_len - q_len
     scale = (
-        gate_scale
-        if isinstance(gate_scale, torch.Tensor)
-        else torch.tensor(gate_scale, device=q_idx.device, dtype=acc)
+        gate_scale if isinstance(gate_scale, torch.Tensor) else torch.tensor(gate_scale, device=q_idx.device, dtype=acc)
     )
-    lse = _HistoryLSE.apply(
-        q_idx, k_idx, scale, history, key_tile, acc, sink_stop, query_offset
-    )
+    lse = _HistoryLSE.apply(q_idx, k_idx, scale, history, key_tile, acc, sink_stop, query_offset)
     if return_history_count:
         if history is not None:
             return lse, history.sum(dim=-1)

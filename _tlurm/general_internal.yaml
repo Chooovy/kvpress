@@ -1,0 +1,35 @@
+
+# this is a template for internal clusters (general platform)
+# usage 1 (true task): trun _tlurm/_general_internal.yaml
+# usage 2 (hold task): trun -d _tlurm/_general_internal.yaml
+
+task_flag: tlurm_example_${now:%Y%m%d-%H_%M_%S} # 可选，任务标识，推荐修改为自己的任务标识，需保证唯一
+business_flag: "TaiJi_HYAide_AG_GZ_H20" # 使用的业务标识/GPU应用组
+image_full_name: "mirrors.tencent.com/rayleizhu/taiji-cuda-dev:12.9"  # 镜像名
+host_num: 1 # 几台GPU机器
+host_gpu_num: 8 # 每台GPU机器几张卡。支持使用vgpu，即填写0.x的卡数，卡数范围[0.05,1)，并且只能是0.05卡的倍数
+GPUName: "H20"
+cuda_version: "12.0"
+model_local_file_path: "./"  # 模型训练代码在本地开发机的目录地址
+mount_ceph_business_flag: "TaiJi_HYAide_AILab_ARCH_GZ_H20" # 可选，挂载的ceph业务标识
+start_cmd: "" # 启动命令，可选
+
+is_resource_waiting: true  # 可选，资源不足时进入队列等待
+is_elasticity: false
+keep_alive: false
+enable_evicted_pulled_up: true
+enable_rdma: true
+rdma_in_same_module: true
+enable_evicted_end_task: true
+exec_start_in_all_mpi_pods: true
+
+accelerate_params:
+    enable_optimization: true
+    application_scenario: "Torch-NLP"
+
+envs:
+    HUNYUAN_TASK_CATEGORY: "TEXT2TEXT"
+    HUNYUAN_TASK_DESCRIPTION: "Llama-3.1-405B SFT"
+    HUNYUAN_RESOURCE_USAGE: "experiment"
+    HUNYUAN_BASE_MODEL: "405B-dense-128k"
+    HUNYUAN_OUTPUT_BASE_MODEL: "405B-dense-128k"

@@ -42,13 +42,14 @@ pytestmark = pytest.mark.skipif(
     reason="needs Triton and either CUDA or TRITON_INTERPRET=1",
 )
 
-#: ``(pin_mode, n_sink, pin_self)`` -- the kernel takes the geometry, not the mode name, because
-#: both supported pins reduce to "which (query, key) pairs take gate 0".
+#: ``(pin_mode, n_sink, n_local)`` -- the kernel takes the geometry, not the mode name, because
+#: every supported pin reduces to "which (query, key) pairs take gate 0". ``n_local`` is the
+#: width of the causal window: 0 for no window, 1 for the ``self`` diagonal.
 PIN_CASES = [
-    ("none", 0, False),
-    ("sink", 4, False),
-    ("self", 0, True),
-    ("self+sink", 4, True),
+    ("none", 0, 0),
+    ("sink", 4, 0),
+    ("self", 0, 1),
+    ("self+sink", 4, 1),
 ]
 
 
@@ -64,7 +65,7 @@ def make_inputs(bsz=1, n_heads=4, n_kv_heads=2, q_len=16, k_len=16, dim=16, idx_
     )
 
 
-def run_kernel(inputs, gate_scale, pin_mode, n_sink, pin_self, block_m=8, block_n=8):
+def run_kernel(inputs, gate_scale, pin_mode, n_sink, n_local, block_m=8, block_n=8):
     """
     The kernel, with ``lse`` built the way the production path builds it.
 
@@ -87,7 +88,7 @@ def run_kernel(inputs, gate_scale, pin_mode, n_sink, pin_self, block_m=8, block_
         scaling=inputs["q"].shape[-1] ** -0.5,
         query_offset=k_len - q_len,
         n_sink=n_sink,
-        pin_self=pin_self,
+        n_local=n_local,
         block_m=block_m,
         block_n=block_n,
     )
@@ -104,7 +105,7 @@ def grads_of(out, inputs, gate_scale, seed=2):
 LABELS = ("out", "d q", "d k", "d v", "d q_idx", "d k_idx", "d gate_scale")
 
 
-@pytest.mark.parametrize("pin_mode,n_sink,pin_self", PIN_CASES)
+@pytest.mark.parametrize("pin_mode,n_sink,n_local", PIN_CASES)
 @pytest.mark.parametrize(
     "q_len,k_len,n_heads,n_kv_heads,dim,idx_dim",
     [
@@ -115,7 +116,7 @@ LABELS = ("out", "d q", "d k", "d v", "d q_idx", "d k_idx", "d gate_scale")
         (1, 12, 2, 2, 8, 8),      # a decode step
     ],
 )
-def test_kernel_matches_reference(pin_mode, n_sink, pin_self, q_len, k_len, n_heads, n_kv_heads, dim, idx_dim):
+def test_kernel_matches_reference(pin_mode, n_sink, n_local, q_len, k_len, n_heads, n_kv_heads, dim, idx_dim):
     """
     Forward **and all six gradients** must match the reference, for every pin mode and shape.
 
@@ -135,7 +136,7 @@ def test_kernel_matches_reference(pin_mode, n_sink, pin_self, q_len, k_len, n_he
                 scaling=dim**-0.5,
             )
         else:
-            out = run_kernel(inputs, gate_scale, pin_mode, n_sink, pin_self)
+            out = run_kernel(inputs, gate_scale, pin_mode, n_sink, n_local)
         results[path] = grads_of(out, inputs, gate_scale)
 
     for index, label in enumerate(LABELS):

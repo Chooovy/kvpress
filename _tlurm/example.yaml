@@ -1,0 +1,39 @@
+train_code:
+    project: TencentAILab/nlp/research/architecture/InfiniteLongLM
+    branch: hils_mla_ste
+    commit: bfea5ca201c2682d43f01c5f667aa22985891110
+is_pull_submodules: false
+start_cmd: "sleep 1h"
+name: infinitelonglm_cog_a100_${now:%Y%m%d_%H%M%S}
+business_flag: "TaiJi_HYAide_AILab_Cog_SH_A100H"
+extra_plat_business: "TaiJi_HYAide_AILab_MM_SH_A100H"
+host_num: 4
+host_gpu_num: 8
+gpu_name: "A100PRO"
+location: "tj"
+cuda_version: "11.0"
+image_name: "mirrors.tencent.com/shawnxxhu/veomni_sglang_v1.3"
+project_name: "long_memory"
+train_stage: "Pretrain"
+thinking_type: "all"
+train_framework: "other"
+quota_type: "private"
+model_local_file_path: "./"
+is_elasticity: false
+keep_alive: false
+enable_evicted_pulled_up: true
+enable_evicted_end_task: true
+enable_rdma: true
+rdma_in_same_module: true
+exec_start_in_all_mpi_pods: false
+is_resource_waiting: true
+belong_project_name: "long_memory"
+description_info: "long_memory"
+envs:
+    CEPH_ROOT: "/apdcephfs_fsgm/share_303843174"
+    WANDB_API_KEY: "28a9abbfd1dffa2b3ae7a4acc2c7ea6a83e983e5"
+    HUNYUAN_TASK_CATEGORY: "TEXT2TEXT"
+    HUNYUAN_TASK_DESCRIPTION: "Memory-Retrieval"
+    HUNYUAN_RESOURCE_USAGE: "experiment"
+    HUNYUAN_BASE_MODEL: "405B-dense-128k"
+    HUNYUAN_OUTPUT_BASE_MODEL: "405B-dense-128k"

@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Config layer for evaluate_reasoning_longbench.sh. Separate from evaluate_config.yaml because that
+# file ships RULER-shaped defaults that are wrong here and, worse, arrive silently:
+#
+#   data_dir: "4096"       -> math500/aime25/longbench-v2 have no length splits. load_dataset would
+#                             be asked for a subdirectory that does not exist.
+#   model_kwargs.dtype     -> "dtype" is the post-4.56 spelling; this box runs transformers
+#                             4.56.0.dev0, whose Qwen3ForCausalLM.__init__ rejects it outright
+#                             ("unexpected keyword argument 'dtype'"). "torch_dtype" is the spelling
+#                             that works here.
+#   press_name: knorm      -> would quietly compress the dense baseline.
+#
+# evaluate.py layers dataclass defaults < YAML < CLI, and evaluate_sharded.py reproduces that
+# layering before forwarding the merged result to its shards, so anything set here is overridable
+# from the shell script's flags.
+
+output_dir: "./results_reasoning_longbench"
+
+# Left null: these benchmarks are single-config datasets, unlike RULER where data_dir is the length.
+data_dir: null
+
+# The dense arm. The shell script passes --press_name explicitly for both arms; this is only the
+# floor, chosen so that a run which somehow lost that flag measures nothing rather than measuring
+# knorm compression and reporting it as a baseline.
+press_name: "no_press"
+compression_ratio: 0.0
+key_channel_compression_ratio: null
+threshold: null
+
+fraction: 0.1
+max_new_tokens: null
+max_context_length: null
+query_aware: false
+needle_depth: null
+
+device: null
+fp8: false
+
+# sdpa rather than flash_attention_2: a flash-attn build that merely imports without matching the
+# installed torch returns wrong logits *silently* -- it reads as "the model scores 0 on everything"
+# rather than as a crash. The shell script passes --attn_implementation too, so both arms match.
+attn_implementation: "sdpa"
+
+model_kwargs:
+  # torch_dtype, not dtype -- see the header. "auto" resolves to bf16 from the checkpoint's config,
+  # which is what the sparse path loads the backbone as, so the two arms share a dtype.
+  torch_dtype: "auto"

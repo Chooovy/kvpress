@@ -407,6 +407,39 @@ def load_indexer_state_dict(model: nn.Module, state_dict: dict, scorer_attr: str
     logger.info("Loaded %d %s tensors", len(filtered), scorer_attr)
 
 
+#: Attribute the linear-memory modules are registered under, matching
+#: :attr:`~.press.GQAIndexerPress.memory_attr`.
+MEMORY_ATTR = "kv_memory"
+
+
+def memory_state_dict(model: nn.Module, memory_attr: str = MEMORY_ATTR) -> dict:
+    """
+    Extract just the memory weights, in the same fully-qualified form as the indexer's.
+
+    Kept as a separate call rather than folded into :func:`indexer_state_dict` because the two are
+    trained in different stages and a checkpoint should say which it holds: the memory arm loads a
+    *frozen* router from one file and writes only the memory to another, so mixing them would make
+    "which router was this memory trained against" unanswerable from the artifacts.
+
+    ~7.1M parameters over 36 layers at the default geometry, so the file stays small.
+    """
+    return indexer_state_dict(model, scorer_attr=memory_attr)
+
+
+def load_memory_state_dict(
+    model: nn.Module, state_dict: dict, memory_attr: str = MEMORY_ATTR
+) -> None:
+    """
+    Load memory weights, failing loudly if nothing matched or a key is unknown.
+
+    Same contract as :func:`load_indexer_state_dict`, and required for the same reason:
+    ``strict=False`` is unavoidable (the dict omits the backbone) but it also swallows genuine
+    mismatches, so a checkpoint written at a different ``memory_rank`` would half-load and train a
+    partly-random memory while every logged number looked fine.
+    """
+    load_indexer_state_dict(model, state_dict, scorer_attr=memory_attr)
+
+
 #: Parameters only a scalar indexer has. ``in_norm``/``w_out`` rather than ``w_in``/``mid_norm``
 #: because the ``mid_dim=0`` linear ablation drops the latter, and would then read as pairwise.
 _SCALAR_ONLY_SUFFIXES = ("in_norm.weight", "in_norm.bias", "w_out.weight")
@@ -419,6 +452,11 @@ _PAIRWISE_ONLY_SUFFIXES = ("w_q.weight", "w_k.weight", "q_norm.weight", "k_norm.
 _PREFIX_ONLY_SUFFIXES = ("w_pq.weight", "w_pk.weight", "w_pv.weight", "w_a.weight")
 #: Parameters only a DMA value scorer has.
 _DMA_ONLY_SUFFIXES = ("dt_proj.weight", "A")
+
+#: Unique to the Fast-KVzip head: the learnable reference bank. Deliberately NOT q_norm/
+#: k_norm, which the pairwise scorer also carries -- keying on those would make every
+#: kvzip checkpoint look ambiguous and fall through to "cannot tell which scorer".
+_KVZIP_ONLY_SUFFIXES = ("k_base", "q_proj.weight", "k_proj.weight")
 
 
 def detect_scorer_from_keys(state_dict) -> str | None:
@@ -436,6 +474,10 @@ def detect_scorer_from_keys(state_dict) -> str | None:
     is_scalar = any(n.endswith(_SCALAR_ONLY_SUFFIXES) for n in names)
     is_pairwise = any(n.endswith(_PAIRWISE_ONLY_SUFFIXES) for n in names)
     is_dma = any(n.endswith(_DMA_ONLY_SUFFIXES) for n in names)
+    # Before the pairwise test: a kvzip head carries q_norm/k_norm too, so the pairwise predicate
+    # fires on it. k_base is what separates them.
+    if any(n.endswith("k_base") for n in names):
+        return "kvzip"
     if is_dma:
         return "dma" if not (is_pairwise or is_scalar or is_prefix) else None
     if is_pairwise:
@@ -451,7 +493,7 @@ def detect_scorer_from_keys(state_dict) -> str | None:
 
 def detect_scorer(state_dict, config: dict | None = None) -> str:
     """
-    Which scorer wrote a checkpoint: ``"pairwise"``, ``"scalar"``, ``"prefix"`` or ``"dma"``.
+    Which scorer wrote a checkpoint: ``"pairwise"``, ``"scalar"``, ``"prefix"``, ``"dma"`` or ``"kvzip"``.
 
     ``config["scorer"]`` is authoritative when present -- that is what the trainer actually ran.
     Checkpoints written before the field existed fall back to
@@ -459,7 +501,7 @@ def detect_scorer(state_dict, config: dict | None = None) -> str:
     building the wrong scorer either fails on every key or, worse, half-loads.
     """
     recorded = (config or {}).get("scorer")
-    if recorded in ("pairwise", "scalar", "prefix", "dma"):
+    if recorded in ("pairwise", "scalar", "prefix", "dma", "kvzip"):
         return recorded
     if recorded is not None:
         raise ValueError(f"checkpoint records an unknown scorer {recorded!r}")
@@ -567,6 +609,99 @@ def press_kwargs_from_checkpoint(
         recorded = config.get("scalar_pos_slope")
         if recorded is not None:
             kwargs["scalar_pos_slope"] = float(recorded)
+    if scorer == "scalar":
+        kwargs.update(infer_scalar_decay(state_dict, config))
     if scorer == "prefix":
         kwargs.update(infer_prefix_dims(state_dict, config))
+    if scorer == "kvzip":
+        recorded = config.get("scalar_pos_slope")
+        if recorded is not None:
+            kwargs["scalar_pos_slope"] = float(recorded)
+        kwargs.update(infer_scalar_decay(state_dict, config))
+        kwargs.update(infer_kvzip_dims(state_dict, config))
     return scorer, kwargs
+
+
+def infer_kvzip_dims(state_dict, config: dict | None = None) -> dict:
+    """
+    A kvzip head's ``(kvzip_dim, kvzip_base, kvzip_ngroup)``, taken from the weight shapes.
+
+    All three are parameter shapes -- ``k_base`` is ``(n_heads, base, dim)`` and ``q_proj`` is
+    ``(n_heads * ngroup * dim, hidden)`` -- so they are read from the weights rather than the
+    recorded config: if the two ever disagree, only the shapes can load. The config is used only
+    to fill ``ngroup`` when the bank was ablated away.
+    """
+    out: dict = {}
+    k_base = next((t for n, t in state_dict.items() if str(n).endswith("k_base")), None)
+    q_proj = next((t for n, t in state_dict.items() if str(n).endswith("q_proj.weight")), None)
+    k_proj = next((t for n, t in state_dict.items() if str(n).endswith("k_proj.weight")), None)
+    if k_base is not None:
+        n_heads, base, dim = (int(x) for x in k_base.shape)
+        out["kvzip_base"] = base
+        out["kvzip_dim"] = dim
+    elif k_proj is not None:
+        # Bank ablated (kvzip_base=0): dim comes from k_proj, which is (n_heads * dim, hidden).
+        out["kvzip_base"] = 0
+        recorded = (config or {}).get("kvzip_dim")
+        if recorded is None:
+            raise ValueError(
+                "checkpoint has no k_base and records no kvzip_dim, so the projection width "
+                "cannot be recovered (k_proj folds n_heads and dim into one axis). Retrain with "
+                "the field recorded, or pass the geometry explicitly."
+            )
+        out["kvzip_dim"] = int(recorded)
+        n_heads, dim = None, out["kvzip_dim"]
+    else:
+        raise ValueError("checkpoint identifies as kvzip but holds neither k_base nor k_proj")
+
+    if q_proj is not None and n_heads is not None:
+        # q_proj is (n_heads * ngroup * dim, hidden) -> ngroup follows from the other two.
+        out["kvzip_ngroup"] = int(q_proj.shape[0]) // (n_heads * out["kvzip_dim"])
+    else:
+        recorded = (config or {}).get("kvzip_ngroup")
+        if recorded:
+            out["kvzip_ngroup"] = int(recorded)
+    return out
+
+
+def infer_scalar_decay(state_dict, config: dict | None = None) -> dict:
+    """
+    Whether a scalar checkpoint carries TrimKV's lifetime head, and at what geometry.
+
+    ``decay`` itself is read from the **weights** -- a ``w_decay`` tensor is present or it is not --
+    for the same reason :func:`infer_scalar_mid_dim` prefers shapes: that is the one source that
+    cannot disagree with what was actually trained. A recorded config claiming the opposite is an
+    error rather than an override, since one of the two is certainly wrong about the checkpoint.
+
+    ``decay_ref`` and ``decay_init`` can only come from the config. Neither is a parameter --
+    ``ref`` divides a position and ``init`` merely seeded a bias that has since trained -- so a
+    wrong value loads every tensor cleanly and silently rescales every age. ``decay_init`` is
+    recorded for provenance only and is deliberately *not* returned: re-applying it at eval would
+    do nothing (the bias comes from the weights), and passing it would only invite the impression
+    that it still matters after training.
+
+    An older checkpoint that predates decay records nothing and has no ``w_decay``, so this
+    returns ``{}`` and the press default (off) applies -- which is exactly right.
+    """
+    config = config or {}
+    has_decay = any(".w_decay." in str(k) or str(k).endswith("w_decay.bias") for k in state_dict)
+    recorded = config.get("scalar_decay")
+    if recorded is not None and bool(recorded) != has_decay:
+        raise ValueError(
+            f"checkpoint records scalar_decay={recorded} but its weights "
+            f"{'contain' if has_decay else 'do not contain'} a w_decay head. One of the two is "
+            "wrong about this checkpoint; refusing to guess which."
+        )
+    if not has_decay:
+        return {}
+    out: dict = {"scalar_decay": True}
+    ref = config.get("scalar_decay_ref")
+    if ref is not None:
+        out["scalar_decay_ref"] = float(ref)
+    else:
+        logger.warning(
+            "checkpoint has a decay head but records no scalar_decay_ref; using the module "
+            "default. decay_ref is not a parameter, so a mismatch rescales every age silently "
+            "while every weight still loads."
+        )
+    return out

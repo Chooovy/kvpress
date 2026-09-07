@@ -6,7 +6,7 @@ import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import MethodType
-from typing import Generator, List
+from typing import Generator, List, Literal
 
 import torch
 from torch import nn
@@ -45,15 +45,52 @@ class KVzipPress(BasePress):
         Number of initial tokens to preserve as attention sinks.
     kvzip_plus_normalization: bool, default=False
         Whether to enable KVzip+ normalization.
+    query_pool : int, default=1
+        Mean-pool the reconstruction query embeddings in blocks of this many tokens, so the second
+        pass replays ``len(chunk) / query_pool`` rows instead of ``len(chunk)``. ``1`` is KVzip
+        unchanged, which makes this a single-variable A/B.
+
+        The scoring overhead falls roughly as ``1/query_pool``, but the score changes in a way worth
+        stating: ``<mean_i(q_i), k_j> = mean_i(<q_i, k_j>)``, so pooling silently replaces KVzip's
+        ``max`` over queries with an *average* over each block. KVzip's semantics are "keep ``j`` if
+        *any* reconstruction query needs it"; pooled, it becomes "if the *average* query needs it",
+        which dilutes a key that only one query in its block depends on. The ``max`` *between*
+        blocks survives, so this is a knob trading how many distinct information needs the score can
+        express against cost.
+
+        Measured on RULER 8K (``scratch/probe_meanpool_kvzip.py``): against the true ``P=1`` score,
+        pooling reaches only ~0.55 top-k overlap at keep 25% and loses to simply *subsampling* every
+        ``P``-th real token at every ``P`` tried.
+
+        Only the repeated context is pooled -- the instruction tokens ("Repeat the previous context
+        exactly") carry the reconstruction semantics and are kept verbatim. Each pooled block is
+        given the position of the block's **centre**, so RoPE distances to the context keys are
+        preserved; without that the second segment's positions would compress ``query_pool``-fold
+        and the recency geometry would silently change.
+    query_pool_mode : {"mean", "subsample"}, default="mean"
+        How each block of ``query_pool`` tokens is reduced to one query.
+
+        ``"mean"`` averages the block's embeddings, which is what turns KVzip's ``max`` into an
+        average and dilutes rare demands. ``"subsample"`` instead keeps the block's **centre token**
+        verbatim -- same query count, same positions, same cost, but the query is a real token whose
+        contrast is undiluted. It is strictly the cheaper operation and the probe favours it at every
+        ``P``, so it is the control that says whether the loss comes from *pooling* or from *having
+        fewer queries*.
     """
 
     compression_ratio: float = 0.0
     layerwise: bool = False
     n_sink: int = 4
     kvzip_plus_normalization: bool = False
+    query_pool: int = 1
+    query_pool_mode: Literal["mean", "subsample"] = "mean"
 
     def __post_init__(self):
         assert 0 <= self.compression_ratio < 1, "Compression ratio must be between 0 and 1"
+        assert self.query_pool >= 1, f"query_pool must be >= 1, got {self.query_pool}"
+        assert self.query_pool_mode in ("mean", "subsample"), (
+            f"query_pool_mode must be 'mean' or 'subsample', got {self.query_pool_mode!r}"
+        )
         logger.warning(
             "KVzipPress requires multiple forward passes for chunked context reconstruction, "
             "resulting in a computational overhead of 2–3 times the initial prefilling cost. "
@@ -188,16 +225,80 @@ class KVzipPress(BasePress):
         self.start_idx = self.prefix_length
         for prefill_ids, repeat_ids in chunked_context_pairs:
             self.end_idx = self.start_idx + prefill_ids.shape[1]
-            # Pass the cache that was used in the initial forward pass
-            model(
-                input_ids=repeat_ids.to(model.device),
-                past_key_values=self._cache,
-                num_logits_to_keep=1,
-            )
+            # start_idx/end_idx bracket the chunk's keys and are set from the UNPOOLED chunk, so
+            # every key is still scored even when the queries are pooled.
+            if self.query_pool > 1:
+                inputs_embeds, position_ids = self._pool_repeat_queries(
+                    model, repeat_ids, prefill_ids.shape[1]
+                )
+                model(
+                    inputs_embeds=inputs_embeds,
+                    position_ids=position_ids,
+                    past_key_values=self._cache,
+                    num_logits_to_keep=1,
+                )
+            else:
+                # Pass the cache that was used in the initial forward pass
+                model(
+                    input_ids=repeat_ids.to(model.device),
+                    past_key_values=self._cache,
+                    num_logits_to_keep=1,
+                )
             self.start_idx = self.end_idx
 
         # Perform final compression
         self.compress_post(model)
+
+    def _pool_repeat_queries(
+        self, model: PreTrainedModel, repeat_ids: torch.Tensor, n_repeated: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Reduce the repeated context to one query per block of ``query_pool`` tokens.
+
+        ``repeat_ids`` is ``[q_ids, suffix_ids, a_ids]`` as built by :meth:`prepare`; only the
+        trailing ``n_repeated`` tokens (``a_ids``) are reduced. The instruction and chat-suffix
+        tokens ahead of them are what make this a *reconstruction* query rather than a continuation,
+        so they are kept verbatim.
+
+        ``query_pool_mode`` selects the reduction: ``"mean"`` averages each block's embeddings,
+        ``"subsample"`` keeps the block's centre token. Both share the block bounds and the emitted
+        positions, so switching between them changes exactly one thing.
+
+        Returns the embeddings and their ``position_ids``. Each block takes the position of its
+        **centre** rather than a fresh consecutive index: the score depends on the rotary offset
+        between these queries and the context keys, and consecutive numbering would pull the whole
+        segment ``query_pool`` times closer to the context, changing the geometry the score is read
+        from for reasons that have nothing to do with the reduction. For ``"subsample"`` the centre
+        position is also the kept token's own true position, so its queries are exactly the rows the
+        unpooled pass would have produced there.
+        """
+        device = model.device
+        embed = model.get_input_embeddings()
+        repeat_ids = repeat_ids.to(device)
+        n_prefix = repeat_ids.shape[1] - n_repeated
+        embeds = embed(repeat_ids)
+
+        head = embeds[:, :n_prefix]
+        body = embeds[:, n_prefix:]
+        bounds = [
+            (s, min(s + self.query_pool, n_repeated)) for s in range(0, n_repeated, self.query_pool)
+        ]
+        if self.query_pool_mode == "mean":
+            pooled = torch.stack([body[0, lo:hi].mean(0) for lo, hi in bounds]).unsqueeze(0)
+        else:
+            centres = [(lo + hi - 1) // 2 for lo, hi in bounds]
+            pooled = body[:, centres]
+
+        # The cache holds the context, so this segment starts right after it.
+        base = self.context_length
+        pos_head = torch.arange(base, base + n_prefix, device=device)
+        pos_body = torch.tensor(
+            [base + n_prefix + (lo + hi - 1) // 2 for lo, hi in bounds], device=device
+        )
+        return (
+            torch.cat([head, pooled], dim=1),
+            torch.cat([pos_head, pos_body]).unsqueeze(0),
+        )
 
     def _chunk_fn(self, ctx_ids: torch.Tensor, chunk_size: int) -> List[torch.Tensor]:
         """

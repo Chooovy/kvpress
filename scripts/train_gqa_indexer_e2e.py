@@ -94,13 +94,18 @@ if str(REPO_ROOT) not in sys.path:
 
 from kvpress import GQAIndexerPress  # noqa: E402
 from kvpress.presses.gqa_indexer import (  # noqa: E402
+    DEFAULT_DECAY_INIT,
+    DEFAULT_DECAY_REF,
     DEFAULT_LOGIT_CHUNK,
+    DEFAULT_N_LOCAL,
     DEFAULT_POS_SLOPE,
     PIN_MODES,
     E2EIndexerTrainer,
     e2e_indexer_training_step,
     e2e_indexer_delta_weighted_step,
     e2e_indexer_longce_step,
+    e2e_indexer_split_step,
+    resolve_split,
     indexer_state_dict,
     load_indexer_state_dict,
 )
@@ -157,8 +162,15 @@ def save(
         "indexer": indexer_state_dict(model, args.scorer_attr),
         "step": step,
         "config": {
-            "objective": "ruler_sft_answer_only" if args.sft_ruler else "e2e_lm_loss",
+            "objective": "ruler_sft_answer_only" if args.sft_ruler else (
+                "e2e_split_c1c2" if args.split_frac is not None else "e2e_lm_loss"
+            ),
             "model": args.model,
+            # The C1/C2 geometry. Not recoverable from the weights, and it changes what the
+            # router was trained to predict, so an eval or a resume that ignored it would be
+            # comparing two different objectives.
+            "split_frac": args.split_frac,
+            "split_gap": args.split_gap if args.split_frac is not None else None,
             # Which router produced these weights. Without it the two arms' checkpoints are
             # indistinguishable, and --init-from would load one into the other -- the parameter
             # names differ, so load_indexer_state_dict (strict=False) would drop everything and
@@ -168,6 +180,17 @@ def save(
             "scalar_pos_slope": (
                 args.scalar_pos_slope if args.scorer in ("scalar", "prefix") else None
             ),
+            # The decay geometry. `scalar_decay` IS recoverable from the weights (a w_decay tensor
+            # is either there or not), and the loader prefers that. decay_ref and decay_init are
+            # NOT parameters -- ref only ever divides a position and init only seeds a bias -- so a
+            # mismatch loads every tensor cleanly and silently rescales every age. Recording them
+            # is the only thing that makes an eval reproduce the geometry it was trained at.
+            "scalar_decay": args.scalar_decay if args.scorer in ("scalar", "kvzip") else None,
+            "kvzip_dim": args.kvzip_dim if args.scorer == "kvzip" else None,
+            "kvzip_base": args.kvzip_base if args.scorer == "kvzip" else None,
+            "kvzip_ngroup": args.kvzip_ngroup if args.scorer == "kvzip" else None,
+            "scalar_decay_ref": args.scalar_decay_ref if args.scalar_decay else None,
+            "scalar_decay_init": args.scalar_decay_init if args.scalar_decay else None,
             # The prefix branch's geometry. Recorded for the same reason as `scorer`: head_dim and
             # value_dim ARE parameter shapes, so a mismatch would fail to load loudly -- but
             # prefix_zero_init is not, and a run resumed with the flag flipped would train a
@@ -179,6 +202,7 @@ def save(
             "stage": args.stage,
             "pin_mode": args.pin_mode,
             "n_sink": args.n_sink,
+            "n_local": args.n_local,
             "gate_budget": args.gate_budget,
             "gate_budget_ratio": args.gate_budget_ratio,
             "schedule": args.schedule,
@@ -446,7 +470,7 @@ def main() -> int:
     model_group.add_argument("--n-heads", type=int, default=None)
     model_group.add_argument(
         "--scorer",
-        choices=("pairwise", "scalar", "prefix", "dma"),
+        choices=("pairwise", "scalar", "prefix", "dma", "kvzip"),
         default="pairwise",
         help="which router to train. 'pairwise' scores every (query, key) pair -- query-aware, "
         "and O(t) per decode step, which at 128K makes the router 32x the cost of the sparse "
@@ -485,6 +509,85 @@ def main() -> int:
         "makes a dropped key safe to free: verified 0 re-entries over 1500 steps with an absolute "
         "tilt against 27 when normalised by sequence length. Also carries the recency duty so the "
         "learned part is not pushed to predict ever-larger values (SparseK Sec. 3.2). 0 ablates it.",
+    )
+    model_group.add_argument(
+        "--scalar-decay",
+        action="store_true",
+        help="--scorer scalar only: give each key a learned LIFETIME as well as a magnitude, "
+        "which is TrimKV's core mechanism. The gate becomes s_j + log_beta_j * (i - j) / "
+        "decay_ref with log_beta <= 0, so a key's weight decays geometrically in its age and "
+        "its RANK can change over the sequence -- a frozen score fixes the ranking forever. "
+        "Folds into the existing bilinear gate exactly at Di = 2 * n_heads (verified 2.4e-07), "
+        "so no attention kernel changes and no extra memory beyond the doubled indexer width.",
+    )
+    model_group.add_argument(
+        "--scalar-decay-ref",
+        type=float,
+        default=DEFAULT_DECAY_REF,
+        help="age normalizer in tokens for --scalar-decay, a FIXED constant (default 16384, the "
+        "training length). Two jobs: it puts d(gate)/d(log_beta) = age/ref at O(1) instead of "
+        "1e4 so the lifetime head and the score head share one LR, and it keeps the tilt "
+        "absolute so a dropped key never re-enters the top-k. Normalising by the LIVE length "
+        "instead would break that (measured 27 re-entries vs 0). It is also load-bearing for "
+        "precision: the fold puts the position in a bf16 column, where a raw 16383 rounds to "
+        "16384 and an age of 83 collapses to 64.",
+    )
+    model_group.add_argument(
+        "--scalar-decay-init",
+        type=float,
+        default=DEFAULT_DECAY_INIT,
+        help="initial log_beta for --scalar-decay, in nats per decay_ref of age (default -1.0, "
+        "must be <= 0). -1.0 puts the decay term's range at the score's own std (~1) so the "
+        "lifetime is live from step 0. Deliberately NOT TrimKV's near-zero init: there the "
+        "retention hinge loss is what drives beta below 1, and this port replaces that hinge "
+        "with the gate's lse normalizer, which enforces a budget but exerts no pressure toward "
+        "shorter lifetimes -- so an inert init risks log_beta never leaving 0 and the arm "
+        "silently collapsing back to the plain scalar indexer. 0.0 is that ablation.",
+    )
+    model_group.add_argument(
+        "--kvzip-dim", type=int, default=16,
+        help="--scorer kvzip only: width of the per-token q/k projections and the 1/sqrt(d) "
+        "softmax scale (16 upstream). This is the arm's capacity knob, in place of "
+        "--scalar-mid-dim, which the kvzip config rejects.",
+    )
+    model_group.add_argument(
+        "--kvzip-base", type=int, default=16,
+        help="--scorer kvzip only: size of the learnable reference-key bank each token's logit "
+        "is scored against (16 upstream). This bank IS the architecture's one real idea -- an "
+        "adaptive, content-based threshold, which the scalar arm's MLP has no analogue of. 0 "
+        "removes it and reduces the score to a bare per-token logit, which is the ablation that "
+        "isolates the bank's contribution.",
+    )
+    model_group.add_argument(
+        "--kvzip-ngroup", type=int, default=0,
+        help="--scorer kvzip only: query groups per KV head, pooled in log space to one score. "
+        "0 (default) derives it from the model as n_q_heads / n_kv_heads, which is what upstream "
+        "uses (4 on Qwen3-8B).",
+    )
+    model_group.add_argument(
+        "--split-frac",
+        type=float,
+        default=None,
+        help="enable the C1/C2 (split-context) objective and give C1 this fraction of each "
+        "sequence. C1 is gated (soft-evicted), C2 is PINNED out of the gate and read densely, "
+        "and the LM loss is taken on C2 only -- so the router is supervised on FUTURE UTILITY: "
+        "every C2 query is at least |C2| tokens from every C1 key, so no C1 key can be rescued "
+        "by a local window and its retention is decided by the router alone. Under the default "
+        "objective most of a position's loss is explained by its neighbours, which "
+        "force_local=64 keeps for free at inference, so that gradient trains a decision the "
+        "router never faces. 0.5 (balanced) is the recommended starting point; below ~0.25 the "
+        "supervised positions get sparse enough to make the curve noisy. Composes with "
+        "--longce-weights, which then reweights within C2.",
+    )
+    model_group.add_argument(
+        "--split-gap",
+        type=int,
+        default=0,
+        help="drop this many positions at the start of C2 from the loss. The token just after "
+        "the split still has genuinely local dependencies reaching into C1's tail, so its loss "
+        "partly measures the short-range decision force_local makes for free. Set to 64 (one "
+        "local window) to remove that contamination, at the cost of that many supervised "
+        "positions.",
     )
     model_group.add_argument(
         "--prefix-head-dim",
@@ -587,6 +690,17 @@ def main() -> int:
     gate.add_argument(
         "--n-sink", type=int, default=None,
         help="leading keys to pin (default: --press-n-sink)",
+    )
+    gate.add_argument(
+        "--n-local", type=int, default=DEFAULT_N_LOCAL,
+        help="width of the always-attended causal window for --pin-mode local/local+sink, "
+        "in tokens (default 128, SP-KV's value). Keys within `n_local` of the query are read "
+        "at gate 0 AND held out of the gate's normalizer, so the router never spends budget on "
+        "a neighbour and ranks only what lies beyond the window -- the division of labour the "
+        "eviction path already assumes at inference via --force-local. SP-KV sweeps this at "
+        "{1, 8, 32, 128, 512} and reads gate densities 60.7/47.8/33.4/25.4/27.5%, i.e. a WIDER "
+        "window makes the router MORE willing to drop distant keys. Ignored by every other "
+        "pin mode; `self` is fixed at width 1.",
     )
     budget = gate.add_mutually_exclusive_group()
     budget.add_argument(
@@ -779,6 +893,48 @@ def main() -> int:
                 "attention_mask threaded through the gate's selector and normalizer. Use "
                 "--global-batch-size / --accum-steps to reach the batch you want."
             )
+    if args.split_frac is not None:
+        if not 0.0 < args.split_frac < 1.0:
+            raise SystemExit(f"--split-frac must be in (0, 1), got {args.split_frac}")
+        # A FIXED budget is arithmetically wrong under a split, not merely suboptimal.
+        # The gate grants history:pinned mass in the ratio gate_budget : |pinned|. Without a
+        # split, |pinned| = n_sink = 4, so C1 competes 1:4. With a split every C2 key is pinned
+        # too, so at 8K/split 4096 it competes 1:4100 -- a log(4101) = 8.3 nat handicap applied
+        # to exactly the region this objective exists to teach. Measured on a 512-token probe:
+        # router-controlled attention mass 0.2391 unsplit vs 0.0157 split (15x less), restored to
+        # 0.53 by ratio=0.5. The observed failure was a router whose gate_sparsity collapsed to
+        # 0.055 (vs 0.163-0.174 for the unsplit arms) and RULER 8K 12.77 vs 73.71.
+        #
+        # A ratio budget scales with the history length, so the handicap cannot appear.
+        if args.gate_budget_ratio is None:
+            raise SystemExit(
+                "--split-frac requires --gate-budget-ratio (try 0.5).\n"
+                "  A fixed --gate-budget splits the gate's mass as budget : |pinned|, and a "
+                "split pins the whole C2 suffix -- so C1, the region being trained, takes a "
+                "log(|C2| + n_sink) handicap (8.3 nats at 8K/split 4096). The router responds "
+                "by collapsing onto a few keys, which then scores near zero at eval where "
+                "nothing is pinned. Pass --gate-budget-ratio to make the budget proportional "
+                "to the history length instead."
+            )
+        if args.delta_weight:
+            raise SystemExit(
+                "--split-frac and --delta-weight are incompatible: delta compares a dense "
+                "reference forward against the gated one, but under a split the two differ by "
+                "the pin geometry as well as the gate, so the gap no longer isolates routing."
+            )
+        if args.stage == "sparse":
+            raise SystemExit(
+                "--split-frac needs --stage dense: it splits the key axis into a gated prefix "
+                "and a pinned suffix, and under the sparse stage the forward is already "
+                "restricted to the router's top-k so there is no dense prefix to pressure."
+            )
+        if args.sft_ruler:
+            raise SystemExit(
+                "--split-frac and --sft-ruler both decide which positions carry loss; running "
+                "both would silently produce a third objective neither was validated as."
+            )
+        if args.split_gap < 0:
+            raise SystemExit(f"--split-gap must be non-negative, got {args.split_gap}")
     if args.longce_weights:
         # All four are configuration contradictions, so they surface before any device is touched.
         if args.delta_weight:
@@ -986,9 +1142,29 @@ def main() -> int:
         "n_sink": args.press_n_sink,
         "scorer": args.scorer,
     }
+    if args.scorer == "kvzip":
+        # Same geometry as the scalar arm (tilt, decay, gate multiplier) but no MLP: the scoring
+        # head is a q/k self-interaction against a learnable key bank, so mid_dim has no meaning
+        # and the config rejects it.
+        press_kwargs["scalar_pos_slope"] = args.scalar_pos_slope
+        press_kwargs["scalar_decay"] = args.scalar_decay
+        press_kwargs["scalar_decay_ref"] = args.scalar_decay_ref
+        press_kwargs["scalar_decay_init"] = args.scalar_decay_init
+        press_kwargs["kvzip_dim"] = args.kvzip_dim
+        press_kwargs["kvzip_base"] = args.kvzip_base
+        press_kwargs["kvzip_ngroup"] = args.kvzip_ngroup
     if args.scorer in ("scalar", "prefix"):
         press_kwargs["scalar_mid_dim"] = args.scalar_mid_dim
         press_kwargs["scalar_pos_slope"] = args.scalar_pos_slope
+        if args.scorer == "scalar":
+            press_kwargs["scalar_decay"] = args.scalar_decay
+            press_kwargs["scalar_decay_ref"] = args.scalar_decay_ref
+            press_kwargs["scalar_decay_init"] = args.scalar_decay_init
+        elif args.scalar_decay:
+            raise SystemExit(
+                f"--scalar-decay is only implemented for --scorer scalar/kvzip, got "
+                f"{args.scorer!r}."
+            )
     if args.scorer == "prefix":
         press_kwargs["prefix_head_dim"] = args.prefix_head_dim
         press_kwargs["prefix_value_dim"] = args.prefix_value_dim
@@ -1023,6 +1199,7 @@ def main() -> int:
         stage=args.stage,
         pin_mode=args.pin_mode,
         n_sink=args.n_sink,
+        n_local=args.n_local,
         gate_budget=args.gate_budget,
         gate_budget_ratio=args.gate_budget_ratio,
         key_tile=args.key_tile,
@@ -1141,6 +1318,16 @@ def main() -> int:
                         longce_missing, longce_seen = 0, 0
                         if rank == 0:
                             logger.info("LongCE weight cache: %s", longce_cache.summary())
+                if args.split_frac is not None:
+                    # Recomputed per stage: the split is a FRACTION, so the absolute index moves
+                    # with the curriculum. Set on the trainer because the attention hooks read it
+                    # from there to build the gate's pin -- the loss step asserts the two agree.
+                    trainer.split = resolve_split(seq_len, args.split_frac)
+                    if rank == 0:
+                        logger.info(
+                            "C1/C2 split at %d of %d (C1 gated, C2 pinned; loss on C2, gap %d)",
+                            trainer.split, seq_len, args.split_gap,
+                        )
                 current_len = seq_len
 
             optimizer.zero_grad(set_to_none=True)
@@ -1268,9 +1455,21 @@ def main() -> int:
                         model, trainer, input_ids=input_ids, labels=labels,
                         weights=torch.stack(batch_weights).to(device, non_blocking=True),
                         logit_chunk=args.delta_logit_chunk,
+                    ) if args.split_frac is None else e2e_indexer_split_step(
+                        model, trainer, input_ids=input_ids, labels=labels,
+                        split=trainer.split, gap=args.split_gap,
+                        weights=torch.stack(batch_weights).to(device, non_blocking=True),
+                        logit_chunk=args.delta_logit_chunk,
                     )
                     delta_stats["longce_cache_miss_frac"] = (
                         longce_missing / longce_seen if longce_seen else 0.0
+                    )
+                elif args.split_frac is not None:
+                    # Split objective without LongCE: plain mean over the C2 positions.
+                    loss, delta_stats = e2e_indexer_split_step(
+                        model, trainer, input_ids=input_ids, labels=labels,
+                        split=trainer.split, gap=args.split_gap,
+                        logit_chunk=args.delta_logit_chunk,
                     )
                 else:
                     # skip_logits must be explicit: liger's default gates on self.training, and

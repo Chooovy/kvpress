@@ -21,11 +21,20 @@ from kvpress.presses.gqa_indexer.indexer import (
     build_indexer_mask,
     slice_rope_tables,
 )
+from kvpress.presses.gqa_indexer.memory import MemoryConfig, MemoryKernel
 from kvpress.presses.gqa_indexer.prefix_indexer import PrefixIndexer, PrefixIndexerConfig
 from kvpress.presses.gqa_indexer.scalar_indexer import (
+    DEFAULT_DECAY_INIT,
+    DEFAULT_DECAY_REF,
     DEFAULT_POS_SLOPE,
     ScalarIndexer,
     ScalarIndexerConfig,
+)
+from kvpress.presses.gqa_indexer.kvzip_indexer import (
+    DEFAULT_KVZIP_BASE,
+    DEFAULT_KVZIP_DIM,
+    KVzipIndexer,
+    KVzipIndexerConfig,
 )
 from kvpress.presses.scorer_press import ScorerPress
 
@@ -41,6 +50,7 @@ _SCORER_CLASSES = {
     "scalar": ScalarIndexer,
     "prefix": PrefixIndexer,
     "dma": DMAIndexer,
+    "kvzip": KVzipIndexer,
 }
 
 
@@ -127,6 +137,24 @@ class GQAIndexerPress(ScorerPress):
         prefix" the single variable in the comparison.
     scorer_attr : str
         Attribute name the indexer is registered under on each attention module.
+    memory : bool
+        Attach a :class:`~.memory.MemoryKernel` per layer, so the keys this press evicts are first
+        compressed into a constant-size linear state and folded back into the same softmax at
+        inference (see :mod:`~.memory`). Off by default: the eviction baseline is the thing the
+        memory arm is measured against, and a distillation or router-only checkpoint must stay free
+        of the extra parameters.
+
+        Requires ``scorer="scalar"``. Query-independence is not a convenience here but the
+        precondition: ``E_t`` has to be a function of ``t`` alone for one accumulated state to
+        represent it, and under a pairwise scorer the evicted set varies per query.
+    memory_rank, memory_mid_dim : int
+        State rank ``R`` and trunk width ``R'``. ``memory_rank=0`` is the rank-0 ablation (one
+        learned vector per head times the mass), which measured 78% relative residual against the
+        exact evicted output -- so it is the cheap comparison, expected to lose.
+    memory_per_head : bool
+        Give each KV head its own kernel readout, sharing the trunk.
+    memory_attr : str
+        Attribute name the memory module is registered under.
     """
 
     compression_ratio: float = 0.0
@@ -142,11 +170,22 @@ class GQAIndexerPress(ScorerPress):
     scorer: str = "pairwise"
     scalar_mid_dim: int = 256
     scalar_pos_slope: float = DEFAULT_POS_SLOPE
+    #: TrimKV's per-key lifetime. Widens the indexer to ``2 * n_heads`` and makes the gate
+    #: ``s_j + log_beta_j * (i - j) / decay_ref``. See :class:`~.scalar_indexer.ScalarIndexerConfig`.
+    scalar_decay: bool = False
+    scalar_decay_ref: float = DEFAULT_DECAY_REF
+    scalar_decay_init: float = DEFAULT_DECAY_INIT
 
     # scorer="prefix" only: the prefix-attention branch's geometry
     prefix_head_dim: int = 128
     prefix_value_dim: int = 128
     prefix_zero_init: bool = True
+
+    # scorer="kvzip" only: Fast-KVzip's gate geometry. kvzip_ngroup=0 means "derive it
+    # from the model", i.e. n_q_heads / n_kv_heads, which is what upstream uses.
+    kvzip_dim: int = DEFAULT_KVZIP_DIM
+    kvzip_base: int = DEFAULT_KVZIP_BASE
+    kvzip_ngroup: int = 0
 
     # Query-axis reduction
     query_reduce: str = "mean"
@@ -164,6 +203,13 @@ class GQAIndexerPress(ScorerPress):
     use_vnorm: bool = False
     scorer_attr: str = "indexer"
 
+    # Linear memory over the evicted keys
+    memory: bool = False
+    memory_rank: int = 16
+    memory_mid_dim: int = 256
+    memory_per_head: bool = True
+    memory_attr: str = "kv_memory"
+
     _initialized: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self):
@@ -172,11 +218,24 @@ class GQAIndexerPress(ScorerPress):
             raise ValueError("n_sink and n_local must be non-negative")
         if self.chunk_size < 0:
             raise ValueError("chunk_size must be non-negative")
-        if self.scorer not in ("pairwise", "scalar", "prefix", "dma"):
+        if self.scorer not in ("pairwise", "scalar", "prefix", "dma", "kvzip"):
             raise ValueError(
-                "scorer must be 'pairwise', 'scalar', 'prefix' or 'dma', "
+                "scorer must be 'pairwise', 'scalar', 'prefix', 'dma' or 'kvzip', "
                 f"got {self.scorer!r}"
             )
+        if self.memory and self.scorer != "scalar":
+            # Structural, not a missing feature. The memory holds one state per KV head standing
+            # for the whole evicted set, which only exists if the evicted set is a function of the
+            # query position alone. A pairwise scorer's E_t varies per query, so no constant-size
+            # state represents it -- the module would run and quietly summarize the wrong keys.
+            raise ValueError(
+                f"memory=True requires scorer='scalar', got {self.scorer!r}. The memory keeps one "
+                "constant-size state per KV head for the evicted set, which presupposes that the "
+                "set depends only on the query's position; a query-dependent scorer evicts a "
+                "different set for every query and no single state can stand for it."
+            )
+        if self.memory and self.memory_mid_dim <= 0:
+            raise ValueError(f"memory_mid_dim must be positive, got {self.memory_mid_dim}")
 
     # ------------------------------------------------------------------
     # Setup
@@ -208,7 +267,7 @@ class GQAIndexerPress(ScorerPress):
                 raise ValueError("scorer='dma' scores values directly and does not use RoPE")
             return DMAIndexerConfig(n_heads=model_n_heads, head_dim=model_head_dim)
 
-        if self.scorer in ("scalar", "prefix"):
+        if self.scorer in ("scalar", "prefix", "kvzip"):
             # No head_dim and no rope_dim: the score is one number per (key, head), derived from
             # that key (or its prefix) alone, so there is nothing to rotate. The prefix arm's own
             # attention is deliberately NoPE -- h_j already carries the backbone's rotary signal
@@ -234,13 +293,41 @@ class GQAIndexerPress(ScorerPress):
                 gate_scale=self.gate_scale,
             )
             if self.scorer == "prefix":
+                if self.scalar_decay:
+                    # PrefixIndexer overrides score_keys with its own prefix-attention readout and
+                    # has no lifetime head; silently dropping the flag would train the wrong arm.
+                    raise ValueError(
+                        "scalar_decay is only implemented for scorer='scalar'. The prefix arm "
+                        "computes its score through prefix attention, which the decay fold does "
+                        "not cover."
+                    )
                 return PrefixIndexerConfig(
                     **common,
                     head_dim=self.prefix_head_dim,
                     value_dim=self.prefix_value_dim,
                     zero_init_prefix=self.prefix_zero_init,
                 )
-            return ScalarIndexerConfig(**common)
+            decay_kwargs = dict(
+                decay=self.scalar_decay,
+                decay_ref=self.scalar_decay_ref,
+                decay_init=self.scalar_decay_init,
+            )
+            if self.scorer == "kvzip":
+                # No MLP in this head, so mid_dim is dropped rather than passed -- the config
+                # rejects a nonzero one, which is what keeps a swept --scalar-mid-dim from
+                # silently meaning nothing here.
+                common.pop("mid_dim", None)
+                ngroup = self.kvzip_ngroup or (
+                    text_config.num_attention_heads // text_config.num_key_value_heads
+                )
+                return KVzipIndexerConfig(
+                    **common,
+                    **decay_kwargs,
+                    kvzip_dim=self.kvzip_dim,
+                    kvzip_base=self.kvzip_base,
+                    kvzip_ngroup=ngroup,
+                )
+            return ScalarIndexerConfig(**common, **decay_kwargs)
 
         head_dim = self.head_dim or getattr(
             module, "head_dim", text_config.hidden_size // text_config.num_attention_heads
@@ -264,6 +351,27 @@ class GQAIndexerPress(ScorerPress):
             gate_scale=self.gate_scale,
         )
 
+    def build_memory_config(self, model: nn.Module, module: nn.Module) -> MemoryConfig:
+        """Derive the memory geometry from the model's KV geometry.
+
+        The state lives on ``(n_kv_heads, head_dim)`` because that is the shape of what is evicted:
+        GQA holds physically separate caches per KV head, so each head's evicted set -- and hence
+        its summary -- is its own.
+        """
+        text_config = getattr(model.config, "text_config", model.config)
+        head_dim = getattr(
+            module,
+            "head_dim",
+            text_config.hidden_size // text_config.num_attention_heads,
+        )
+        return MemoryConfig(
+            n_kv_heads=text_config.num_key_value_heads,
+            head_dim=head_dim,
+            rank=self.memory_rank,
+            mid_dim=self.memory_mid_dim,
+            per_head_readout=self.memory_per_head,
+        )
+
     def post_init_from_model(self, model: nn.Module, force_reinit: bool = False) -> None:
         """
         Attach a :class:`GQAIndexer` to every attention layer.
@@ -281,6 +389,7 @@ class GQAIndexerPress(ScorerPress):
 
         language_model = get_language_model(model)
         created = 0
+        created_memory = 0
         for layer in language_model.layers:
             attn = layer.self_attn
             indexer_config = self.build_indexer_config(model, attn)
@@ -294,15 +403,38 @@ class GQAIndexerPress(ScorerPress):
                         "requested one. Use a fresh model, or force_reinit=True to replace it "
                         "(which discards the existing weights)."
                     )
+            else:
+                cls = _SCORER_CLASSES[self.scorer]
+                indexer = cls(indexer_config).to(device=model.device, dtype=model.dtype)
+                attn.register_module(self.scorer_attr, indexer)
+                created += 1
+
+            if not self.memory:
                 continue
-            cls = _SCORER_CLASSES[self.scorer]
-            indexer = cls(indexer_config).to(device=model.device, dtype=model.dtype)
-            attn.register_module(self.scorer_attr, indexer)
-            created += 1
+            memory_config = self.build_memory_config(model, attn)
+            existing_memory = getattr(attn, self.memory_attr, None)
+            if existing_memory is not None and not force_reinit:
+                if existing_memory.config != memory_config:
+                    raise ValueError(
+                        f"{type(attn).__name__} already has a {self.memory_attr!r} with geometry "
+                        f"{existing_memory.config}, but this press is configured for "
+                        f"{memory_config}. Use a fresh model, or force_reinit=True."
+                    )
+                continue
+            memory = MemoryKernel(memory_config).to(device=model.device, dtype=model.dtype)
+            # The scalars are created in fp32 and .to(dtype=...) just cast them back down. Undo it
+            # here rather than leaving it to the trainer: in bf16 a warmup learning rate rounds
+            # every step back and they stay frozen at initialization, which is the failure
+            # E2EIndexerTrainer.upcast_gate_scales documents (30 steps, all 36 layers, invisible).
+            memory.upcast_scalars()
+            attn.register_module(self.memory_attr, memory)
+            created_memory += 1
 
         self._initialized = True
         if created:
             logger.info("Initialized %d %s modules", created, self.scorer_attr)
+        if created_memory:
+            logger.info("Initialized %d %s modules", created_memory, self.memory_attr)
 
     def get_indexer(self, module: nn.Module) -> GQAIndexer:
         indexer = getattr(module, self.scorer_attr, None)
@@ -312,6 +444,20 @@ class GQAIndexerPress(ScorerPress):
                 "Call post_init_from_model(model) before using this press."
             )
         return indexer
+
+    def get_memory(self, module: nn.Module) -> MemoryKernel:
+        """This layer's :class:`~.memory.MemoryKernel`, raising when the press has none.
+
+        Raises rather than returning ``None`` so a caller cannot silently skip the memory term and
+        report numbers for the plain eviction baseline under the memory arm's name.
+        """
+        memory = getattr(module, self.memory_attr, None)
+        if memory is None:
+            raise RuntimeError(
+                f"No {self.memory_attr!r} found on {type(module).__name__}. Build the press with "
+                "memory=True and call post_init_from_model(model)."
+            )
+        return memory
 
     # ------------------------------------------------------------------
     # RoPE plumbing

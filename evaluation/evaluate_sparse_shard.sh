@@ -8,6 +8,17 @@
 #   bash evaluate_sparse_scalar_shard.sh
 #   MODEL=/path CKPT=/path/final.pt LENGTHS=8192 TOPKS=2048 bash evaluate_sparse_scalar_shard.sh
 #
+# To A/B the linear memory (kvpress.presses.gqa_indexer.memory), run the same command twice --
+# MEMORY= is the eviction baseline the memory arm has to beat:
+#
+#   CKPT=.../longce/final.pt LENGTHS="8192 16384" TOPKS=2048 bash evaluate_sparse_shard.sh
+#   MEMORY=.../memory/final.pt CKPT=.../longce/final.pt LENGTHS="8192 16384" TOPKS=2048 \
+#       bash evaluate_sparse_shard.sh
+#
+# Read the two per TASK, not just in aggregate. A rank-16 state cannot hold "the uuid is at position
+# 41022", so niah is expected to be roughly flat while vt/qa/cwe move; a uniform gain across all 13
+# tasks would be more suspicious than a selective one.
+#
 # HOW THIS DIFFERS FROM evaluate_sparse_scalar.sh
 # That script parallelizes over CONFIGURATIONS: one (length, topk) pair per GPU, because
 # evaluate_sparse.py had no sharding option and running one configuration on 8 GPUs would have
@@ -35,10 +46,17 @@ cd "$(dirname "$0")"
 DATASET="${DATASET:-ruler}"
 DATA_DIR="${DATA_DIR:-8192}"
 MODEL="${MODEL:-/apdcephfs_gy8/share_303843174/guhao/models/Qwen3-8B}"
-CKPT="${CKPT:-/apdcephfs_gy8/share_303843174/guhao/models/Qwen-3-8B-gqa_indexer_scalar/stage1_16k_mid256_delta0.1/step500.pt}"
-OUTPUT_DIR="${OUTPUT_DIR:-./results_sparse_scalar_delta}"
+CKPT="${CKPT:-/apdcephfs_gy8/share_303843174/guhao/models/Qwen-3-8B-gqa_indexer_scalar/local128/stage1_longce_decay/final.pt}"
+OUTPUT_DIR="${OUTPUT_DIR:-./results_sparse_scalar_local128}"
 
-FORCE_LOCAL="${FORCE_LOCAL:-64}"
+# Trained linear memory over the evicted keys (kvpress.presses.gqa_indexer.memory). Empty runs plain
+# sparse attention, which is the baseline the memory arm is measured against -- so an A/B is the same
+# command twice, once with MEMORY= and once with MEMORY=<ckpt>. FORCE_LOCAL/FORCE_SINK must match
+# what the memory was TRAINED at or the state is read over a different evicted set; evaluate_sparse
+# warns from the checkpoint's recorded config when they differ.
+MEMORY="${MEMORY:-}"
+
+FORCE_LOCAL="${FORCE_LOCAL:-128}"
 FORCE_SINK="${FORCE_SINK:-4}"
 BLOCK_K="${BLOCK_K:-64}"
 # tl.dot precision. tf32 because q/k/v are the model's own bf16, and every bf16 value is exactly
@@ -66,7 +84,7 @@ PYTHON="${PYTHON:-python}"
 export https_proxy="${https_proxy:-http://star-proxy.oa.com:3128}"
 export http_proxy="${http_proxy:-http://star-proxy.oa.com:3128}"
 
-read -r -a TOPKS <<< "${TOPKS:-2048}"
+read -r -a TOPKS <<< "${TOPKS:-4096}"
 read -r -a LENGTHS <<< "${LENGTHS:-$DATA_DIR}"
 
 if [[ ! -f "$CKPT" ]]; then
@@ -75,13 +93,24 @@ if [[ ! -f "$CKPT" ]]; then
 fi
 
 num_gpus=$(nvidia-smi --list-gpus | wc -l)
-NGPU="${NGPU:-$num_gpus}"
-if [[ "$NGPU" -gt "$num_gpus" ]]; then
-  echo "Error: NGPU=$NGPU exceeds the $num_gpus GPUs on this box" >&2
-  exit 1
+# DEVICES pins the exact CUDA indices to shard over, e.g. DEVICES="0,1,2,3". Needed because NGPU=n
+# always takes GPUs 0..n-1, which collides with anything already running on them -- and an eval that
+# lands on a training GPU OOMs the training run, not just itself.
+DEVICES="${DEVICES:-}"
+if [[ -n "$DEVICES" ]]; then
+  IFS=',' read -r -a device_list <<< "$DEVICES"
+  NGPU="${#device_list[@]}"
+  SHARD_ARGS=(--devices "$DEVICES")
+  echo "sharded over ${NGPU} pinned GPU(s) [$DEVICES]: lengths=${LENGTHS[*]} topks=${TOPKS[*]}"
+else
+  NGPU="${NGPU:-$num_gpus}"
+  if [[ "$NGPU" -gt "$num_gpus" ]]; then
+    echo "Error: NGPU=$NGPU exceeds the $num_gpus GPUs on this box" >&2
+    exit 1
+  fi
+  SHARD_ARGS=(--ngpu "$NGPU")
+  echo "sharded over $NGPU GPU(s): lengths=${LENGTHS[*]} topks=${TOPKS[*]}"
 fi
-
-echo "sharded over $NGPU GPU(s): lengths=${LENGTHS[*]} topks=${TOPKS[*]}"
 
 # Sequential over configurations, data-parallel within each: the opposite of the sibling script.
 for length in "${LENGTHS[@]}"; do
@@ -89,9 +118,10 @@ for length in "${LENGTHS[@]}"; do
     EXTRA=()
     [[ -n "$length" ]] && EXTRA+=(--data_dir "$length")
     [[ -n "$SCORER" ]] && EXTRA+=(--scorer "$SCORER")
+    [[ -n "$MEMORY" ]] && EXTRA+=(--memory_ckpt "$MEMORY")
     echo "=== topk=$topk @ ${length:-default} across $NGPU GPU(s)"
     "$PYTHON" evaluate_sparse_sharded.py \
-      --ngpu "$NGPU" \
+      "${SHARD_ARGS[@]}" \
       --dataset "$DATASET" --model "$MODEL" --indexer_ckpt "$CKPT" \
       --topk "$topk" --force_local "$FORCE_LOCAL" --force_sink "$FORCE_SINK" --block_k "$BLOCK_K" \
       --precision "$PRECISION" \

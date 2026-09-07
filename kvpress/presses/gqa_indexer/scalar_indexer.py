@@ -74,6 +74,7 @@ first-class ablation rather than removed.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import torch
@@ -81,9 +82,34 @@ from torch import nn
 
 from kvpress.presses.gqa_indexer.indexer import MASK_NEG, IndexerNorm
 
+
+def _inv_softplus(y: float) -> float:
+    """``x`` such that ``softplus(x) == y``, for seeding the decay bias.
+
+    ``y == 0`` is the inert-decay ablation (``decay_init=0``) and is exactly the point where the
+    true inverse diverges, so it is clamped to a large negative bias instead: ``softplus(-30)`` is
+    9e-14, i.e. zero to every dtype in play, and unlike ``-inf`` it still has a finite gradient so
+    the head can train away from it. Refusing here would reject a documented ablation.
+    """
+    if y < 0:
+        raise ValueError(f"inverse softplus needs a non-negative target, got {y}")
+    if y == 0:
+        return -30.0
+    return float(math.log(math.expm1(y))) if y < 20 else float(y)
+
 #: Default slope. Small enough to leave content ranking intact over a 128K context
 #: (total tilt 0.13 against a score of order 1), large enough to break ties by recency.
 DEFAULT_POS_SLOPE = 1e-6
+
+#: Age normalizer for the learned decay, in tokens. Matches the 16K training stage, so
+#: ``log_beta`` reads as "nats lost over one training window of age". A CONSTANT by design --
+#: see :attr:`ScalarIndexerConfig.decay_ref`.
+DEFAULT_DECAY_REF = 16384.0
+
+#: Initial ``log_beta``, in nats per :data:`DEFAULT_DECAY_REF` of age. Puts the decay term's range
+#: at the score's own std (~1) so the lifetime is live from step 0, unlike TrimKV's near-zero init
+#: which relies on a retention hinge this port does not have.
+DEFAULT_DECAY_INIT = -1.0
 
 
 @dataclass
@@ -123,6 +149,45 @@ class ScalarIndexerConfig:
     gate_scale : bool
         Create the learnable gate multiplier used by end-to-end training, mirroring
         :class:`~.indexer.GQAIndexerConfig`.
+    decay : bool
+        Give each key a learned *lifetime* on top of its magnitude, TrimKV's core mechanism::
+
+            gate_j(i) = s_j + log_beta_j * (i - j) / decay_ref
+
+        with ``log_beta_j <= 0``, so a key's contribution decays geometrically in its age
+        ``i - j``. This is a strictly larger hypothesis class than the frozen score: ``s_j``
+        alone fixes a key's rank for all time, while ``log_beta_j`` lets rank *evolve* -- a
+        slowly-decaying key overtakes a faster-decaying older one as the sequence grows.
+
+        Folds into the existing bilinear gate exactly, at ``Di = 2 * n_heads`` instead of
+        ``n_heads`` (see :meth:`gate_key`), so no attention kernel changes: the gate, its ``lse``
+        normalizer and the whole backward run unmodified. Verified to 2.4e-07 against an explicit
+        per-pair reference.
+    decay_ref : float
+        Age normalizer, in tokens. **A fixed constant, never the live sequence length.**
+
+        Two independent reasons, and they point the same way:
+
+        * *Gradient scale.* ``d(gate)/d(log_beta_j) = (i - j)``, which reaches 16384 at 16K
+          against ``d(gate)/d(s_j) = 1``. Unnormalized, the lifetime head trains at ~1e4 times
+          the score head's effective learning rate off one shared LR. Dividing by a constant puts
+          both at O(1) and makes ``log_beta`` read in *nats per ``decay_ref`` of age*.
+        * *Irreversibility.* Dividing by the **live** length instead would make every old key's
+          score move as the sequence grows, which breaks the property that a key dropped from the
+          top-k never returns -- the property the eviction path and
+          :mod:`~.qi_flex_attention`'s deadlines rest on. Already measured on the plain tilt:
+          absolute gives 0 returns over 1500 steps, length-normalized gives 27.
+    decay_init : float
+        Initial ``log_beta``, in the same nats-per-``decay_ref`` units. ``-1.0`` puts the decay
+        term's range (0 at age 0, ``-1`` at age ``decay_ref``) at the score's own std of ~1, so
+        the lifetime is a live feature from step 0.
+
+        Deliberately **not** TrimKV's near-zero init. There, ``bias_init=18`` gives
+        ``log_beta = logsigmoid(18) ~ -1.5e-8`` -- decay starts inert and the *retention hinge
+        loss* is the only thing driving it down. This port replaces that hinge with the gate's
+        ``lse`` normalizer, which supplies a budget but exerts no pressure toward shorter
+        lifetimes, so an inert init risks ``log_beta`` never leaving 0 and the arm silently
+        collapsing back to the plain scalar indexer.
     """
 
     hidden_size: int
@@ -131,6 +196,9 @@ class ScalarIndexerConfig:
     norm_eps: float = 1e-5
     pos_slope: float = DEFAULT_POS_SLOPE
     gate_scale: bool = False
+    decay: bool = False
+    decay_ref: float = DEFAULT_DECAY_REF
+    decay_init: float = DEFAULT_DECAY_INIT
 
     #: Always ``0``. A per-key score has no rotary width -- there is no query to be rotated
     #: relative to, and the recency prior is carried explicitly by ``pos_slope`` instead. Kept
@@ -149,6 +217,18 @@ class ScalarIndexerConfig:
             raise ValueError(
                 f"pos_slope must be non-negative, got {self.pos_slope}: a negative tilt "
                 "favours old keys over new ones, which inverts the recency prior"
+            )
+        if self.decay_ref <= 0:
+            raise ValueError(
+                f"decay_ref must be positive, got {self.decay_ref}: it divides the age, and it "
+                "must be a fixed constant rather than the live sequence length -- see the config "
+                "docstring on irreversibility"
+            )
+        if self.decay_init > 0:
+            raise ValueError(
+                f"decay_init must be <= 0, got {self.decay_init}: log_beta is the log of a "
+                "retention factor in (0, 1], so a positive value makes a key GROW with age and "
+                "inverts the lifetime prior"
             )
 
 
@@ -218,6 +298,29 @@ class ScalarIndexer(nn.Module):
             nn.Parameter(torch.tensor(self.GATE_SCALE_INIT())) if config.gate_scale else None
         )
 
+        # TrimKV's lifetime head. Emits log_beta <= 0 per (token, KV head) in nats per decay_ref
+        # of age, so the gate carries s_j + log_beta_j * (i - j) / decay_ref.
+        #
+        # Parameterized as -softplus(raw) rather than logsigmoid(raw): both are smooth maps onto
+        # (-inf, 0], but softplus is ~linear once raw > 0, so the whole useful range of log_beta is
+        # reachable at O(1) raw values. logsigmoid saturates the other way -- it needs raw ~ -1 to
+        # reach log_beta ~ -1 and then compresses hard, which is exactly why TrimKV must init its
+        # bias at 18 to sit near zero. Here the init is a plain inverse-softplus of |decay_init|.
+        self.decay = config.decay
+        self.decay_ref = config.decay_ref
+        if config.decay:
+            self.w_decay = nn.Linear(
+                config.mid_dim if config.mid_dim else config.hidden_size,
+                config.n_heads,
+                bias=True,
+            )
+            # Zero weights, biased init: every key starts at exactly decay_init and differentiates
+            # from there. A random init would spread lifetimes before the score means anything.
+            nn.init.zeros_(self.w_decay.weight)
+            nn.init.constant_(self.w_decay.bias, _inv_softplus(-config.decay_init))
+        else:
+            self.w_decay = None
+
     @property
     def weight_dtype(self) -> torch.dtype:
         return self.w_out.weight.dtype
@@ -251,6 +354,11 @@ class ScalarIndexer(nn.Module):
         incremental top-k during decode -- should use this rather than :meth:`forward`, which
         exists to satisfy the pairwise protocol.
 
+        With :attr:`decay` enabled this returns the score at **age zero** (``log_beta``
+        contributes nothing at ``i == j``), which is the magnitude term only. That is a genuine
+        per-key quantity but it is *not* the ranking any real query sees. Use :meth:`score_at`
+        when a frozen ranking is needed, or :meth:`gate_key` for the exact age-dependent gate.
+
         Parameters
         ----------
         hidden_states : torch.Tensor
@@ -273,6 +381,26 @@ class ScalarIndexer(nn.Module):
         torch.Tensor
             ``(B, n_heads, Sk)`` fp32 scores.
         """
+        scores, _ = self._score_and_decay(
+            hidden_states, key_offset=key_offset, mask=mask
+        )
+        return scores
+
+    def _score_and_decay(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        key_offset: int = 0,
+        mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        The trunk shared by every entry point: ``(scores, log_beta)``, both fp32 ``(B, h, Sk)``.
+
+        ``log_beta`` is ``None`` when :attr:`decay` is off, and ``<= 0`` otherwise, in nats per
+        :attr:`decay_ref` of age. One trunk so the score head and the lifetime head cannot be
+        computed from different normalizations of the same hidden state, and so the MLP is
+        evaluated once rather than once per head.
+        """
         if hidden_states.dim() != 3:
             raise ValueError(
                 f"hidden_states must be (B, Sk, hidden_size), got {tuple(hidden_states.shape)}"
@@ -293,10 +421,53 @@ class ScalarIndexer(nn.Module):
             )
             scores = scores + self.pos_slope * pos
 
+        log_beta = None
+        if self.w_decay is not None:
+            # -softplus keeps log_beta <= 0: a retention factor beta = exp(log_beta) in (0, 1].
+            log_beta = -nn.functional.softplus(self.w_decay(x).float())
+            log_beta = log_beta.transpose(1, 2)  # (B, n_heads, Sk)
+
         if mask is not None:
             keep = mask if mask.dtype == torch.bool else mask != 0
-            scores = scores.masked_fill(~keep.view(keep.shape[0], 1, -1), MASK_NEG)
-        return scores
+            keep = ~keep.view(keep.shape[0], 1, -1)
+            scores = scores.masked_fill(keep, MASK_NEG)
+            if log_beta is not None:
+                # Padding must not also decay: MASK_NEG already ranks it last, and a nonzero
+                # log_beta there would make the masked value drift with age instead of staying
+                # pinned at the bottom.
+                log_beta = log_beta.masked_fill(keep, 0.0)
+        return scores, log_beta
+
+    def score_at(
+        self,
+        hidden_states: torch.Tensor,
+        query_pos: float,
+        *,
+        key_offset: int = 0,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        The per-key score **as seen by a query at absolute position** ``query_pos``.
+
+        ``(B, n_heads, Sk)`` fp32. Without decay this is :meth:`score_keys` and ``query_pos`` is
+        irrelevant. With decay the score is no longer a property of the key alone, so any caller
+        that wants a single per-key ranking has to say *when* -- there is no query-free answer.
+
+        This is the honest interface for the eviction and deadline paths, which need one frozen
+        ranking. They pick a representative ``query_pos``; the resulting selection is an
+        approximation whose error is bounded by how much ``log_beta`` varies across keys.
+        """
+        scores, log_beta = self._score_and_decay(
+            hidden_states, key_offset=key_offset, mask=mask
+        )
+        if log_beta is None:
+            return scores
+        k_len = hidden_states.shape[1]
+        pos = torch.arange(
+            key_offset, key_offset + k_len, device=scores.device, dtype=scores.dtype
+        )
+        age = (float(query_pos) - pos).clamp(min=0.0) / self.decay_ref
+        return scores + log_beta * age
 
     def forward(
         self,
@@ -307,16 +478,22 @@ class ScalarIndexer(nn.Module):
         key_hidden_states: torch.Tensor | None = None,
         key_cos: torch.Tensor | None = None,
         key_sin: torch.Tensor | None = None,
+        query_offset: int | None = None,
     ) -> torch.Tensor:
         """
         Pairwise-protocol view of the score: ``(B, n_heads, Sq, Sk)``, matching
         :meth:`~.indexer.GQAIndexer.forward` argument for argument.
 
-        Every query row is identical -- that is what query-independence means -- so this is a
-        broadcast **view** of :meth:`score_keys`, not an ``O(Sq * Sk)`` computation. It exists
-        so the press, the query reductions and the loss helpers run over either scorer through
-        one code path; the additive ``mask`` is applied here because those callers pass the
-        press's ``(B, 1, Sq, Sk)`` causal mask, which only makes sense in this layout.
+        Without decay every query row is identical -- that is what query-independence means --
+        so this is a broadcast **view** of :meth:`score_keys`, not an ``O(Sq * Sk)`` computation.
+        It exists so the press, the query reductions and the loss helpers run over either scorer
+        through one code path; the additive ``mask`` is applied here because those callers pass
+        the press's ``(B, 1, Sq, Sk)`` causal mask, which only makes sense in this layout.
+
+        With decay the rows genuinely differ, so this **materializes** ``(B, h, Sq, Sk)``. That
+        is correct but expensive, and it is why the gate path uses the :meth:`gate_key` fold
+        instead of calling this. ``query_offset`` defaults to bottom-right alignment
+        (``Sk - Sq``), matching the rest of the codebase.
 
         Prefer :meth:`score_keys` when the query axis is not actually needed: expanding and
         then reducing it back is wasted work, and at inference it is the whole cost this
@@ -325,7 +502,23 @@ class ScalarIndexer(nn.Module):
         self._reject_rope(cos, sin)
         self._reject_rope(key_cos, key_sin)
         keys = hidden_states if key_hidden_states is None else key_hidden_states
-        scores = self.expand_to_pairs(self.score_keys(keys), hidden_states.shape[1])
+        q_len = hidden_states.shape[1]
+        base, log_beta = self._score_and_decay(keys)
+        if log_beta is None:
+            scores = self.expand_to_pairs(base, q_len)
+        else:
+            k_len = keys.shape[1]
+            if query_offset is None:
+                query_offset = k_len - q_len
+            q_pos = torch.arange(q_len, device=base.device, dtype=base.dtype) + query_offset
+            k_pos = torch.arange(k_len, device=base.device, dtype=base.dtype)
+            # Deliberately NOT clamped at 0. A future key (j > i) gets a positive age term here,
+            # which is meaningless -- but those pairs are masked out by causality in every caller,
+            # and leaving them unclamped makes this exactly equal to the gate_key/gate_query fold
+            # the kernel computes. Clamping would make the two paths disagree off-causal and turn
+            # any fold regression test into a false negative.
+            age = (q_pos.view(-1, 1) - k_pos.view(1, -1)) / self.decay_ref
+            scores = base.unsqueeze(2) + log_beta.unsqueeze(2) * age
         if mask is not None:
             scores = scores + mask.to(scores.dtype)
         return scores
@@ -342,25 +535,77 @@ class ScalarIndexer(nn.Module):
         bsz, n_heads, k_len = scores.shape
         return scores.unsqueeze(2).expand(bsz, n_heads, q_len, k_len)
 
+    #: Indexer width. ``n_heads`` for the plain score; ``2 * n_heads`` with decay, where each head
+    #: contributes an adjacent ``[magnitude, lifetime]`` pair. Consumed by the gate purely as
+    #: ``q_idx.shape[-1]``, which is unconstrained -- the Triton kernel pads it to the next power
+    #: of two (floor 16) and masks the tail -- so widening it needs no kernel change.
+    @property
+    def idx_dim(self) -> int:
+        return 2 * self.n_heads if self.decay else self.n_heads
+
     def gate_key(
         self, hidden_states: torch.Tensor, *, key_offset: int = 0, dtype=None
     ) -> torch.Tensor:
         """
-        The score shaped as an indexer key, ``(B, Sk, Di)`` with ``Di = n_heads``.
+        The score shaped as an indexer key, ``(B, Sk, Di)`` with ``Di = ``:attr:`idx_dim`.
 
         Pairs with :meth:`gate_query` to drive :mod:`~.gated_attention` unchanged: the gate
         computes ``qi . ki`` over a width-``Di`` axis, and a per-key score is that product with
         the query side pinned to a constant selector.
 
-        ``dtype`` casts the result, which :meth:`forward` deliberately returns in fp32 for
+        **With decay, this is where TrimKV's lifetime enters -- as an exact algebraic identity,
+        not an approximation.** The target gate is
+
+            ``s_j + log_beta_j * (i - j) / ref``
+
+        which is bilinear in (query position, key), so it folds into the same dot product at
+        twice the width. Head ``h`` occupies columns ``2h`` and ``2h+1``::
+
+            ki[j, 2h]   = s_j - log_beta_j * j / ref        qi[h, i, 2h]   = 1
+            ki[j, 2h+1] = log_beta_j                        qi[h, i, 2h+1] = i / ref
+
+        so ``qi . ki = s_j + log_beta_j * (i - j) / ref``. Verified to 2.4e-07 against an explicit
+        per-pair reference. Because it is the *same* bilinear form, the fused kernel, the ``lse``
+        normalizer and the entire backward pass are untouched -- the gradient reaches ``log_beta``
+        through the existing ``dKI`` path.
+
+        The key side absorbs ``-log_beta_j * j / ref``, so ``ki`` is a function of ``j`` alone and
+        stays cacheable: at decode the whole history's ``ki`` is read from the cache and only the
+        new token is scored, exactly as without decay.
+
+        ``dtype`` casts the result, which :meth:`score_keys` deliberately returns in fp32 for
         top-k resolution. The gate wants it in the attention's dtype instead -- pass the
         model's, or the einsum against a non-fp32 query raises.
+
+        One precision note: ``s_j - log_beta_j * j / ref`` is O(1) here *because* the position is
+        normalized by ``ref``. Folding a raw age instead would put ``j`` itself in a bf16 column,
+        where 16383 rounds to 16384 and an age of 83 becomes 64 -- the age term would be
+        destroyed. This is why :attr:`decay_ref` is load-bearing for correctness, not just for
+        gradient scale.
         """
-        k = self.score_keys(hidden_states, key_offset=key_offset).transpose(1, 2)
+        scores, log_beta = self._score_and_decay(hidden_states, key_offset=key_offset)
+        if log_beta is None:
+            k = scores.transpose(1, 2)
+        else:
+            k_len = hidden_states.shape[1]
+            pos = torch.arange(
+                key_offset, key_offset + k_len, device=scores.device, dtype=scores.dtype
+            )
+            magnitude = scores - log_beta * (pos / self.decay_ref)  # (B, h, Sk)
+            # interleave to [mag_0, beta_0, mag_1, beta_1, ...] so head h reads columns 2h, 2h+1
+            k = torch.stack([magnitude, log_beta], dim=-1)  # (B, h, Sk, 2)
+            k = k.permute(0, 2, 1, 3).reshape(scores.shape[0], k_len, 2 * self.n_heads)
         return k if dtype is None else k.to(dtype)
 
     def gate_query(
-        self, q_len: int, bsz: int, n_kv_heads: int, *, device=None, dtype=None
+        self,
+        q_len: int,
+        bsz: int,
+        n_kv_heads: int,
+        *,
+        device=None,
+        dtype=None,
+        query_offset: int = 0,
     ) -> torch.Tensor:
         """
         The constant indexer query for the gate path, ``(B, n_kv_heads, Sq, Di)``.
@@ -373,21 +618,52 @@ class ScalarIndexer(nn.Module):
         Not a learnable query -- that is the whole point. The gate's ``qi . ki`` becomes a
         pure lookup, which is what makes the score query-independent while still travelling
         through the existing gated-attention path unchanged.
+
+        With decay the query side stops being constant along ``Sq``: column ``2h+1`` carries
+        ``(row + query_offset) / decay_ref``, the query's absolute position. It is still not
+        *learnable* and still carries no content -- it is a position, so the score remains a
+        function of (key content, age) with no query content in it. ``query_offset`` is the
+        absolute position of row 0 and **must** be supplied whenever the queries are not a
+        full-sequence prefill; getting it wrong makes every age wrong by a constant.
         """
         di = self.n_heads
-        if di == 1:
-            return torch.ones(bsz, n_kv_heads, q_len, 1, device=device, dtype=dtype)
-        if di != n_kv_heads:
+        if di != 1 and di != n_kv_heads:
             raise ValueError(
                 f"per-head ScalarIndexer has n_heads={di} but the model has "
                 f"{n_kv_heads} KV heads; they must match for the gate to route each head "
                 f"to its own score. Build it with ScalarIndexerConfig(n_heads=<KV heads>), "
                 f"or n_heads=1 for the shared-score ablation."
             )
-        # expand, not repeat: the selector is the same for every batch element and query, so
-        # this stays a view. At Sq = 32K and Di = 8 a materialised copy would be 8 GB in fp32.
-        eye = torch.eye(di, device=device, dtype=dtype)
-        return eye.view(1, di, 1, di).expand(bsz, di, q_len, di)
+        if not self.decay:
+            if di == 1:
+                return torch.ones(bsz, n_kv_heads, q_len, 1, device=device, dtype=dtype)
+            # expand, not repeat: the selector is the same for every batch element and query, so
+            # this stays a view. At Sq = 32K and Di = 8 a materialised copy would be 8 GB in fp32.
+            eye = torch.eye(di, device=device, dtype=dtype)
+            return eye.view(1, di, 1, di).expand(bsz, di, q_len, di)
+
+        # Decay: the selector picks head h's magnitude column, and the age column carries i/ref --
+        # gated by the SAME selector, so head h reads only its own log_beta. Without that gating,
+        # head h's age column would multiply head h'-s lifetime.
+        # Built in fp32 then cast, so i/ref is rounded once at the end rather than accumulated in
+        # low precision.
+        q_pos = (
+            torch.arange(q_len, device=device, dtype=torch.float32) + float(query_offset)
+        ) / self.decay_ref
+        if di == 1:
+            sel = torch.ones(n_kv_heads, 1, device=device, dtype=torch.float32)
+        else:
+            sel = torch.eye(di, device=device, dtype=torch.float32)
+        # (h, 1, di) * (1, Sq, 1) -> the pair (selector, selector * age) per head/query/column
+        qi = torch.stack(
+            [
+                sel.unsqueeze(1).expand(n_kv_heads, q_len, di),
+                sel.unsqueeze(1) * q_pos.view(1, q_len, 1),
+            ],
+            dim=-1,
+        )  # (h, Sq, di, 2)
+        qi = qi.reshape(n_kv_heads, q_len, 2 * di).to(dtype)
+        return qi.unsqueeze(0).expand(bsz, n_kv_heads, q_len, 2 * di)
 
     # ------------------------------------------------------------------
     # GQAIndexer protocol
@@ -400,13 +676,24 @@ class ScalarIndexer(nn.Module):
     # (None, None), and a caller that passes real tables is asking for something this scorer
     # cannot do.
     def project_q(
-        self, hidden_states: torch.Tensor, cos=None, sin=None, *, n_kv_heads: int | None = None
+        self,
+        hidden_states: torch.Tensor,
+        cos=None,
+        sin=None,
+        *,
+        n_kv_heads: int | None = None,
+        query_offset: int = 0,
     ) -> torch.Tensor:
-        """The constant gate selector, ``(B, n_heads, Sq, Di)``. Not a function of the input.
+        """The gate selector, ``(B, n_kv_heads, Sq, Di)``. Carries no content.
 
-        Shaped like :meth:`~.indexer.GQAIndexer.project_q` so the gate path is shared, but it
-        carries no information: query-independence means the query side is a lookup, and the
-        whole score lives in :meth:`project_k`.
+        Shaped like :meth:`~.indexer.GQAIndexer.project_q` so the gate path is shared. Without
+        decay it is a pure constant lookup: query-independence means the whole score lives in
+        :meth:`project_k`. With decay it additionally carries the query's *position*, which is
+        still not content -- see :meth:`gate_query`.
+
+        ``query_offset`` is the absolute position of query row 0. It defaults to 0, which is
+        correct for full-sequence training and prefill; decode and chunked prefill must pass the
+        real offset or every age is wrong by a constant. Ignored entirely when decay is off.
         """
         self._reject_rope(cos, sin)
         bsz, q_len, _ = hidden_states.shape
@@ -416,6 +703,7 @@ class ScalarIndexer(nn.Module):
             n_kv_heads if n_kv_heads is not None else self.n_heads,
             device=hidden_states.device,
             dtype=hidden_states.dtype,
+            query_offset=query_offset,
         )
 
     def project_k(
@@ -425,18 +713,22 @@ class ScalarIndexer(nn.Module):
         sin=None,
         *,
         value_states: torch.Tensor | None = None,
+        key_offset: int = 0,
     ) -> torch.Tensor:
         """The per-key score as an indexer key, ``(B, Sk, Di)`` in the input's dtype.
 
-        ``key_offset`` is deliberately not exposed here: this is the training/prefill entry
-        point, where ``hidden_states`` starts at position 0. Decode and chunked prefill must
-        call :meth:`gate_key` with the right offset, or the recency tilt restarts per chunk.
+        ``key_offset`` defaults to 0 -- correct for the training/prefill entry point, where
+        ``hidden_states`` starts at position 0. Decode and chunked prefill must pass the real
+        offset, or the recency tilt restarts per chunk and (with decay) the folded ``-log_beta *
+        j / ref`` term is computed at the wrong ``j``.
 
         ``value_states`` is accepted for the scorer protocol and intentionally unused. This
         scorer is defined on hidden states; value-based scorers consume it instead.
         """
         self._reject_rope(cos, sin)
-        return self.gate_key(hidden_states, dtype=hidden_states.dtype)
+        return self.gate_key(
+            hidden_states, key_offset=key_offset, dtype=hidden_states.dtype
+        )
 
     def _reject_rope(self, cos, sin) -> None:
         if cos is not None or sin is not None:
@@ -450,4 +742,7 @@ class ScalarIndexer(nn.Module):
     def extra_repr(self) -> str:
         shape = f"hidden={self.config.hidden_size}, n_heads={self.n_heads}"
         shape += f", mid_dim={self.mid_dim}" if self.mid_dim else " (linear)"
-        return f"{shape}, pos_slope={self.pos_slope:g}"
+        shape += f", pos_slope={self.pos_slope:g}"
+        if self.decay:
+            shape += f", decay(ref={self.decay_ref:g}, init={self.config.decay_init:g})"
+        return f"{shape}, Di={self.idx_dim}"

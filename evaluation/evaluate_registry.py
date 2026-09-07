@@ -95,6 +95,13 @@ PRESS_REGISTRY = {
     "kvcompose_unstructured": KVComposePress(structured=False),
     "kvzip": KVzipPress(),
     "kvzip_plus": KVzipPress(kvzip_plus_normalization=True),
+    # Reduce the reconstruction queries 8x, cutting KVzip's scoring pass ~8x. The A/B against
+    # "kvzip" is single-variable (query_pool=1 is KVzip unchanged), and pool8-vs-sub8 isolates the
+    # reduction operator: same query count, same positions, mean of the block vs one real token.
+    "kvzip_pool4": KVzipPress(query_pool=4),
+    "kvzip_sub4": KVzipPress(query_pool=4, query_pool_mode="subsample"),
+    "kvzip_pool8": KVzipPress(query_pool=8),
+    "kvzip_sub8": KVzipPress(query_pool=8, query_pool_mode="subsample"),
     "kvzap_linear": DMSPress(press=KVzapPress(model_type="linear")),
     "kvzap_mlp": DMSPress(press=KVzapPress(model_type="mlp")),
     "kvzap_mlp_head": KVzapPress(model_type="mlp"),

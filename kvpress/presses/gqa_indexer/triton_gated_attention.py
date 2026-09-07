@@ -44,11 +44,12 @@ pass, and folding it in would force this kernel to make two passes over the keys
 normalize, one to attend) for no memory saving.
 
 Pinning is expressed as a **bias table over the pinned set**, not as a mode flag. Both
-``sink`` (the first ``n_sink`` keys, same for every query) and ``self`` (each query's own
-diagonal) reduce to "these ``(query, key)`` pairs take gate ``0`` instead of ``score - lse``",
-and the kernel decides that from ``n_sink`` and the diagonal position arithmetically. So
-``self`` is no longer the expensive mode -- it costs one extra comparison per element, and the
-``O(Sq * Sk)`` two-branch fallback it needed is gone.
+``sink`` (the first ``n_sink`` keys, same for every query) and ``local`` (a causal window of
+width ``n_local`` ending at each query, of which ``self`` is the ``n_local=1`` case) reduce to
+"these ``(query, key)`` pairs take gate ``0`` instead of ``score - lse``", and the kernel decides
+that from ``n_sink`` and the query's own position arithmetically. So the query-dependent pins are
+no longer the expensive mode -- they cost one extra comparison per element, and the
+``O(Sq * Sk)`` two-branch fallback they needed is gone.
 
 Numerics
 --------
@@ -103,18 +104,53 @@ if HAS_TRITON:
 
     @triton.jit
     def _gated_attn_fwd(
-        gQ, gK, gV, gQI, gKI, gLSE, gGateScale, gOut, gRowLSE,
-        stride_qb, stride_qh, stride_qm, stride_qd,
-        stride_kb, stride_kh, stride_kn, stride_kd,
-        stride_vb, stride_vh, stride_vn, stride_vd,
-        stride_qib, stride_qih, stride_qim, stride_qid,
-        stride_kib, stride_kin, stride_kid,
-        stride_lb, stride_lh, stride_lm,
-        stride_ob, stride_oh, stride_om, stride_od,
-        stride_rb, stride_rh, stride_rm,
-        q_len, k_len, query_offset, n_sink,
+        gQ,
+        gK,
+        gV,
+        gQI,
+        gKI,
+        gLSE,
+        gGateScale,
+        gOut,
+        gRowLSE,
+        stride_qb,
+        stride_qh,
+        stride_qm,
+        stride_qd,
+        stride_kb,
+        stride_kh,
+        stride_kn,
+        stride_kd,
+        stride_vb,
+        stride_vh,
+        stride_vn,
+        stride_vd,
+        stride_qib,
+        stride_qih,
+        stride_qim,
+        stride_qid,
+        stride_kib,
+        stride_kin,
+        stride_kid,
+        stride_lb,
+        stride_lh,
+        stride_lm,
+        stride_ob,
+        stride_oh,
+        stride_om,
+        stride_od,
+        stride_rb,
+        stride_rh,
+        stride_rm,
+        q_len,
+        k_len,
+        query_offset,
+        n_sink,
+        pin_from,
         sm_scale,
-        PIN_SELF: tl.constexpr,
+        PIN_LOCAL: tl.constexpr,
+        N_LOCAL: tl.constexpr,
+        PIN_TAIL: tl.constexpr,
         GROUP: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -148,18 +184,23 @@ if HAS_TRITON:
         mask_dv = offs_dv < DIM_V
 
         q = tl.load(
-            gQ + pid_b * stride_qb + pid_h * stride_qh
-            + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd,
-            mask=mask_m[:, None] & mask_d[None, :], other=0.0,
+            gQ + pid_b * stride_qb + pid_h * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd,
+            mask=mask_m[:, None] & mask_d[None, :],
+            other=0.0,
         )
         q_idx = tl.load(
-            gQI + pid_b * stride_qib + head_kv * stride_qih
-            + offs_m[:, None] * stride_qim + offs_di[None, :] * stride_qid,
-            mask=mask_m[:, None] & mask_di[None, :], other=0.0,
+            gQI
+            + pid_b * stride_qib
+            + head_kv * stride_qih
+            + offs_m[:, None] * stride_qim
+            + offs_di[None, :] * stride_qid,
+            mask=mask_m[:, None] & mask_di[None, :],
+            other=0.0,
         )
         lse = tl.load(
             gLSE + pid_b * stride_lb + head_kv * stride_lh + offs_m * stride_lm,
-            mask=mask_m, other=0.0,
+            mask=mask_m,
+            other=0.0,
         )
         gate_scale = tl.load(gGateScale).to(tl.float32)
 
@@ -178,14 +219,18 @@ if HAS_TRITON:
             mask_n = offs_n < k_len
 
             k = tl.load(
-                gK + pid_b * stride_kb + head_kv * stride_kh
-                + offs_n[None, :] * stride_kn + offs_d[:, None] * stride_kd,
-                mask=mask_n[None, :] & mask_d[:, None], other=0.0,
+                gK
+                + pid_b * stride_kb
+                + head_kv * stride_kh
+                + offs_n[None, :] * stride_kn
+                + offs_d[:, None] * stride_kd,
+                mask=mask_n[None, :] & mask_d[:, None],
+                other=0.0,
             )
             k_idx = tl.load(
-                gKI + pid_b * stride_kib
-                + offs_n[None, :] * stride_kin + offs_di[:, None] * stride_kid,
-                mask=mask_n[None, :] & mask_di[:, None], other=0.0,
+                gKI + pid_b * stride_kib + offs_n[None, :] * stride_kin + offs_di[:, None] * stride_kid,
+                mask=mask_n[None, :] & mask_di[:, None],
+                other=0.0,
             )
 
             logits = tl.dot(q, k, input_precision=PRECISION) * sm_scale
@@ -194,8 +239,18 @@ if HAS_TRITON:
             # Pinned pairs take gate 0; history takes score - lse. Derived arithmetically so
             # both pin modes share this line -- `self` costs one comparison, not a second pass.
             pinned = offs_n[None, :] < n_sink
-            if PIN_SELF:
-                pinned = pinned | (offs_n[None, :] == q_pos[:, None])
+            if PIN_TAIL:
+                # Tail pin: every key at or after pin_from is exempt from the gate. Query-
+                # independent, so it is one comparison on the key index -- the same shape as the
+                # sink pin, at the other end of the axis.
+                pinned = pinned | (offs_n[None, :] >= pin_from)
+            if PIN_LOCAL:
+                # Causal local window of width N_LOCAL ending at each query: 0 <= age < w.
+                # N_LOCAL == 1 is exactly the old `self` pin (age == 0), so that mode keeps
+                # running through this branch bit-for-bit. The lower bound is not redundant:
+                # at Sq < Sk a key can sit after the query and would give a negative age.
+                age = q_pos[:, None] - offs_n[None, :]
+                pinned = pinned | ((age >= 0) & (age < N_LOCAL))
             logits = logits + tl.where(pinned, 0.0, score - lse[:, None])
 
             causal = (offs_n[None, :] <= q_pos[:, None]) & mask_n[None, :] & mask_m[:, None]
@@ -210,9 +265,13 @@ if HAS_TRITON:
             p = tl.where(causal, tl.exp(logits - safe_max[:, None]), 0.0)
 
             v = tl.load(
-                gV + pid_b * stride_vb + head_kv * stride_vh
-                + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd,
-                mask=mask_n[:, None] & mask_dv[None, :], other=0.0,
+                gV
+                + pid_b * stride_vb
+                + head_kv * stride_vh
+                + offs_n[:, None] * stride_vn
+                + offs_dv[None, :] * stride_vd,
+                mask=mask_n[:, None] & mask_dv[None, :],
+                other=0.0,
             )
             acc = acc * rescale[:, None] + tl.dot(p.to(v.dtype), v, input_precision=PRECISION)
             run_sum = run_sum * rescale + tl.sum(p, 1)
@@ -225,8 +284,7 @@ if HAS_TRITON:
         # tile-invariant: block_m with and without padding lanes agree to 1e-6.
         out = acc / run_sum[:, None]
         tl.store(
-            gOut + pid_b * stride_ob + pid_h * stride_oh
-            + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od,
+            gOut + pid_b * stride_ob + pid_h * stride_oh + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od,
             out.to(gOut.dtype.element_ty),
             mask=mask_m[:, None] & mask_dv[None, :],
         )
@@ -239,19 +297,62 @@ if HAS_TRITON:
 
     @triton.jit
     def _gated_attn_bwd(
-        gQ, gK, gV, gQI, gKI, gLSE, gGateScale, gOut, gRowLSE, gDOut, gDelta,
-        gDQ, gDK, gDV, gDQI, gDKI, gDGateScale, gDLSE,
-        stride_qb, stride_qh, stride_qm, stride_qd,
-        stride_kb, stride_kh, stride_kn, stride_kd,
-        stride_vb, stride_vh, stride_vn, stride_vd,
-        stride_qib, stride_qih, stride_qim, stride_qid,
-        stride_kib, stride_kin, stride_kid,
-        stride_lb, stride_lh, stride_lm,
-        stride_ob, stride_oh, stride_om, stride_od,
-        stride_rb, stride_rh, stride_rm,
-        q_len, k_len, query_offset, n_sink,
+        gQ,
+        gK,
+        gV,
+        gQI,
+        gKI,
+        gLSE,
+        gGateScale,
+        gOut,
+        gRowLSE,
+        gDOut,
+        gDelta,
+        gDQ,
+        gDK,
+        gDV,
+        gDQI,
+        gDKI,
+        gDGateScale,
+        gDLSE,
+        stride_qb,
+        stride_qh,
+        stride_qm,
+        stride_qd,
+        stride_kb,
+        stride_kh,
+        stride_kn,
+        stride_kd,
+        stride_vb,
+        stride_vh,
+        stride_vn,
+        stride_vd,
+        stride_qib,
+        stride_qih,
+        stride_qim,
+        stride_qid,
+        stride_kib,
+        stride_kin,
+        stride_kid,
+        stride_lb,
+        stride_lh,
+        stride_lm,
+        stride_ob,
+        stride_oh,
+        stride_om,
+        stride_od,
+        stride_rb,
+        stride_rh,
+        stride_rm,
+        q_len,
+        k_len,
+        query_offset,
+        n_sink,
+        pin_from,
         sm_scale,
-        PIN_SELF: tl.constexpr,
+        PIN_LOCAL: tl.constexpr,
+        N_LOCAL: tl.constexpr,
+        PIN_TAIL: tl.constexpr,
         GROUP: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -289,31 +390,38 @@ if HAS_TRITON:
         mask_dv = offs_dv < DIM_V
 
         q = tl.load(
-            gQ + pid_b * stride_qb + pid_h * stride_qh
-            + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd,
-            mask=mask_m[:, None] & mask_d[None, :], other=0.0,
+            gQ + pid_b * stride_qb + pid_h * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd,
+            mask=mask_m[:, None] & mask_d[None, :],
+            other=0.0,
         )
         q_idx = tl.load(
-            gQI + pid_b * stride_qib + head_kv * stride_qih
-            + offs_m[:, None] * stride_qim + offs_di[None, :] * stride_qid,
-            mask=mask_m[:, None] & mask_di[None, :], other=0.0,
+            gQI
+            + pid_b * stride_qib
+            + head_kv * stride_qih
+            + offs_m[:, None] * stride_qim
+            + offs_di[None, :] * stride_qid,
+            mask=mask_m[:, None] & mask_di[None, :],
+            other=0.0,
         )
         lse = tl.load(
             gLSE + pid_b * stride_lb + head_kv * stride_lh + offs_m * stride_lm,
-            mask=mask_m, other=0.0,
+            mask=mask_m,
+            other=0.0,
         )
         row_lse = tl.load(
             gRowLSE + pid_b * stride_rb + pid_h * stride_rh + offs_m * stride_rm,
-            mask=mask_m, other=0.0,
+            mask=mask_m,
+            other=0.0,
         )
         delta = tl.load(
             gDelta + pid_b * stride_rb + pid_h * stride_rh + offs_m * stride_rm,
-            mask=mask_m, other=0.0,
+            mask=mask_m,
+            other=0.0,
         )
         dout = tl.load(
-            gDOut + pid_b * stride_ob + pid_h * stride_oh
-            + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od,
-            mask=mask_m[:, None] & mask_dv[None, :], other=0.0,
+            gDOut + pid_b * stride_ob + pid_h * stride_oh + offs_m[:, None] * stride_om + offs_dv[None, :] * stride_od,
+            mask=mask_m[:, None] & mask_dv[None, :],
+            other=0.0,
         )
         gate_scale = tl.load(gGateScale).to(tl.float32)
 
@@ -333,26 +441,44 @@ if HAS_TRITON:
             mask_n = offs_n < k_len
 
             k = tl.load(
-                gK + pid_b * stride_kb + head_kv * stride_kh
-                + offs_n[None, :] * stride_kn + offs_d[:, None] * stride_kd,
-                mask=mask_n[None, :] & mask_d[:, None], other=0.0,
+                gK
+                + pid_b * stride_kb
+                + head_kv * stride_kh
+                + offs_n[None, :] * stride_kn
+                + offs_d[:, None] * stride_kd,
+                mask=mask_n[None, :] & mask_d[:, None],
+                other=0.0,
             )
             k_idx = tl.load(
-                gKI + pid_b * stride_kib
-                + offs_n[None, :] * stride_kin + offs_di[:, None] * stride_kid,
-                mask=mask_n[None, :] & mask_di[:, None], other=0.0,
+                gKI + pid_b * stride_kib + offs_n[None, :] * stride_kin + offs_di[:, None] * stride_kid,
+                mask=mask_n[None, :] & mask_di[:, None],
+                other=0.0,
             )
             v = tl.load(
-                gV + pid_b * stride_vb + head_kv * stride_vh
-                + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd,
-                mask=mask_n[:, None] & mask_dv[None, :], other=0.0,
+                gV
+                + pid_b * stride_vb
+                + head_kv * stride_vh
+                + offs_n[:, None] * stride_vn
+                + offs_dv[None, :] * stride_vd,
+                mask=mask_n[:, None] & mask_dv[None, :],
+                other=0.0,
             )
 
             raw_gate = tl.dot(q_idx, k_idx, input_precision=PRECISION)
             logits = tl.dot(q, k, input_precision=PRECISION) * sm_scale
             pinned = offs_n[None, :] < n_sink
-            if PIN_SELF:
-                pinned = pinned | (offs_n[None, :] == q_pos[:, None])
+            if PIN_TAIL:
+                # Tail pin: every key at or after pin_from is exempt from the gate. Query-
+                # independent, so it is one comparison on the key index -- the same shape as the
+                # sink pin, at the other end of the axis.
+                pinned = pinned | (offs_n[None, :] >= pin_from)
+            if PIN_LOCAL:
+                # Causal local window of width N_LOCAL ending at each query: 0 <= age < w.
+                # N_LOCAL == 1 is exactly the old `self` pin (age == 0), so that mode keeps
+                # running through this branch bit-for-bit. The lower bound is not redundant:
+                # at Sq < Sk a key can sit after the query and would give a negative age.
+                age = q_pos[:, None] - offs_n[None, :]
+                pinned = pinned | ((age >= 0) & (age < N_LOCAL))
             logits = logits + tl.where(pinned, 0.0, raw_gate * gate_scale - lse[:, None])
 
             causal = (offs_n[None, :] <= q_pos[:, None]) & mask_n[None, :] & mask_m[:, None]
@@ -360,8 +486,11 @@ if HAS_TRITON:
 
             # dV = p^T @ dout, and dp = dout @ V^T -> dS = p * (dp - delta).
             tl.atomic_add(
-                gDV + pid_b * stride_vb + head_kv * stride_vh
-                + offs_n[:, None] * stride_vn + offs_dv[None, :] * stride_vd,
+                gDV
+                + pid_b * stride_vb
+                + head_kv * stride_vh
+                + offs_n[:, None] * stride_vn
+                + offs_dv[None, :] * stride_vd,
                 tl.dot(tl.trans(p).to(dout.dtype), dout, input_precision=PRECISION),
                 mask=mask_n[:, None] & mask_dv[None, :],
             )
@@ -375,15 +504,17 @@ if HAS_TRITON:
 
             dq += tl.dot(ds_attn.to(k.dtype), tl.trans(k), input_precision=PRECISION)
             tl.atomic_add(
-                gDK + pid_b * stride_kb + head_kv * stride_kh
-                + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd,
+                gDK
+                + pid_b * stride_kb
+                + head_kv * stride_kh
+                + offs_n[:, None] * stride_kn
+                + offs_d[None, :] * stride_kd,
                 tl.dot(tl.trans(ds_attn).to(q.dtype), q, input_precision=PRECISION),
                 mask=mask_n[:, None] & mask_d[None, :],
             )
             dq_idx += tl.dot(ds_gate.to(k_idx.dtype), tl.trans(k_idx), input_precision=PRECISION) * gate_scale
             tl.atomic_add(
-                gDKI + pid_b * stride_kib
-                + offs_n[:, None] * stride_kin + offs_di[None, :] * stride_kid,
+                gDKI + pid_b * stride_kib + offs_n[:, None] * stride_kin + offs_di[None, :] * stride_kid,
                 tl.dot(tl.trans(ds_gate).to(q_idx.dtype), q_idx, input_precision=PRECISION) * gate_scale,
                 mask=mask_n[:, None] & mask_di[None, :],
             )
@@ -391,14 +522,16 @@ if HAS_TRITON:
             d_lse += -tl.sum(ds_gate, 1)
 
         tl.store(
-            gDQ + pid_b * stride_qb + pid_h * stride_qh
-            + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd,
+            gDQ + pid_b * stride_qb + pid_h * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd,
             dq.to(gDQ.dtype.element_ty),
             mask=mask_m[:, None] & mask_d[None, :],
         )
         tl.atomic_add(
-            gDQI + pid_b * stride_qib + head_kv * stride_qih
-            + offs_m[:, None] * stride_qim + offs_di[None, :] * stride_qid,
+            gDQI
+            + pid_b * stride_qib
+            + head_kv * stride_qih
+            + offs_m[:, None] * stride_qim
+            + offs_di[None, :] * stride_qid,
             dq_idx,
             mask=mask_m[:, None] & mask_di[None, :],
         )
@@ -406,7 +539,8 @@ if HAS_TRITON:
         # Summed over the query heads of a group, matching lse's per-KV-head layout.
         tl.atomic_add(
             gDLSE + pid_b * stride_lb + head_kv * stride_lh + offs_m * stride_lm,
-            d_lse, mask=mask_m,
+            d_lse,
+            mask=mask_m,
         )
 
 
@@ -421,8 +555,24 @@ class _GatedAttention(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, q, k, v, q_idx, k_idx, lse, gate_scale, sm_scale,
-                query_offset, n_sink, pin_self, block_m, block_n, precision):
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        q_idx,
+        k_idx,
+        lse,
+        gate_scale,
+        sm_scale,
+        query_offset,
+        n_sink,
+        n_local,
+        pin_from,
+        block_m,
+        block_n,
+        precision,
+    ):
         bsz, n_heads, q_len, head_dim = q.shape
         n_kv_heads, k_len = k.shape[1], k.shape[2]
         dim_v = v.shape[-1]
@@ -431,29 +581,56 @@ class _GatedAttention(torch.autograd.Function):
         out = torch.empty((bsz, n_heads, q_len, dim_v), device=q.device, dtype=q.dtype)
         row_lse = torch.empty((bsz, n_heads, q_len), device=q.device, dtype=torch.float32)
         shapes = dict(
-            GROUP=group, BLOCK_M=block_m, BLOCK_N=block_n,
-            BLOCK_D=block_pow2(head_dim), BLOCK_DI=block_pow2(q_idx.shape[-1]),
+            GROUP=group,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_D=block_pow2(head_dim),
+            BLOCK_DI=block_pow2(q_idx.shape[-1]),
             BLOCK_DV=block_pow2(dim_v),
-            HEAD_DIM=head_dim, IDX_DIM=q_idx.shape[-1], DIM_V=dim_v,
+            HEAD_DIM=head_dim,
+            IDX_DIM=q_idx.shape[-1],
+            DIM_V=dim_v,
             PRECISION=precision,
         )
         grid = (triton.cdiv(q_len, block_m), n_heads, bsz)
         _gated_attn_fwd[grid](
-            q, k, v, q_idx, k_idx, lse, gate_scale, out, row_lse,
-            *q.stride(), *k.stride(), *v.stride(), *q_idx.stride(), *k_idx.stride(),
-            *lse.stride(), *out.stride(), *row_lse.stride(),
-            q_len, k_len, query_offset, n_sink,
-            sm_scale, PIN_SELF=pin_self, **shapes,
+            q,
+            k,
+            v,
+            q_idx,
+            k_idx,
+            lse,
+            gate_scale,
+            out,
+            row_lse,
+            *q.stride(),
+            *k.stride(),
+            *v.stride(),
+            *q_idx.stride(),
+            *k_idx.stride(),
+            *lse.stride(),
+            *out.stride(),
+            *row_lse.stride(),
+            q_len,
+            k_len,
+            query_offset,
+            n_sink,
+            pin_from,
+            sm_scale,
+            PIN_LOCAL=n_local > 0,
+            N_LOCAL=n_local,
+            PIN_TAIL=pin_from >= 0,
+            **shapes,
         )
 
         ctx.save_for_backward(q, k, v, q_idx, k_idx, lse, gate_scale, out, row_lse)
-        ctx.meta = (sm_scale, query_offset, n_sink, pin_self, block_m, block_n, precision, group)
+        ctx.meta = (sm_scale, query_offset, n_sink, n_local, pin_from, block_m, block_n, precision, group)
         return out, row_lse
 
     @staticmethod
     def backward(ctx, d_out, _d_row_lse):
         q, k, v, q_idx, k_idx, lse, gate_scale, out, row_lse = ctx.saved_tensors
-        sm_scale, query_offset, n_sink, pin_self, block_m, block_n, precision, group = ctx.meta
+        sm_scale, query_offset, n_sink, n_local, pin_from, block_m, block_n, precision, group = ctx.meta
         bsz, n_heads, q_len, head_dim = q.shape
         k_len, dim_v = k.shape[2], v.shape[-1]
 
@@ -473,28 +650,73 @@ class _GatedAttention(torch.autograd.Function):
         d_lse = torch.zeros_like(lse, dtype=torch.float32)
 
         shapes = dict(
-            GROUP=group, BLOCK_M=block_m, BLOCK_N=block_n,
-            BLOCK_D=block_pow2(head_dim), BLOCK_DI=block_pow2(q_idx.shape[-1]),
+            GROUP=group,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_D=block_pow2(head_dim),
+            BLOCK_DI=block_pow2(q_idx.shape[-1]),
             BLOCK_DV=block_pow2(dim_v),
-            HEAD_DIM=head_dim, IDX_DIM=q_idx.shape[-1], DIM_V=dim_v,
+            HEAD_DIM=head_dim,
+            IDX_DIM=q_idx.shape[-1],
+            DIM_V=dim_v,
             PRECISION=precision,
         )
         grid = (triton.cdiv(q_len, block_m), n_heads, bsz)
         _gated_attn_bwd[grid](
-            q, k, v, q_idx, k_idx, lse, gate_scale, out, row_lse, d_out, delta,
-            d_q, d_k, d_v, d_q_idx, d_k_idx, d_gate_scale, d_lse,
-            *q.stride(), *k.stride(), *v.stride(), *q_idx.stride(), *k_idx.stride(),
-            *lse.stride(), *d_out.stride(), *row_lse.stride(),
-            q_len, k_len, query_offset, n_sink,
-            sm_scale, PIN_SELF=pin_self, **shapes,
+            q,
+            k,
+            v,
+            q_idx,
+            k_idx,
+            lse,
+            gate_scale,
+            out,
+            row_lse,
+            d_out,
+            delta,
+            d_q,
+            d_k,
+            d_v,
+            d_q_idx,
+            d_k_idx,
+            d_gate_scale,
+            d_lse,
+            *q.stride(),
+            *k.stride(),
+            *v.stride(),
+            *q_idx.stride(),
+            *k_idx.stride(),
+            *lse.stride(),
+            *d_out.stride(),
+            *row_lse.stride(),
+            q_len,
+            k_len,
+            query_offset,
+            n_sink,
+            pin_from,
+            sm_scale,
+            PIN_LOCAL=n_local > 0,
+            N_LOCAL=n_local,
+            PIN_TAIL=pin_from >= 0,
+            **shapes,
         )
 
         return (
-            d_q.to(q.dtype), d_k.to(k.dtype), d_v.to(v.dtype),
-            d_q_idx.to(q_idx.dtype), d_k_idx.to(k_idx.dtype),
+            d_q.to(q.dtype),
+            d_k.to(k.dtype),
+            d_v.to(v.dtype),
+            d_q_idx.to(q_idx.dtype),
+            d_k_idx.to(k_idx.dtype),
             d_lse.to(lse.dtype),
             d_gate_scale.to(gate_scale.dtype),
-            None, None, None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
 
 
@@ -510,33 +732,49 @@ def triton_gated_attention(
     scaling: float,
     query_offset: int,
     n_sink: int = 0,
-    pin_self: bool = False,
+    n_local: int = 0,
+    pin_from: int = -1,
     block_m: int = 64,
     block_n: int = 64,
     precision: str = "ieee",
     return_row_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
-    Gated attention with the gate computed inside the tile loop, ``O(L)`` memory.
+        Gated attention with the gate computed inside the tile loop, ``O(L)`` memory.
 
-    Parameters mirror
-    :func:`~kvpress.presses.gqa_indexer.gated_attention.gated_attention_reference`, with the
-    pinning expressed as ``(n_sink, pin_self)`` -- the two shapes every supported ``pin_mode``
-    reduces to.
+        Parameters mirror
+        :func:`~kvpress.presses.gqa_indexer.gated_attention.gated_attention_reference`, with the
+        pinning expressed as ``(n_sink, n_local, pin_from)`` -- the three shapes every supported
+        ``pin_mode`` reduces to. ``n_local > 0`` pins a causal window of that width ending at each
+        query -- ``n_local=1`` is the old ``self`` pin, 128 is SP-KV's sliding window -- and it is
+        excluded from the normalizer, so the router never spends budget on a neighbour.
+    ``pin_from >= 0`` additionally pins every key at that index and
+        beyond (the C1/C2 tail pin); ``-1`` disables it.
 
-    ``lse`` is the per-``(batch, kv head, query)`` history normalizer from
-    :func:`~.gate_pin.history_lse`; pass zeros to gate without a budget (``pin_mode="none"``,
-    where the normalizer is provably inert).
+        ``lse`` is the per-``(batch, kv head, query)`` history normalizer from
+        :func:`~.gate_pin.history_lse`; pass zeros to gate without a budget (``pin_mode="none"``,
+        where the normalizer is provably inert).
 
-    Returns ``(B, H, Sq, Dv)`` in ``q``'s dtype. With ``return_row_lse=True``, also
-    returns the fused forward's ``(B, H, Sq)`` fp32 attention log-normalizer for diagnostics.
+        Returns ``(B, H, Sq, Dv)`` in ``q``'s dtype. With ``return_row_lse=True``, also
+        returns the fused forward's ``(B, H, Sq)`` fp32 attention log-normalizer for diagnostics.
     """
     if not HAS_TRITON:
         raise RuntimeError("triton_gated_attention needs Triton")
     out, row_lse = _GatedAttention.apply(
-        q.contiguous(), k.contiguous(), v.contiguous(),
-        q_idx.contiguous(), k_idx.contiguous(), lse.contiguous(),
-        gate_scale, float(scaling), int(query_offset), int(n_sink), bool(pin_self),
-        int(block_m), int(block_n), precision,
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        q_idx.contiguous(),
+        k_idx.contiguous(),
+        lse.contiguous(),
+        gate_scale,
+        float(scaling),
+        int(query_offset),
+        int(n_sink),
+        int(n_local),
+        int(pin_from),
+        int(block_m),
+        int(block_n),
+        precision,
     )
     return (out, row_lse.detach()) if return_row_lse else out

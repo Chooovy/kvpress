@@ -25,6 +25,8 @@ from kvpress.presses.fastkvzip_press import FastKVzipPress
 from kvpress.presses.facility_location_press import FacilityLocationPress
 from kvpress.presses.finch_press import FinchPress
 from kvpress.presses.gqa_indexer import (
+    EvictInferenceContext,
+    EvictPagedPool,
     GQAIndexer,
     GQAIndexerConfig,
     GQAIndexerPress,
@@ -106,6 +108,8 @@ __all__ = [
     "LUKVPress",
     "GQAIndexerPress",
     "SparseAttentionContext",
+    "EvictInferenceContext",
+    "EvictPagedPool",
     "load_indexer_state_dict",
     "GQAIndexer",
     "GQAIndexerConfig",

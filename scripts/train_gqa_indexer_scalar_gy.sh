@@ -127,6 +127,41 @@ KVZIP_DIM="${KVZIP_DIM:-16}"
 KVZIP_BASE="${KVZIP_BASE:-16}"
 POS_SLOPE="${POS_SLOPE:-1e-6}"
 
+# SCORER=conv and SCORER=rnn are the two HISTORY arms. Both answer one question: does letting a
+# per-key score read the tokens BEFORE j buy anything over reading h_j alone?
+#
+# Both are supersets of the scalar arm by construction -- the branch is added into the scalar
+# MLP's pre-activation through a zero-initialized w_a, so at step 0 the score is BIT-IDENTICAL to
+# SCORER=scalar at the same MID_DIM. That is what makes the A/B single-variable, and it means
+# ||w_a|| at the end of training is a direct readout on whether history earned its place.
+#
+# Both read STRICTLY the past: conv drops tap 0 and rnn reads S_{j-1}. h_j reaches the score only
+# through W_in, which the baseline already has.
+#
+# WHAT TO EXPECT: the prior is negative, and that is the point. The strictly MORE expressive
+# prefix arm (softmax attention over the whole prefix) already lost to scalar at a matched
+# objective -- RULER 8K 73.45 vs 73.71 with 2.5x the params -- and a fixed-decay recurrent state
+# did not survive its own shuffle control at probe level (t=0.79, sign test p=0.388). These arms
+# bracket that space from the cheap end (bounded receptive field) and the learned-gate end, so a
+# negative result stops being one architecture's failure and becomes a property of the problem.
+#
+#   SCORER=conv DECAY=1 LONGCE=1 scripts/train_gqa_indexer_scalar_gy.sh stage1_16k
+#   SCORER=rnn  DECAY=1 LONGCE=1 scripts/train_gqa_indexer_scalar_gy.sh stage1_16k
+#
+# WATCH in --metrics-file: gate_sparsity (must concentrate, i.e. fall, as in the scalar arm) and
+# the step time -- the rnn's scan is O(log L) sequential steps, not O(L), but it is still more
+# kernel launches than the conv's single grouped conv1d.
+CONV_KERNEL="${CONV_KERNEL:-8}"
+CONV_DIM="${CONV_DIM:-256}"
+# 1 = the conv reads only j-K..j-1 (default). 0 = include tap 0, the ablation.
+CONV_EXCLUDE_SELF="${CONV_EXCLUDE_SELF:-1}"
+STATE_DIM="${STATE_DIM:-256}"
+# learned = per-channel input-dependent forget gate (the hypothesis). fixed = one learnable
+# scalar retention, which is the ablation MATCHED to the already-probed EMA form, so "learned
+# gating matters" can be separated from "recurrence does not help".
+RNN_GATE_MODE="${RNN_GATE_MODE:-learned}"
+RNN_GATE_BIAS="${RNN_GATE_BIAS:-2.0}"
+
 # TrimKV's per-key LIFETIME (DECAY=1). Off by default, so every existing invocation is unchanged.
 #
 # The plain scalar router gives each key one number, fixed for all time: s_j decides its rank at
@@ -278,6 +313,39 @@ DELTA_LOGIT_CHUNK="${DELTA_LOGIT_CHUNK:-8192}"
 # WATCH `weight_participation` in --metrics-file, NOT the loss. If it lands at 0.13-0.18 again this
 # is repeating DELTA's failure and should be stopped; ~1.0 means the weighting is inert (check
 # longce_cache_miss_frac, which says how many drawn documents had no cached weights).
+# Forward-KL objective (FWKL=1). Replaces the cross-entropy with
+#   L = mean_t KL(p_dense_t || p_gated_t)
+# i.e. self-distillation against this same frozen backbone run WITHOUT the gate.
+#
+# WHY, in one line: CE anchors on the gold token, so it is nearly blind to the case eviction turns
+# on -- a key whose removal changes the prediction entirely at a position where the gold token was
+# never top-1. Needle tokens are exactly that case (measured key_L - all_L = -1.7, i.e. EASIER than
+# average under long context, which is also why LongCE's exp(L_short - L_long) weight misses them).
+# KL sees the whole distribution, so "dense answered the needle and the gated run did not" is a
+# large direct signal regardless of the gold token's rank.
+#
+# The teacher is CACHED as final HIDDEN states, not logits: lm_head is frozen, so the distribution
+# is a deterministic function of h_dense, and (L, 4096) is 37x smaller than (L, 151936). Build it
+# once with scripts/precompute_hdense.py and every later sweep reuses it.
+#
+#   FWKL=1 scripts/train_gqa_indexer_scalar_gy.sh stage1
+#   FWKL=1 FWKL_CE_WEIGHT=0.5 scripts/train_gqa_indexer_scalar_gy.sh stage1   # TrimKV's ntp+fwkl
+#
+# WATCH in --metrics-file: `agree_top1` (fraction of positions where the gated and dense argmax
+# agree -- more interpretable than the KL's absolute scale, and it should RISE) and
+# `fwkl_cache_miss_frac` (must stay 0.0; non-zero means the cache is being bypassed for an inline
+# teacher forward, which costs ~+27% per step).
+FWKL="${FWKL:-0}"
+# MUST match the seed the cache was built at: loader_for derives its stream from seed + seq_len,
+# so a different seed draws entirely different documents and every lookup misses (silently
+# falling back to an inline teacher, at +27% per step).
+SEED="${SEED:-1000}"
+FWKL_CACHE="${FWKL_CACHE:-/apdcephfs_gy8/share_303843174/guhao/datasets/hdense_8k_seed1000}"
+# 0 = pure KL. 0.5 reproduces TrimKV, whose compute_base_loss sums each enabled term and divides
+# by how many there are. But equal WEIGHTS are not equal influence: CE starts near 2.4 and this KL
+# near 0.145, so w=0.5 lets CE dominate the gradient ~17x. 0.1 puts them at ~1.8:1.
+FWKL_CE_WEIGHT="${FWKL_CE_WEIGHT:-0}"
+
 LONGCE="${LONGCE:-0}"
 # Window into each document: `head` takes a prefix, `random` a random slice. NOT cosmetic for an
 # A/B: LongCE REQUIRES head (its cache is keyed to per-position weights over a prefix, and the
@@ -308,11 +376,24 @@ ffn_sp_arg() { [[ "$FFN_SP" != "1" ]] && echo "--ffn-sp-size $FFN_SP"; }
 gate_sparsity_arg() { [[ "${GATE_SPARSITY:-1}" != "0" ]] && echo "--gate-sparsity"; }
 
 scalar_args() {
-  if [[ "$SCORER" == "kvzip" ]]; then
-    echo "--scorer kvzip --scalar-pos-slope $POS_SLOPE --kvzip-dim $KVZIP_DIM --kvzip-base $KVZIP_BASE"
-  else
-    echo "--scorer scalar --scalar-mid-dim $MID_DIM --scalar-pos-slope $POS_SLOPE"
-  fi
+  case "$SCORER" in
+    kvzip)
+      echo "--scorer kvzip --scalar-pos-slope $POS_SLOPE --kvzip-dim $KVZIP_DIM --kvzip-base $KVZIP_BASE"
+      ;;
+    conv)
+      # mid_dim is kept: the conv branch is ADDED to the scalar MLP's pre-activation, so both
+      # exist and an A/B against SCORER=scalar at the same MID_DIM has exactly one variable.
+      echo "--scorer conv --scalar-mid-dim $MID_DIM --scalar-pos-slope $POS_SLOPE \
+--conv-kernel $CONV_KERNEL --conv-dim $CONV_DIM $([[ "$CONV_EXCLUDE_SELF" == "0" ]] && echo --conv-include-self)"
+      ;;
+    rnn)
+      echo "--scorer rnn --scalar-mid-dim $MID_DIM --scalar-pos-slope $POS_SLOPE \
+--state-dim $STATE_DIM --rnn-gate-mode $RNN_GATE_MODE --rnn-gate-bias $RNN_GATE_BIAS"
+      ;;
+    *)
+      echo "--scorer scalar --scalar-mid-dim $MID_DIM --scalar-pos-slope $POS_SLOPE"
+      ;;
+  esac
   return 0
 }
 # `return 0` is load-bearing here for the same reason as delta_args/longce_args below: these are
@@ -381,9 +462,25 @@ delta_suffix() {
 # because the losses are causal. `random` would pair position i's weight with a different token, and
 # the trainer rejects the combination for that reason.
 take_from_arg() {
-  # Deliberately silent when LongCE is on: longce_args already passes head, and a second
-  # --take-from later on the command line would win and break the cache digest check.
-  [[ "$LONGCE" == "0" && -n "$TAKE_FROM" ]] && echo "--take-from $TAKE_FROM"
+  # Deliberately silent when LongCE or FWKL is on: both already pass `head` (their caches store
+  # per-document PREFIXES), and a second --take-from later on the command line would win and
+  # break the digest check.
+  [[ "$LONGCE" == "0" && "$FWKL" == "0" && -n "$TAKE_FROM" ]] && echo "--take-from $TAKE_FROM"
+  return 0
+}
+
+fwkl_args() {
+  if [[ "$FWKL" != "0" ]]; then
+    echo "--fwkl $FWKL_CACHE --take-from head"
+    [[ "$FWKL_CE_WEIGHT" != "0" ]] && echo "--fwkl-ce-weight $FWKL_CE_WEIGHT"
+  fi
+  return 0
+}
+
+fwkl_suffix() {
+  if [[ "$FWKL" != "0" ]]; then
+    if [[ "$FWKL_CE_WEIGHT" != "0" ]]; then echo "_fwkl_ce${FWKL_CE_WEIGHT}"; else echo "_fwkl"; fi
+  fi
   return 0
 }
 
@@ -405,6 +502,25 @@ longce_suffix() {
 # requiring `DELTA=0 LONGCE=1` would make the documented invocation fail on a value the caller never
 # set. An EXPLICIT `DELTA=1 LONGCE=1` is still an error: that is a real contradiction rather than a
 # default leaking through.
+if [[ "$FWKL" != "0" ]]; then
+  if [[ "$LONGCE" != "0" ]]; then
+    echo "FWKL=1 and LONGCE=1 are different objectives over the same forward; pick one." >&2
+    exit 1
+  fi
+  if [[ -n "$DELTA_EXPLICIT" && "$DELTA" != "0" ]]; then
+    echo "FWKL=1 and DELTA=1 are mutually exclusive: FWKL REPLACES the cross-entropy, DELTA" >&2
+    echo "reweights it." >&2
+    exit 1
+  fi
+  # DELTA's default is 1, so it has to be cleared rather than required to be 0 by the caller.
+  DELTA=0
+  if [[ ! -d "$FWKL_CACHE" ]]; then
+    echo "FWKL=1 needs an h_dense teacher cache at $FWKL_CACHE" >&2
+    echo "  build it:  python -m scripts.precompute_hdense --seq-len 8192 --seed \$SEED ..." >&2
+    echo "  or point FWKL_CACHE= at an existing one" >&2
+    exit 1
+  fi
+fi
 if [[ "$LONGCE" != "0" ]]; then
   if [[ -n "$DELTA_EXPLICIT" && "$DELTA" != "0" ]]; then
     echo "DELTA=1 and LONGCE=1 are mutually exclusive: they are two different weightings of the" >&2
@@ -583,10 +699,11 @@ case "$MODE" in
     # case rather than a separate mode -- --resume-from checks the checkpoint's recorded
     # --schedule against the one passed, so a copy of this block that drifted by one flag would
     # be rejected here (or, worse, resume onto a different curve). One code path cannot drift.
-    STAGE1_SUB="stage1$(delta_suffix)$(longce_suffix)$(decay_suffix)$(budget_suffix)"
+    STAGE1_SUB="stage1$(delta_suffix)$(fwkl_suffix)$(longce_suffix)$(decay_suffix)$(budget_suffix)"
     exec "${LAUNCH[@]}" -m scripts.train_gqa_indexer_e2e \
       --data-root "$DATA_ROOT" --model "$MODEL" $(data_args) $(scalar_args) $(delta_args) \
-      $(longce_args) $(decay_args) $(take_from_arg) \
+      $(fwkl_args) $(longce_args) $(decay_args) $(take_from_arg) \
+      --seed "$SEED" \
       --schedule "${SCHEDULE:-8192:300,16384:300,32768:900}" \
       ${MAX_STEPS:+--max-steps $MAX_STEPS} \
       --stage dense --pin-mode "$PIN_MODE" --n-sink "$N_SINK" --n-local "$N_LOCAL" $(liger_arg) $(ffn_sp_arg) \

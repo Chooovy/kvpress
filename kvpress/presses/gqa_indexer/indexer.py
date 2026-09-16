@@ -283,7 +283,7 @@ class GQAIndexer(nn.Module):
         # Starting at the natural scale means accepting a std-1 perturbation of the attention
         # logits at step 0, which is the price of having a gradient at all.
         self.gate_scale = (
-            nn.Parameter(torch.tensor(self.GATE_SCALE_INIT(config.head_dim)))
+            nn.Parameter(torch.tensor([self.GATE_SCALE_INIT(config.head_dim)]))
             if config.gate_scale
             else None
         )

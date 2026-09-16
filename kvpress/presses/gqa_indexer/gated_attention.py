@@ -473,6 +473,7 @@ def gated_attention_full(
     n_sink: int = 0,
     n_local: int = 0,
     pin_from: int | None = None,
+    thresh: torch.Tensor | None = None,
     key_tile: int = 1024,
     block_m: int = 64,
     block_n: int = 64,
@@ -574,6 +575,7 @@ def gated_attention_full(
             query_offset=query_offset,
             n_sink=n_sink if pins_sink(pin_mode) else 0,
             n_local=local_width(pin_mode, n_local),
+            thresh=thresh,
             pin_from=pin_from if has_tail else -1,
             block_m=block_m,
             block_n=block_n,
@@ -789,6 +791,7 @@ def gated_attention(
     n_sink: int = 0,
     n_local: int = 0,
     pin_from: int | None = None,
+    thresh: torch.Tensor | None = None,
     key_tile: int = 1024,
     return_row_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
@@ -834,6 +837,7 @@ def gated_attention(
             n_sink=n_sink,
             n_local=n_local,
             pin_from=pin_from,
+            thresh=thresh,
             key_tile=key_tile,
             return_row_lse=return_row_lse,
         )
@@ -854,6 +858,13 @@ def gated_attention(
             "already restricted to the selected keys, so a flat gate cannot recover dense "
             "attention and there is no no-op to pin against. Use pin_mode='none' here, and pin "
             "in the full-scope stage."
+        )
+    if thresh is not None:
+        raise ValueError(
+            "thresh (hard eviction) is a full-scope quantity: under scope='sparse' the forward is "
+            "ALREADY restricted to the router's top-k, so a hard mask would apply the same "
+            "selection twice. Use scope='full' with thresh -- that is the affordable way to train "
+            "on the hard geometry (the sparse scope's gather backward is O(L * topk * D))."
         )
     if pin_from is not None:
         raise ValueError(

@@ -403,6 +403,31 @@ def load_indexer_state_dict(model: nn.Module, state_dict: dict, scorer_attr: str
             f"{len(missing)} indexer keys are absent from the model "
             f"(e.g. {missing[:3]}). Did the indexer geometry change?{hint}"
         )
+    # gate_scale was a 0-dim tensor until FSDP forced it to (1,) -- FSDP rejects scalar
+    # parameters outright ("Change ... to a 1D tensor with numel equal to 1"). Reshape rather
+    # than refuse, because load_state_dict(strict=False) SILENTLY SKIPS a shape mismatch: an
+    # older checkpoint would load every other tensor, drop its trained gate_scale back to the
+    # init constant, and report success. That scalar is the per-layer gate strength, so the run
+    # would look healthy while having thrown away one trained value per layer.
+    model_state = model.state_dict()
+    migrated = 0
+    for key, value in list(filtered.items()):
+        target = model_state.get(key)
+        if (
+            target is not None
+            and torch.is_tensor(value)
+            and value.shape != target.shape
+            and value.numel() == target.numel() == 1
+        ):
+            filtered[key] = value.reshape(target.shape)
+            migrated += 1
+    if migrated:
+        logger.info(
+            "reshaped %d scalar tensor(s) (e.g. gate_scale) from 0-dim to (1,): FSDP does not "
+            "accept scalar parameters, and a silent shape mismatch would have reset them to init",
+            migrated,
+        )
+
     model.load_state_dict(filtered, strict=False)
     logger.info("Loaded %d %s tensors", len(filtered), scorer_attr)
 
@@ -449,9 +474,24 @@ _PAIRWISE_ONLY_SUFFIXES = ("w_q.weight", "w_k.weight", "q_norm.weight", "k_norm.
 #: :class:`~.prefix_indexer.PrefixIndexer` subclasses the scalar one and so carries every
 #: ``_SCALAR_ONLY_SUFFIXES`` entry too -- without this a prefix checkpoint would read as
 #: ``"scalar"`` and then half-load, silently dropping the entire prefix branch.
-_PREFIX_ONLY_SUFFIXES = ("w_pq.weight", "w_pk.weight", "w_pv.weight", "w_a.weight")
+#:
+#: ``w_a.weight`` is deliberately EXCLUDED: all three history arms (prefix, conv, rnn) project
+#: their branch into the trunk through a module of that name, so keying on it made every conv and
+#: rnn checkpoint look like a prefix one *and* like itself, which the ambiguity guard below then
+#: resolved to ``None`` -- i.e. "cannot tell which scorer wrote this checkpoint" on a perfectly
+#: well-formed one. ``w_pq``/``w_pk``/``w_pv`` are unique to the prefix attention.
+_PREFIX_ONLY_SUFFIXES = ("w_pq.weight", "w_pk.weight", "w_pv.weight")
 #: Parameters only a DMA value scorer has.
 _DMA_ONLY_SUFFIXES = ("dt_proj.weight", "A")
+
+#: Parameters only a conv indexer has. Like the prefix suffixes these are checked *before* the
+#: scalar ones, because :class:`~.conv_indexer.ConvIndexer` subclasses the scalar arm and carries
+#: every ``_SCALAR_ONLY_SUFFIXES`` entry too.
+_CONV_ONLY_SUFFIXES = ("w_cin.weight", "conv.weight")
+#: Parameters only an RNN indexer has. ``w_u`` rather than ``w_g``/``logit_retain``, because
+#: ``gate_mode="fixed"`` drops ``w_g`` and ``gate_mode="learned"`` drops ``logit_retain`` -- only
+#: ``w_u`` is present in both, so keying on either of the others would make one mode undetectable.
+_RNN_ONLY_SUFFIXES = ("w_u.weight",)
 
 #: Unique to the Fast-KVzip head: the learnable reference bank. Deliberately NOT q_norm/
 #: k_norm, which the pairwise scorer also carries -- keying on those would make every
@@ -471,6 +511,8 @@ def detect_scorer_from_keys(state_dict) -> str | None:
     """
     names = [str(k) for k in state_dict]
     is_prefix = any(n.endswith(_PREFIX_ONLY_SUFFIXES) for n in names)
+    is_conv = any(n.endswith(_CONV_ONLY_SUFFIXES) for n in names)
+    is_rnn = any(n.endswith(_RNN_ONLY_SUFFIXES) for n in names)
     is_scalar = any(n.endswith(_SCALAR_ONLY_SUFFIXES) for n in names)
     is_pairwise = any(n.endswith(_PAIRWISE_ONLY_SUFFIXES) for n in names)
     is_dma = any(n.endswith(_DMA_ONLY_SUFFIXES) for n in names)
@@ -482,10 +524,15 @@ def detect_scorer_from_keys(state_dict) -> str | None:
         return "dma" if not (is_pairwise or is_scalar or is_prefix) else None
     if is_pairwise:
         return "pairwise" if not (is_scalar or is_prefix) else None
-    if is_prefix:
-        # A prefix checkpoint must also carry the scalar parameters it inherits; if it does not,
-        # the names are contradictory and guessing would half-load.
-        return "prefix" if is_scalar else None
+    # The three history arms each subclass the scalar one, so each is a superset of it and must
+    # be tested before the bare-scalar fall-through. They are mutually exclusive by construction;
+    # if more than one fires the names are contradictory and guessing would half-load.
+    if sum((is_prefix, is_conv, is_rnn)) > 1:
+        return None
+    for flag, name in ((is_prefix, "prefix"), (is_conv, "conv"), (is_rnn, "rnn")):
+        if flag:
+            # Must also carry the scalar parameters it inherits; if not, the names contradict.
+            return name if is_scalar else None
     if is_scalar:
         return "scalar"
     return None
@@ -493,7 +540,8 @@ def detect_scorer_from_keys(state_dict) -> str | None:
 
 def detect_scorer(state_dict, config: dict | None = None) -> str:
     """
-    Which scorer wrote a checkpoint: ``"pairwise"``, ``"scalar"``, ``"prefix"``, ``"dma"`` or ``"kvzip"``.
+    Which scorer wrote a checkpoint: ``"pairwise"``, ``"scalar"``, ``"prefix"``, ``"dma"``,
+    ``"kvzip"``, ``"conv"`` or ``"rnn"``.
 
     ``config["scorer"]`` is authoritative when present -- that is what the trainer actually ran.
     Checkpoints written before the field existed fall back to
@@ -501,7 +549,7 @@ def detect_scorer(state_dict, config: dict | None = None) -> str:
     building the wrong scorer either fails on every key or, worse, half-loads.
     """
     recorded = (config or {}).get("scorer")
-    if recorded in ("pairwise", "scalar", "prefix", "dma", "kvzip"):
+    if recorded in ("pairwise", "scalar", "prefix", "dma", "kvzip", "conv", "rnn"):
         return recorded
     if recorded is not None:
         raise ValueError(f"checkpoint records an unknown scorer {recorded!r}")
@@ -535,6 +583,79 @@ def infer_scalar_mid_dim(state_dict, config: dict | None = None) -> int:
             "written by the mid_dim=0 linear form; the two disagree."
         )
     return 0
+
+
+def _shape_from(state_dict, suffix: str, axis: int, what: str) -> int:
+    """One parameter dimension, read off the weights rather than trusted from the config."""
+    for name, tensor in state_dict.items():
+        if str(name).endswith(suffix):
+            return int(tensor.shape[axis])
+    raise ValueError(
+        f"this checkpoint is a {what} but holds no {suffix}, so its geometry cannot be recovered."
+    )
+
+
+def _crosscheck(config: dict | None, key: str, shape: int, suffix: str) -> None:
+    """Raise if the recorded config contradicts the weight shape it claims to describe."""
+    recorded = (config or {}).get(key)
+    if recorded is not None and int(recorded) != shape:
+        raise ValueError(
+            f"checkpoint records {key}={recorded} but {suffix} implies {shape}; the two "
+            "disagree, so the run's own record of its geometry is inconsistent."
+        )
+
+
+def infer_conv_dims(state_dict, config: dict | None = None) -> dict:
+    """
+    A conv indexer's ``conv_dim`` and ``conv_kernel``, from ``w_cin``/``conv``.
+
+    Both are parameter shapes, so both come from the weights and the recorded config is only a
+    cross-check -- same contract as :func:`infer_prefix_dims`, and for the same reason: a config
+    value that disagrees with what loads cannot be the right one.
+
+    ``conv_exclude_self`` is deliberately **not** inferred: it is not a shape (it shifts the input
+    stream by one), so a checkpoint trained with it flipped would load every tensor cleanly and
+    score differently. It is read from the recorded config, and its absence means the default.
+    """
+    dim = _shape_from(state_dict, "w_cin.weight", 0, "conv indexer")
+    kernel = _shape_from(state_dict, "conv.weight", 2, "conv indexer")
+    _crosscheck(config, "conv_dim", dim, "w_cin.weight")
+    _crosscheck(config, "conv_kernel", kernel, "conv.weight")
+    out = {"conv_dim": dim, "conv_kernel": kernel}
+    recorded = (config or {}).get("conv_exclude_self")
+    if recorded is not None:
+        out["conv_exclude_self"] = bool(recorded)
+    return out
+
+
+def infer_rnn_dims(state_dict, config: dict | None = None) -> dict:
+    """
+    An RNN indexer's ``state_dim`` and ``rnn_gate_mode``, from ``w_u`` and the gate parameters.
+
+    ``state_dim`` is a shape and comes from ``w_u``. ``gate_mode`` is recovered from *which* gate
+    parameter is present -- ``w_g`` for ``"learned"``, ``logit_retain`` for ``"fixed"`` -- which is
+    a structural fact about the checkpoint rather than a recorded string, so it cannot go stale.
+    A checkpoint holding both, or neither, is contradictory and raises.
+    """
+    dim = _shape_from(state_dict, "w_u.weight", 0, "rnn indexer")
+    _crosscheck(config, "state_dim", dim, "w_u.weight")
+
+    names = [str(k) for k in state_dict]
+    has_learned = any(n.endswith("w_g.weight") for n in names)
+    has_fixed = any(n.endswith("logit_retain") for n in names)
+    if has_learned == has_fixed:
+        raise ValueError(
+            "an rnn indexer must hold exactly one of w_g.weight (gate_mode='learned') or "
+            f"logit_retain (gate_mode='fixed'); found learned={has_learned}, fixed={has_fixed}."
+        )
+    mode = "learned" if has_learned else "fixed"
+    recorded = (config or {}).get("rnn_gate_mode")
+    if recorded is not None and str(recorded) != mode:
+        raise ValueError(
+            f"checkpoint records rnn_gate_mode={recorded!r} but its weights hold the {mode!r} "
+            "gate; the run's own record of its geometry is inconsistent."
+        )
+    return {"state_dim": dim, "rnn_gate_mode": mode}
 
 
 def infer_prefix_dims(state_dict, config: dict | None = None) -> dict:
@@ -604,7 +725,7 @@ def press_kwargs_from_checkpoint(
     config = config or {}
     scorer = scorer or detect_scorer(state_dict, config)
     kwargs: dict = {}
-    if scorer in ("scalar", "prefix"):
+    if scorer in ("scalar", "prefix", "conv", "rnn"):
         kwargs["scalar_mid_dim"] = infer_scalar_mid_dim(state_dict, config)
         recorded = config.get("scalar_pos_slope")
         if recorded is not None:
@@ -612,7 +733,23 @@ def press_kwargs_from_checkpoint(
     if scorer == "scalar":
         kwargs.update(infer_scalar_decay(state_dict, config))
     if scorer == "prefix":
+        # Same reason as the scalar arm: `w_decay` consumes the TRUNK and PrefixIndexer overrides
+        # `_trunk`, so a prefix checkpoint can carry a decay head. Without this the press is built
+        # without `w_decay` and loading refuses with "56 indexer keys are absent from the model",
+        # which is what a prefix+decay checkpoint hits at eval. `infer_scalar_decay` reads `decay`
+        # from the WEIGHTS, so a decay-off prefix checkpoint returns {} and is unaffected.
+        kwargs.update(infer_scalar_decay(state_dict, config))
         kwargs.update(infer_prefix_dims(state_dict, config))
+    if scorer in ("conv", "rnn"):
+        # Same reason as the prefix arm: these override `_trunk`, so `w_decay` (which consumes the
+        # trunk) can be present, and it must be read from the WEIGHTS -- a decay-off checkpoint
+        # returns {} and is unaffected. Without this the press is built without `w_decay` and the
+        # load refuses with "N indexer keys are absent from the model".
+        kwargs.update(infer_scalar_decay(state_dict, config))
+    if scorer == "conv":
+        kwargs.update(infer_conv_dims(state_dict, config))
+    if scorer == "rnn":
+        kwargs.update(infer_rnn_dims(state_dict, config))
     if scorer == "kvzip":
         recorded = config.get("scalar_pos_slope")
         if recorded is not None:

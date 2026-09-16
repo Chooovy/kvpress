@@ -44,10 +44,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 DATASET="${DATASET:-ruler}"
-DATA_DIR="${DATA_DIR:-8192}"
+DATA_DIR="${DATA_DIR:-16384}"
 MODEL="${MODEL:-/apdcephfs_gy8/share_303843174/guhao/models/Qwen3-8B}"
-CKPT="${CKPT:-/apdcephfs_gy8/share_303843174/guhao/models/Qwen-3-8B-gqa_indexer_scalar/local128/stage1_longce_decay/final.pt}"
-OUTPUT_DIR="${OUTPUT_DIR:-./results_sparse_scalar_local128}"
+CKPT="${CKPT:-/apdcephfs_gy8/share_303843174/guhao/models/Qwen-3-8B-gqa_indexer_scalar/rvkl_8k_local128_b256_decay/step300.pt}"
+OUTPUT_DIR="${OUTPUT_DIR:-./results_sparse_scalar_rvkl}"
 
 # Trained linear memory over the evicted keys (kvpress.presses.gqa_indexer.memory). Empty runs plain
 # sparse attention, which is the baseline the memory arm is measured against -- so an A/B is the same
@@ -55,6 +55,23 @@ OUTPUT_DIR="${OUTPUT_DIR:-./results_sparse_scalar_local128}"
 # what the memory was TRAINED at or the state is read over a different evicted set; evaluate_sparse
 # warns from the checkpoint's recorded config when they differ.
 MEMORY="${MEMORY:-}"
+# Training-free CMP slots. CMP_SLOTS=0 (the default) is the budget-matched baseline the arm must
+# beat; the slots are funded out of --topk, so both runs read the same number of entries per row.
+CMP_SLOTS="${CMP_SLOTS:-0}"
+CMP_MASS="${CMP_MASS:-count}"
+CMP_DELTA="${CMP_DELTA:-0}"
+CMP_SPACE="${CMP_SPACE:-post_rope}"
+CMP_MASS_CKPT="${CMP_MASS_CKPT:-}"
+
+# Per-head budget allocation. "uniform" is the default and is bitwise identical to the behaviour
+# before the feature existed. "mass" splits each layer's n_kv_heads*topk budget so every head
+# retains the same attention mass, with the total conserved exactly -- see
+# kvpress/presses/gqa_indexer/head_budget.py for why mass is the only cross-head-comparable
+# currency this router admits.
+HEAD_BUDGET="${HEAD_BUDGET:-mass}"
+HEAD_BUDGET_FLOOR="${HEAD_BUDGET_FLOOR:-512}"
+# Offline-fitted (n_layers, n_kv_heads) budget table; required by HEAD_BUDGET=static.
+HEAD_BUDGET_TABLE="${HEAD_BUDGET_TABLE:-}"
 
 FORCE_LOCAL="${FORCE_LOCAL:-128}"
 FORCE_SINK="${FORCE_SINK:-4}"
@@ -119,6 +136,16 @@ for length in "${LENGTHS[@]}"; do
     [[ -n "$length" ]] && EXTRA+=(--data_dir "$length")
     [[ -n "$SCORER" ]] && EXTRA+=(--scorer "$SCORER")
     [[ -n "$MEMORY" ]] && EXTRA+=(--memory_ckpt "$MEMORY")
+    if [[ "$CMP_SLOTS" != "0" ]]; then
+      EXTRA+=(--cmp_slots "$CMP_SLOTS" --cmp_mass "$CMP_MASS" --cmp_delta "$CMP_DELTA")
+      EXTRA+=(--cmp_space "$CMP_SPACE")
+      [[ -n "$CMP_MASS_CKPT" ]] && EXTRA+=(--cmp_mass_ckpt "$CMP_MASS_CKPT")
+    fi
+    if [[ "$HEAD_BUDGET" != "uniform" ]]; then
+      EXTRA+=(--head_budget "$HEAD_BUDGET")
+      [[ "$HEAD_BUDGET_FLOOR" != "0" ]] && EXTRA+=(--head_budget_floor "$HEAD_BUDGET_FLOOR")
+      [[ -n "$HEAD_BUDGET_TABLE" ]] && EXTRA+=(--head_budget_table "$HEAD_BUDGET_TABLE")
+    fi
     echo "=== topk=$topk @ ${length:-default} across $NGPU GPU(s)"
     "$PYTHON" evaluate_sparse_sharded.py \
       "${SHARD_ARGS[@]}" \

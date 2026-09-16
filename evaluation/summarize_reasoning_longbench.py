@@ -101,9 +101,18 @@ def main(output_dir: str = "./results_reasoning_longbench"):
             if predictions.exists():
                 total = len(pd.read_csv(predictions))
         answered = metrics.get("answered")
+        # Thinking and non-thinking are DIFFERENT measurements of the same (task, arm) -- the prompt
+        # differs -- so they must be grouped separately. Without this they carry identical labels,
+        # the sort interleaves them arbitrarily, and the "vs dense" column subtracts whichever dense
+        # row happened to sort first: a thinking sparse arm gets differenced against the
+        # non-thinking baseline, which is how aime25 topk2048 read "+0.2000" when the correct
+        # comparison against thinking dense is -0.3667.
+        thinking = bool(config.get("enable_thinking"))
         rows.append(
             {
                 "task": task,
+                "mode": "think" if thinking else "no-think",
+                "thinking": thinking,
                 "arm": f"sparse topk{config.get('topk')}" if is_sparse else "dense no_press",
                 "topk": config.get("topk") if is_sparse else None,
                 "accuracy": _accuracy(task, metrics),
@@ -119,35 +128,45 @@ def main(output_dir: str = "./results_reasoning_longbench"):
         raise SystemExit(f"no scored runs found under {root}")
 
     header = (
-        f"{'task':<14} {'arm':<20} {'n':>5} {'frac':>5} {'acc':>7} {'answered':>9} {'+/-95%':>7} "
-        f"{'vs dense':>9}"
+        f"{'task':<14} {'mode':<9} {'arm':<20} {'n':>5} {'frac':>5} {'acc':>7} {'answered':>9} "
+        f"{'+/-95%':>7} {'vs dense':>9}"
     )
     print(header)
     print("-" * len(header))
 
+    # One block per (task, mode). The dense baseline is looked up WITHIN the block, so "vs dense"
+    # always compares like with like -- see the note where `thinking` is set.
     for task in sorted({r["task"] for r in rows}):
-        group = [r for r in rows if r["task"] == task]
-        dense = next((r for r in group if r["topk"] is None), None)
-        # Dense first, then ascending top-k: the reading order is "upper bound, then how much budget
-        # it takes to approach it".
-        group.sort(key=lambda r: (r["topk"] is not None, r["topk"] or 0))
-        for r in group:
-            acc, ans, n = r["accuracy"], r["answered"], r["n"] or 0
-            hw = _wilson_halfwidth(acc, n) if acc is not None else None
-            gap = (
-                acc - dense["accuracy"]
-                if (dense and acc is not None and dense["accuracy"] is not None and r is not dense)
-                else None
-            )
-            print(
-                f"{r['task']:<14} {r['arm']:<20} {n:>5} "
-                f"{(f'{r['fraction']:.2f}' if r['fraction'] is not None else '-'):>5} "
-                f"{(f'{acc:.4f}' if acc is not None else '-'):>7} "
-                f"{(f'{ans:.2f}' if ans is not None else '-'):>9} "
-                f"{(f'{hw:.3f}' if hw is not None else '-'):>7} "
-                f"{(f'{gap:+.4f}' if gap is not None else '-'):>9}"
-            )
-        print()
+        for thinking in (False, True):
+            group = [r for r in rows if r["task"] == task and r["thinking"] == thinking]
+            if not group:
+                continue
+            dense = next((r for r in group if r["topk"] is None), None)
+            # Dense first, then ascending top-k: the reading order is "upper bound, then how much
+            # budget it takes to approach it".
+            group.sort(key=lambda r: (r["topk"] is not None, r["topk"] or 0))
+            for r in group:
+                acc, ans, n = r["accuracy"], r["answered"], r["n"] or 0
+                hw = _wilson_halfwidth(acc, n) if acc is not None else None
+                gap = (
+                    acc - dense["accuracy"]
+                    if (
+                        dense
+                        and acc is not None
+                        and dense["accuracy"] is not None
+                        and r is not dense
+                    )
+                    else None
+                )
+                print(
+                    f"{r['task']:<14} {r['mode']:<9} {r['arm']:<20} {n:>5} "
+                    f"{(f'{r['fraction']:.2f}' if r['fraction'] is not None else '-'):>5} "
+                    f"{(f'{acc:.4f}' if acc is not None else '-'):>7} "
+                    f"{(f'{ans:.2f}' if ans is not None else '-'):>9} "
+                    f"{(f'{hw:.3f}' if hw is not None else '-'):>7} "
+                    f"{(f'{gap:+.4f}' if gap is not None else '-'):>9}"
+                )
+            print()
 
     print(
         "acc      = accuracy (math500/aime25) or average (longbench-v2)\n"

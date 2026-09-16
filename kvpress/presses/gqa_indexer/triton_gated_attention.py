@@ -110,6 +110,7 @@ if HAS_TRITON:
         gQI,
         gKI,
         gLSE,
+        gThresh,
         gGateScale,
         gOut,
         gRowLSE,
@@ -149,6 +150,7 @@ if HAS_TRITON:
         pin_from,
         sm_scale,
         PIN_LOCAL: tl.constexpr,
+        HARD: tl.constexpr,
         N_LOCAL: tl.constexpr,
         PIN_TAIL: tl.constexpr,
         GROUP: tl.constexpr,
@@ -251,7 +253,24 @@ if HAS_TRITON:
                 # at Sq < Sk a key can sit after the query and would give a negative age.
                 age = q_pos[:, None] - offs_n[None, :]
                 pinned = pinned | ((age >= 0) & (age < N_LOCAL))
-            logits = logits + tl.where(pinned, 0.0, score - lse[:, None])
+            if HARD:
+                # HARD EVICTION, the geometry inference actually runs. A key outside the row's
+                # top-k is REMOVED (-inf), not merely down-weighted; a key inside it is read at
+                # gate 0, i.e. at full dense weight with no soft multiplier at all.
+                #
+                # Expressed as a per-row THRESHOLD rather than an index tensor, which is what
+                # makes it O(L): the router is frozen and query-independent, so a key's score is
+                # fixed and "in query i's top-k" is exactly "score >= thresh_i". An explicit
+                # (Sq, topk) index set would cost the same memory the sparse gather path does.
+                thresh = tl.load(
+                    gThresh + pid_b * stride_lb + head_kv * stride_lh + offs_m * stride_lm,
+                    mask=mask_m, other=0.0,
+                )
+                logits = logits + tl.where(
+                    pinned, 0.0, tl.where(score >= thresh[:, None], 0.0, float("-inf"))
+                )
+            else:
+                logits = logits + tl.where(pinned, 0.0, score - lse[:, None])
 
             causal = (offs_n[None, :] <= q_pos[:, None]) & mask_n[None, :] & mask_m[:, None]
             logits = tl.where(causal, logits, float("-inf"))
@@ -303,6 +322,7 @@ if HAS_TRITON:
         gQI,
         gKI,
         gLSE,
+        gThresh,
         gGateScale,
         gOut,
         gRowLSE,
@@ -351,6 +371,7 @@ if HAS_TRITON:
         pin_from,
         sm_scale,
         PIN_LOCAL: tl.constexpr,
+        HARD: tl.constexpr,
         N_LOCAL: tl.constexpr,
         PIN_TAIL: tl.constexpr,
         GROUP: tl.constexpr,
@@ -479,7 +500,18 @@ if HAS_TRITON:
                 # at Sq < Sk a key can sit after the query and would give a negative age.
                 age = q_pos[:, None] - offs_n[None, :]
                 pinned = pinned | ((age >= 0) & (age < N_LOCAL))
-            logits = logits + tl.where(pinned, 0.0, raw_gate * gate_scale - lse[:, None])
+            if HARD:
+                thresh = tl.load(
+                    gThresh + pid_b * stride_lb + head_kv * stride_lh + offs_m * stride_lm,
+                    mask=mask_m, other=0.0,
+                )
+                logits = logits + tl.where(
+                    pinned,
+                    0.0,
+                    tl.where(raw_gate * gate_scale >= thresh[:, None], 0.0, float("-inf")),
+                )
+            else:
+                logits = logits + tl.where(pinned, 0.0, raw_gate * gate_scale - lse[:, None])
 
             causal = (offs_n[None, :] <= q_pos[:, None]) & mask_n[None, :] & mask_m[:, None]
             p = tl.where(causal, tl.exp(logits - row_lse[:, None]), 0.0)
@@ -563,6 +595,7 @@ class _GatedAttention(torch.autograd.Function):
         q_idx,
         k_idx,
         lse,
+        thresh,
         gate_scale,
         sm_scale,
         query_offset,
@@ -593,6 +626,11 @@ class _GatedAttention(torch.autograd.Function):
             PRECISION=precision,
         )
         grid = (triton.cdiv(q_len, block_m), n_heads, bsz)
+        # A hard run passes a real per-row threshold; a soft one passes `lse` again as a
+        # placeholder the kernel never reads, because HARD is a constexpr and that branch is
+        # compiled out entirely.
+        hard = thresh is not None
+        thresh_arg = thresh if hard else lse
         _gated_attn_fwd[grid](
             q,
             k,
@@ -600,6 +638,7 @@ class _GatedAttention(torch.autograd.Function):
             q_idx,
             k_idx,
             lse,
+            thresh_arg,
             gate_scale,
             out,
             row_lse,
@@ -619,17 +658,21 @@ class _GatedAttention(torch.autograd.Function):
             sm_scale,
             PIN_LOCAL=n_local > 0,
             N_LOCAL=n_local,
+            HARD=hard,
             PIN_TAIL=pin_from >= 0,
             **shapes,
         )
 
-        ctx.save_for_backward(q, k, v, q_idx, k_idx, lse, gate_scale, out, row_lse)
+        ctx.save_for_backward(
+            q, k, v, q_idx, k_idx, lse, thresh_arg, gate_scale, out, row_lse
+        )
+        ctx.hard = hard
         ctx.meta = (sm_scale, query_offset, n_sink, n_local, pin_from, block_m, block_n, precision, group)
         return out, row_lse
 
     @staticmethod
     def backward(ctx, d_out, _d_row_lse):
-        q, k, v, q_idx, k_idx, lse, gate_scale, out, row_lse = ctx.saved_tensors
+        q, k, v, q_idx, k_idx, lse, thresh_arg, gate_scale, out, row_lse = ctx.saved_tensors
         sm_scale, query_offset, n_sink, n_local, pin_from, block_m, block_n, precision, group = ctx.meta
         bsz, n_heads, q_len, head_dim = q.shape
         k_len, dim_v = k.shape[2], v.shape[-1]
@@ -646,7 +689,7 @@ class _GatedAttention(torch.autograd.Function):
         d_v = torch.zeros_like(v, dtype=torch.float32)
         d_q_idx = torch.zeros_like(q_idx, dtype=torch.float32)
         d_k_idx = torch.zeros_like(k_idx, dtype=torch.float32)
-        d_gate_scale = torch.zeros((), device=q.device, dtype=torch.float32)
+        d_gate_scale = torch.zeros(1, device=q.device, dtype=torch.float32)
         d_lse = torch.zeros_like(lse, dtype=torch.float32)
 
         shapes = dict(
@@ -669,6 +712,7 @@ class _GatedAttention(torch.autograd.Function):
             q_idx,
             k_idx,
             lse,
+            thresh_arg,
             gate_scale,
             out,
             row_lse,
@@ -697,6 +741,7 @@ class _GatedAttention(torch.autograd.Function):
             sm_scale,
             PIN_LOCAL=n_local > 0,
             N_LOCAL=n_local,
+            HARD=ctx.hard,
             PIN_TAIL=pin_from >= 0,
             **shapes,
         )
@@ -708,6 +753,7 @@ class _GatedAttention(torch.autograd.Function):
             d_q_idx.to(q_idx.dtype),
             d_k_idx.to(k_idx.dtype),
             d_lse.to(lse.dtype),
+            None,  # thresh: a frozen router's top-k boundary is not a differentiable quantity
             d_gate_scale.to(gate_scale.dtype),
             None,
             None,
@@ -728,6 +774,7 @@ def triton_gated_attention(
     k_idx: torch.Tensor,
     lse: torch.Tensor,
     *,
+    thresh: torch.Tensor | None = None,
     gate_scale: torch.Tensor,
     scaling: float,
     query_offset: int,
@@ -755,6 +802,17 @@ def triton_gated_attention(
         :func:`~.gate_pin.history_lse`; pass zeros to gate without a budget (``pin_mode="none"``,
         where the normalizer is provably inert).
 
+        ``thresh`` switches the gate from SOFT to **hard eviction**, the geometry inference runs.
+        Same ``(B, Hkv, Sq)`` shape as ``lse``, holding each row's top-k score boundary: a
+        non-pinned key scoring below it is removed with ``-inf`` instead of being down-weighted by
+        ``score - lse``, and one scoring at or above it is read at gate ``0``, i.e. full dense
+        weight with no soft multiplier. ``None`` keeps the soft gate.
+
+        A threshold rather than an index set is what keeps this ``O(L)``. It is only equivalent to
+        a per-row top-k because the router is **frozen and query-independent**: a key's score is
+        then fixed, so "in query ``i``'s top-k" is exactly "score >= thresh_i". With a training
+        router the boundary would move within the step and this equivalence would not hold.
+
         Returns ``(B, H, Sq, Dv)`` in ``q``'s dtype. With ``return_row_lse=True``, also
         returns the fused forward's ``(B, H, Sq)`` fp32 attention log-normalizer for diagnostics.
     """
@@ -767,6 +825,7 @@ def triton_gated_attention(
         q_idx.contiguous(),
         k_idx.contiguous(),
         lse.contiguous(),
+        None if thresh is None else thresh.contiguous(),
         gate_scale,
         float(scaling),
         int(query_offset),

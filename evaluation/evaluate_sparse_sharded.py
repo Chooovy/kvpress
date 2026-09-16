@@ -171,11 +171,49 @@ def main(
     df = pd.concat(frames).sort_index()
     total = sum(len(f) for f in frames)
     assert len(df) == total, f"concat lost rows: {len(df)} != {total}"
+    # Overlap is checked on the index, which is the ONLY row identity available here -- but a
+    # rollout run must be allowed to repeat a row R times.
+    #
+    # History, because the obvious "fix" is wrong twice over. The bare `index.has_duplicates` test
+    # refused to score a complete, correct 240-row aime25 run (240 distinct problems x rollouts, no
+    # shard overlap) after every token had been generated, forcing a hand-score. My first
+    # replacement keyed on `(index, rollout)`; that is ALSO wrong for shards written before
+    # ROLLOUT_STRIDE landed, because `ignore_index=True` renumbered every shard from 0, so index 0
+    # means a DIFFERENT problem in each shard and `(index, rollout)` collides legitimately. And
+    # there is no content column to key on instead: RULER has 4959 distinct questions across 6500
+    # rows, so `question` is not an identity either.
+    #
+    # What is actually checkable: with the strided index, rollout r of row i is `i + r*STRIDE`, so
+    # a correct union has NO duplicate index at all. Legacy (pre-stride) shards cannot be
+    # distinguished from a genuine overlap by any local test, so they are refused with an
+    # explanation and a pointer, rather than silently accepted or silently double-counted.
     if df.index.has_duplicates:
+        rollouts = int(df["rollout"].nunique()) if "rollout" in df.columns else 1
+        if rollouts > 1:
+            raise SystemExit(
+                f"the union has duplicate index values with rollouts={rollouts}. If these shards "
+                "were written before the ROLLOUT_STRIDE fix, each shard renumbered its rows from "
+                "0 and the index is not a row identity -- the DATA may be fine, but it cannot be "
+                "verified here. Re-run (new shards stride the index so rollouts do not collide), "
+                "or score offline after re-keying on the source row.\n"
+                "If these shards ARE strided, then two shards really do hold the same row and the "
+                "union would double-count it."
+            )
         raise SystemExit(
             "shards overlap: the same row appears in more than one shard, so the union would "
             "double-count it. This means the shards did not derive from the identical frame."
         )
+    if "rollout" in df.columns:
+        # Every source row must carry the same number of traces, or the accuracy mean weights
+        # some problems more than others. Recoverable from the strided index: row = index % STRIDE.
+        from evaluate_sparse import ROLLOUT_STRIDE
+
+        counts = (df.index % ROLLOUT_STRIDE).value_counts().unique()
+        if len(counts) > 1:
+            raise SystemExit(
+                f"source rows carry differing rollout counts {sorted(counts)}; an accuracy mean "
+                "over them would weight some problems more than others."
+            )
     if df["predicted_answer"].isna().any():
         n = int(df["predicted_answer"].isna().sum())
         raise SystemExit(f"{n} row(s) have no prediction; refusing to score an incomplete union")
@@ -193,6 +231,34 @@ def main(
     with open(results_dir / "config.yaml", "w") as f:
         saved = asdict(config)
         saved.update({"num_shards": num_shards, "shard_index": None, "sharded_devices": gpu_ids})
+        # Resume provenance, recovered from the SHARD LOGS.
+        #
+        # `evaluate_sparse.py` stamps `resumed_traces` when IT replays a progress log, but in a
+        # sharded run the DRIVER writes config.yaml and never learns what the shards replayed --
+        # so a resumed sharded run recorded `resumed_traces: 0` and read as a clean one. Observed
+        # on math500 K=512, which replayed 696 of 1000 traces and still reported 0.
+        #
+        # This matters because a resumed run reseeds only for the traces it still has to generate,
+        # so it is NOT bit-identical to a clean run at the same seed -- and the paired dense/sparse
+        # seed argument the reasoning comparison rests on holds only for clean runs. Recording the
+        # count is what stops a resumed number being compared as though it were clean.
+        #
+        # Parsed from the logs rather than passed back by the shards: shards communicate only
+        # through parquet files, and a side channel for one integer is not worth the coupling.
+        resumed = 0
+        for log in sorted(results_dir.glob("shard*.log")):
+            try:
+                text = log.read_text(errors="replace")
+            except OSError:
+                continue
+            for line in text.splitlines():
+                if "resuming from" in line and "traces already generated" in line:
+                    head = line.split("traces already generated")[0].rsplit(":", 1)[-1]
+                    got = head.strip().split("/")[0]
+                    if got.isdigit():
+                        resumed += int(got)
+        if resumed:
+            saved["resumed_traces"] = resumed
         yaml.dump(saved, f, default_flow_style=False, sort_keys=False)
 
     if not keep_shards:

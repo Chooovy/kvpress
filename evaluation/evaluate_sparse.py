@@ -60,10 +60,19 @@ from kvpress import (  # noqa: E402
     SparseAttentionContext,
     load_indexer_state_dict,
 )
+from kvpress.presses.gqa_indexer.evict_runner import EvictInferenceContext  # noqa: E402
 from kvpress.presses.gqa_indexer.train import press_kwargs_from_checkpoint  # noqa: E402
 from kvpress.pipeline import KVPressTextGenerationPipeline  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+#: Index stride between rollouts when ``--rollouts > 1``. Rollout ``r`` of row ``i`` is indexed
+#: ``i + r * ROLLOUT_STRIDE``, so the index stays unique across BOTH rollouts and shards, and the
+#: original row is recoverable as ``index % ROLLOUT_STRIDE``. It has to be a constant rather than
+#: ``frame.index.max() + 1``: every shard holds a different slice, so a frame-derived offset
+#: differs per shard and the unioned indices collide -- which the sharded driver correctly refuses
+#: to score ("the same row appears in more than one shard"). Larger than any benchmark's row count.
+ROLLOUT_STRIDE = 1_000_000
 
 
 @dataclass
@@ -85,6 +94,16 @@ class SparseEvaluationConfig:
     # The trained indexer
     indexer_ckpt: str = ""
 
+    # A JOINT checkpoint's adapted BACKBONE (scripts/train_gqa_indexer_joint.py). Empty means the
+    # backbone is whatever --model loads, which is right for every frozen-backbone checkpoint.
+    #
+    # REQUIRED for a joint checkpoint, and the reason is that nothing else catches its absence:
+    # joint training moves 1.51B attention parameters, so the router was optimized against a
+    # backbone that --model does not contain. The indexer would load cleanly, the eval would run,
+    # and the number would describe a pairing that never existed. Point this at the same file as
+    # --indexer_ckpt (a joint payload carries both under "model" and "indexer").
+    backbone_ckpt: str = ""
+
     # The trained linear memory over the evicted keys (kvpress.presses.gqa_indexer.memory). Empty
     # runs plain sparse attention, which is the baseline this arm is measured against. The geometry
     # comes from the checkpoint's recorded config; the router it was trained against is recorded
@@ -92,11 +111,66 @@ class SparseEvaluationConfig:
     # router's support is summarizing keys that router did not evict -- and no weight shape says so.
     memory_ckpt: str = ""
 
+    # Training-free CMP slots (kvpress.presses.gqa_indexer.cmp_slots). 0 disables. R slots are
+    # funded OUT OF --topk, so the row still reads topk entries and the A/B against the plain sparse
+    # run is budget-matched -- comparing at unmatched budget would measure the budget, not the idea.
+    cmp_slots: int = 0
+    # How each slot's log-mass is set. "count" is log n_r, which is provably biased LOW by the
+    # within-cluster logit variance and therefore SAFE (the slot barely participates); "count+var"
+    # adds the 1/2 Var correction estimated from the prefill's own queries. Both are training-free.
+    # See cmp_slots.slot_mass: a confident mass on a mediocre direction measured 3-5x WORSE than no
+    # slot at all, so "count" is the right first run.
+    cmp_mass: str = "count"
+    # Constant nats added to every slot, for sweeping the correction by hand.
+    cmp_delta: float = 0.0
+    # Space the k-means ASSIGNMENT runs in. "post_rope" clusters the cache as stored; "pre_rope"
+    # un-rotates first so the partition sees content with the positional phase removed. Only the
+    # partition changes -- k_cmp/v_cmp stay means of post-RoPE keys either way, since the slot's
+    # logit is q.k_cmp. Measured: post-RoPE clusters are near-contiguous position spans
+    # (position_locality 0.07-0.49) while pre-RoPE ones are position-blind (0.31-0.90).
+    cmp_space: str = "post_rope"
+    # Trained CMPMassHead checkpoint (scripts/train_cmp_mass.py). Supersedes cmp_mass/cmp_delta:
+    # b_r = count_coef*log n_r + var_coef*(1/2 Var_r) + bias, 3 scalars per (layer, KV head).
+    cmp_mass_ckpt: str = ""
+
     # Sparse-attention budget (defaults match the sparse training stage)
     topk: int = 512
+    # Retain this FRACTION of each document's own context instead of a fixed count. Required for a
+    # length-heterogeneous benchmark: LongBench's median context is 10156 tokens, so a fixed
+    # topk=16384 ("retain 50% of 32768") leaves 80% of documents uncompressed and the 50%/25% arms
+    # scored 47.07 vs 47.06. With a ratio, "retain 50%" means the same thing on every row.
+    topk_ratio: Optional[float] = None
     force_sink: int = 4
     force_local: int = 64
     block_k: int = 64
+
+    # How the layer's budget (n_kv_heads * topk) is split across KV heads.
+    #   "uniform" -- today's behaviour: every head gets exactly topk.
+    #   "mass"    -- every head reaches the same RETAINED ATTENTION MASS, total conserved exactly.
+    # Mass is the only currency that is legal here: the trained gate is invariant to a per-(layer,
+    # head) constant added to the score, so pooling raw scores across heads (AdaKV) ranks on an
+    # unidentifiable quantity, while retained softmax mass is invariant to it. See
+    # kvpress/presses/gqa_indexer/head_budget.py.
+    head_budget: str = "uniform"
+    # Minimum evictable keys per head before the split (TrimKV's min_tokens_per_head). Guards
+    # against one reference row starving a head that later rows need.
+    head_budget_floor: int = 0
+    # Static table fitted offline by scripts/fit_head_budget_table.py. Required by
+    # head_budget="static", which reads it instead of measuring anything at prefill.
+    head_budget_table: str = ""
+
+    # Physically COMPRESS the cache after the context prefill, instead of keeping it all and
+    # masking. Same selection (a set identity -- tests/presses/test_gqa_indexer_evict_cache.py),
+    # so the score is comparable to the masking arm; what changes is that decode reads `topk` keys
+    # rather than the whole context, and the cache stops scaling with the context length (0.298 GiB
+    # at topk=2048 whether the context is 8K or 128K). This is the arm to run when the claim is
+    # about decode cost or memory rather than about quality.
+    evict: bool = False
+    # Questions decoded together under --evict. They share one committed context, so a batch costs
+    # one prefill plus a replication per extra question. Decode is memory-bound, so this is where
+    # the throughput comes from; raise it until the GPU saturates.
+    decode_batch: int = 1
+
 
     # tl.dot precision. "tf32" because q/k/v here are the model's own bf16, and every bf16 value
     # is exact in tf32 -- so the QK dot is bit-identical and the whole kernel matches the fp32
@@ -132,6 +206,35 @@ class SparseEvaluationConfig:
     # several times longer, and a truncated trace never reaches \boxed{} at all.
     enable_thinking: bool = False
 
+    # Sampled decoding and pass@1 rollouts, for the reasoning benchmarks.
+    #
+    # `rollouts=1` with `do_sample=False` (the defaults) is the greedy single-sample path every
+    # earlier result used, bitwise. Set both for math500/aime25: those benchmarks cannot be run
+    # greedily and stay comparable to the literature -- Qwen3 ships temperature 0.6 / top_p 0.95 /
+    # top_k 20 in its own generation_config, thinking traces degenerate into repetition under
+    # argmax, and "pass@1" is by definition a mean over sampled rollouts, not one greedy trace.
+    #
+    # Each rollout re-runs the WHOLE row (fresh prefill, fresh sparse context), so the R traces are
+    # independent, and the metric is the mean of the per-rollout scores. Rollout r uses seed
+    # `seed + 1000 * r`, so a run is reproducible and two arms (dense vs IndexMem++) draw the same
+    # seed sequence -- which is what makes their difference a paired comparison rather than two
+    # independent samples.
+    rollouts: int = 1
+    do_sample: bool = False
+    temperature: float = 0.6
+    top_p: float = 0.95
+    top_k: int = 20
+
+    # Reuse an existing results directory instead of uniquifying into `.../1`, so a killed run can
+    # pick up its own `progress.jsonl`. OFF by default, because the uniquification is what stops a
+    # rerun from silently overwriting a completed result -- turning it off unconditionally would
+    # trade a recoverable failure for an unrecoverable one.
+    #
+    # Without this flag the progress log is nearly useless: `get_results_dir` sends every restart
+    # to a NEW directory, so the resume logic looks for a file that is not there and regenerates
+    # everything. That is the trap this flag exists to close.
+    resume: bool = False
+
     # Data-parallel sharding. num_shards > 1 makes this process evaluate only its slice of the
     # (already sampled) rows and write predictions to a parquet shard file instead of scoring:
     # a per-shard score is not a score of anything, since RULER's metric is a per-task mean over
@@ -164,8 +267,13 @@ class SparseEvaluationConfig:
         assert self.precision in ("ieee", "tf32"), (
             f"precision must be 'ieee' or 'tf32', got {self.precision!r}"
         )
-        assert self.scorer in (None, "pairwise", "scalar", "dma"), (
-            f"scorer must be None, 'pairwise', 'scalar' or 'dma', got {self.scorer!r}"
+        # Sourced from the press's own registry rather than hand-listed: this assert previously
+        # rejected 'prefix' and 'kvzip', which every other line in this file supports, and the bug
+        # was invisible because auto-detection passes None.
+        from kvpress.presses.gqa_indexer.press import _SCORER_CLASSES
+
+        assert self.scorer is None or self.scorer in _SCORER_CLASSES, (
+            f"scorer must be None or one of {sorted(_SCORER_CLASSES)}, got {self.scorer!r}"
         )
         assert self.force_sink + self.force_local <= self.topk, (
             f"force_sink + force_local = {self.force_sink + self.force_local} exceeds topk="
@@ -183,6 +291,36 @@ class SparseEvaluationConfig:
             assert (
                 self.max_context_length is not None
             ), "max_context_length must be set for needle_in_haystack"
+        if self.evict:
+            # `cmp_slots` IS supported under --evict, through the streaming centroid update
+            # (kvpress/presses/gqa_indexer/streaming_cmp.py). It behaves differently from the
+            # masking arm and that is the point: there the slots are built once at the prefill and
+            # then frozen, which on a CoT benchmark means they are never built at all (math500's
+            # context is a single space, so the prefill evicts nothing). Here they accumulate the
+            # generation's own evicted keys.
+            assert not self.memory_ckpt, (
+                "--memory_ckpt reads the retained branch's lse, which the paged decode kernel "
+                "does not return, and summarizes keys --evict has deleted. Drop one of the two."
+            )
+            assert self.head_budget in ("uniform", "static"), (
+                f"--head_budget {self.head_budget!r} measures the budget from the DOCUMENT's own "
+                "attention, so a batch would resolve a different budget per sequence -- and the "
+                "paged block table is fixed at allocation. Use 'uniform' or 'static' (both "
+                "input-independent) with --evict, or run the masking arm."
+            )
+            assert self.decode_batch >= 1, (
+                f"decode_batch must be >= 1, got {self.decode_batch}"
+            )
+            if self.topk_ratio is not None and self.decode_batch > 1:
+                # Every question in a group shares ONE context, hence one resolved topk, so this
+                # is safe -- but only because the grouping is by context. Spelled out because the
+                # combination looks dangerous and the guard that would catch it is a raise.
+                logger.info(
+                    "--topk_ratio with --decode_batch %d: safe here because a batch's questions "
+                    "share one context and therefore one resolved budget.",
+                    self.decode_batch,
+                )
+
 
     def get_results_dir(self) -> Path:
         """Unique results directory, mirroring evaluate.py's layout so runs sit side by side."""
@@ -196,7 +334,7 @@ class SparseEvaluationConfig:
             str(self.data_dir) if self.data_dir else "",
             self.model.replace("/", "--"),
             "sparse_indexer",
-            f"topk{self.topk}",
+            (f"ratio{self.topk_ratio:g}" if self.topk_ratio else f"topk{self.topk}"),
             Path(self.indexer_ckpt).stem,
         ]
         if self.memory_ckpt:
@@ -204,6 +342,37 @@ class SparseEvaluationConfig:
             # plain sparse run it is compared against land in the SAME directory, and the second one
             # silently reads as the first's numbers.
             components.append(f"memory-{Path(self.memory_ckpt).stem}")
+        if self.cmp_slots:
+            # Same reason, and the mass mode belongs in it too: "count" and "count+var" are
+            # different measurements of the same checkpoint, so they must not share a directory.
+            tag = f"cmp{self.cmp_slots}-{self.cmp_mass}"
+            if self.cmp_space != "post_rope":
+                tag += f"-{self.cmp_space}"
+            if self.cmp_mass_ckpt:
+                # In the directory name for the same reason memory-<stem> is: otherwise a learned-mass
+                # run and the fixed-mass run it is compared against collide and the second reads as
+                # the first's numbers.
+                tag += f"-mass{Path(self.cmp_mass_ckpt).stem}"
+            if self.cmp_delta:
+                tag += f"-d{self.cmp_delta:g}"
+            components.append(tag)
+        if self.head_budget != "uniform":
+            # Same collision hazard as memory-<stem> and cmp<N>: without this the mass-allocated
+            # run and the uniform baseline it is compared against land in ONE directory, and the
+            # second overwrites the first while looking like a completed A/B.
+            tag = f"hb-{self.head_budget}"
+            if self.head_budget_floor:
+                tag += f"-fl{self.head_budget_floor}"
+            if self.head_budget_table:
+                tag += f"-{Path(self.head_budget_table).stem}"
+            components.append(tag)
+        if self.evict:
+            # Same collision hazard as memory-<stem>, cmp<N> and hb-<mode>: the whole point of
+            # this arm is to be compared against the masking run at the SAME topk, so without a
+            # tag the two land in one directory and the second reads as the first's numbers.
+            components.append(
+                "evict" if self.decode_batch == 1 else f"evict-b{self.decode_batch}"
+            )
         if self.fraction < 1.0:
             components.append(f"fraction{self.fraction:.3f}")
         if self.max_context_length is not None:
@@ -215,9 +384,28 @@ class SparseEvaluationConfig:
             # the prompt, so it is a different measurement and must not share a directory with the
             # non-thinking run of the same (dataset, topk).
             components.append("thinking")
+        if self.do_sample:
+            # Same collision hazard as `thinking`: a sampled run and a greedy run of the same
+            # (dataset, topk) are different measurements, and R matters too -- an R=8 mean and an
+            # R=2 mean have different variance. Without this the second overwrites the first while
+            # looking like a completed comparison.
+            components.append(f"sample-t{self.temperature:g}-p{self.top_p:g}-k{self.top_k}")
+        if self.rollouts > 1:
+            components.append(f"r{self.rollouts}")
 
         config_dir = Path(self.output_dir) / "__".join(filter(None, components))
         if config_dir.exists():  # never overwrite an existing run
+            if self.resume:
+                # Opt-in: reuse the directory so `progress.jsonl` is found and only the missing
+                # traces are generated. Refuses a COMPLETED run, because "resuming" one would
+                # rewrite its metrics.json from a fresh scoring pass and there is no reason to.
+                if (config_dir / "metrics.json").exists():
+                    raise SystemExit(
+                        f"{config_dir} already holds metrics.json -- that run is complete. "
+                        "Drop --resume to write a new run beside it, or point --output_dir "
+                        "somewhere else."
+                    )
+                return config_dir
             i = 1
             while (config_dir / f"{i}").exists():
                 i += 1
@@ -317,7 +505,11 @@ class SparseGenerationPipeline(KVPressTextGenerationPipeline):
         context_length = context_ids.shape[1]
         answers = []
         for question_ids in input_tensors["questions_ids"]:
-            with SparseAttentionContext(self.model, self._sparse_press, **self._sparse_kwargs):
+            with SparseAttentionContext(self.model, self._sparse_press, **self._sparse_kwargs) as ctx:
+                # Per-document budget, when --topk_ratio is set. Must happen before the prefill:
+                # the head-budget split and the CMP slots are both derived from topk, and
+                # set_context_length clears them when it changes.
+                ctx.set_context_length(context_length)
                 fresh = DynamicCache()
                 # Prefill the context under sparse attention (no lm head, matching the base class).
                 self.model.model(input_ids=context_ids, past_key_values=fresh)
@@ -329,6 +521,61 @@ class SparseGenerationPipeline(KVPressTextGenerationPipeline):
                         max_new_tokens=max_new_tokens,
                     )
                 )
+        return answers
+
+
+class EvictGenerationPipeline(SparseGenerationPipeline):
+    """
+    The same pipeline, but the cache is **physically compressed** and decode reads only the budget.
+
+    The masking arm above keeps every key and hides the unselected ones, so it measures the
+    method's *quality* but not its cost. This arm measures both: after the context prefill the
+    cache is compressed to ``topk`` slots per head and never grows again, so decode is a dense
+    attention over the budget with no mask at all. The two select the same keys (a set identity --
+    ``tests/presses/test_gqa_indexer_evict_cache.py``), so the scores are comparable.
+
+    Two things differ from the masking arm, and both are wins here:
+
+    * **The context is prefilled once per document, not once per question.** The masking arm has to
+      re-prefill because its cache is the full context and keeping one per question would not fit;
+      a compressed sequence is 0.298 GiB at ``topk=2048``, so it is committed once and *replicated*
+      onto the other rows. On a 4-question RULER row that removes 3 of 4 prefills.
+    * **The answers are generated as one batch**, which is where eviction pays: decode is
+      memory-bound and every sequence now reads ``budget`` keys instead of the whole context.
+    """
+
+    def configure_evict(self, *, decode_batch: int) -> None:
+        self._decode_batch = int(decode_batch)
+
+    def _forward(self, input_tensors, max_new_tokens=50, press=None, cache=None):
+        context_ids = input_tensors["context_ids"].to(self.model.device)
+        questions = list(input_tensors["questions_ids"])
+        answers: list[str] = []
+        # Questions are grouped into batches; every question in a group shares the one committed
+        # context, so a group costs ONE prefill plus len(group) - 1 replications.
+        group_size = max(1, self._decode_batch)
+        for start in range(0, len(questions), group_size):
+            group = questions[start : start + group_size]
+            with EvictInferenceContext(
+                self.model,
+                self._sparse_press,
+                n_sink=self._sparse_kwargs["force_sink"],
+                n_local=self._sparse_kwargs["force_local"],
+                batch_size=len(group),
+                cmp_slots=self._sparse_kwargs.get("cmp_slots", 0) or 0,
+            ) as ec:
+                ec.prefill_and_commit(context_ids, 0, self._sparse_kwargs)
+                for seq in range(1, len(group)):
+                    ec.replicate(0, seq)
+                tokens = ec.generate(
+                    [q.to(self.model.device) for q in group],
+                    max_new_tokens=max_new_tokens,
+                    sampling=getattr(self, "sampling", None),
+                )
+            answers.extend(
+                str(self.tokenizer.decode(torch.tensor(t), skip_special_tokens=True))
+                for t in tokens
+            )
         return answers
 
 
@@ -351,6 +598,13 @@ class SparseEvaluationRunner:
             torch.backends.cudnn.benchmark = False
 
         self.pipeline: Optional[SparseGenerationPipeline] = None
+        # Resolved lazily in run(), NOT here: get_results_dir() creates the directory as a side
+        # effect, so calling it in __init__ would uniquify a second directory for every run and
+        # reintroduce exactly the split this replaced (progress log in `.../1`, metrics in the
+        # parent). None means "no progress log" -- the state the diagnostic scripts, which call
+        # _run_inference without run(), should get.
+        self._results_dir: Optional[Path] = None
+        self._resumed_from: int = 0
         self.df: Optional[pd.DataFrame] = None
         logger.info("Sparse eval config:\n%s", json.dumps(asdict(config), indent=2))
 
@@ -378,6 +632,72 @@ class SparseEvaluationRunner:
         ckpt = torch.load(cfg.indexer_ckpt, map_location="cpu", weights_only=False)
         indexer_sd = ckpt.get("indexer", ckpt)
         ckpt_config = ckpt.get("config") or {}
+
+        # --- the adapted backbone, for a joint checkpoint -----------------------------------
+        # Loaded BEFORE the press is constructed. The press creates the indexer modules, so
+        # injecting a backbone afterwards with strict=False would silently drop them (the joint
+        # payload's "model" holds indexer keys too, and load_state_dict would overwrite the freshly
+        # loaded router with the same values -- harmless here, but the ordering is only obviously
+        # correct this way round).
+        joint_scope = ckpt_config.get("train_scope")
+        if not cfg.backbone_ckpt and joint_scope:
+            # Refuse rather than warn. The router was trained against a backbone --model does not
+            # contain, so the run would produce a plausible number for a pairing that never
+            # existed, and no weight shape or key name would reveal it.
+            raise SystemExit(
+                f"{cfg.indexer_ckpt} is a JOINT checkpoint (train_scope={joint_scope!r}): its "
+                f"router was trained against an ADAPTED backbone, which --model does not have. "
+                f"Pass --backbone_ckpt {cfg.indexer_ckpt} to load it. Evaluating the router "
+                f"against the pretrained backbone measures a model that never existed."
+            )
+        if cfg.backbone_ckpt:
+            backbone_payload = (
+                ckpt
+                if Path(cfg.backbone_ckpt) == Path(cfg.indexer_ckpt)
+                else torch.load(cfg.backbone_ckpt, map_location="cpu", weights_only=False)
+            )
+            backbone_sd = backbone_payload.get("model")
+            if backbone_sd is None:
+                raise SystemExit(
+                    f"--backbone_ckpt {cfg.backbone_ckpt} has no 'model' key, so it carries no "
+                    f"backbone (keys: {sorted(backbone_payload)[:6]}). A joint checkpoint written "
+                    "before the full-model fix stored only the router -- its adapted attention "
+                    "weights are unrecoverable and that run has to be redone."
+                )
+            # Only the backbone: the indexer is loaded separately from `indexer_sd`, after the
+            # press has built the modules those keys belong to.
+            backbone_only = {k: v for k, v in backbone_sd.items() if ".indexer." not in k}
+
+            # Strip FFN sequence-parallel's wrapper prefix. Training wraps each layer's `mlp` in a
+            # SequenceParallelFFN that holds the real module as `self.inner`, so the saved keys read
+            # `mlp.inner.gate_proj.weight` while an unwrapped model expects `mlp.gate_proj.weight`
+            # (36 layers x 3 projections = 108 of them). That wrapper is a training-time memory
+            # optimization and has no business appearing at eval, so it is normalized away here
+            # rather than reproduced -- and the count is asserted, because a silent miss would leave
+            # the FFN at its pretrained values with only `missing_keys` to show for it.
+            wrapped = [k for k in backbone_only if ".mlp.inner." in k]
+            if wrapped:
+                for key in wrapped:
+                    backbone_only[key.replace(".mlp.inner.", ".mlp.")] = backbone_only.pop(key)
+                logger.info(
+                    "unwrapped %d FFN sequence-parallel key(s): mlp.inner.* -> mlp.* "
+                    "(SequenceParallelFFN keeps the real module as .inner; the wrapper is a "
+                    "training-time detail and the eval model has no such nesting)",
+                    len(wrapped),
+                )
+            incompatible = model.load_state_dict(backbone_only, strict=False)
+            if incompatible.unexpected_keys:
+                raise SystemExit(
+                    f"--backbone_ckpt has {len(incompatible.unexpected_keys)} keys the model does "
+                    f"not accept (e.g. {list(incompatible.unexpected_keys)[:3]}); is it the same "
+                    "architecture as --model?"
+                )
+            logger.info(
+                "Loaded ADAPTED backbone from %s (%d tensors, train_scope=%s, step=%s). "
+                "%d model keys were left at their pretrained values.",
+                cfg.backbone_ckpt, len(backbone_only), joint_scope,
+                backbone_payload.get("step"), len(incompatible.missing_keys),
+            )
         has_gate = any(str(k).endswith("gate_scale") for k in indexer_sd)
         try:
             scorer, scorer_kwargs = press_kwargs_from_checkpoint(
@@ -385,11 +705,11 @@ class SparseEvaluationRunner:
             )
         except ValueError as exc:
             raise SystemExit(
-                f"{exc} Use --scorer pairwise, --scorer scalar, --scorer prefix, --scorer dma or "
-                "--scorer kvzip."
+                f"{exc} Use --scorer with one of: pairwise, scalar, prefix, dma, kvzip, "
+                "conv, rnn."
             ) from exc
 
-        if scorer in ("scalar", "prefix", "kvzip"):
+        if scorer in ("scalar", "prefix", "kvzip", "conv", "rnn"):
             # pos_slope is NOT a parameter -- it is added inside score_keys and never stored -- so
             # a wrong value mis-scores silently with every weight loading cleanly. The CLI wins
             # over the checkpoint's record; if neither has it, say so rather than quietly taking
@@ -402,9 +722,9 @@ class SparseEvaluationRunner:
                     "is not a parameter, so a mismatch against training cannot be detected by "
                     "weight loading -- pass --scalar_pos_slope if training set it."
                 )
-            # Neither scorer has per-head q/k geometry, and the press rejects these rather than
-            # accepting and ignoring them. (The prefix arm's own attention is sized by
-            # prefix_head_dim, read from the weights above, not by --head_dim.)
+            # None of these scorers has per-head q/k geometry, and the press rejects these rather
+            # than accepting and ignoring them. (Each history arm's own width is read from the
+            # weights above -- prefix_head_dim, conv_dim, state_dim -- not from --head_dim.)
             if cfg.head_dim is not None or cfg.rope_dim is not None:
                 raise SystemExit(
                     f"--head_dim/--rope_dim do not apply to a {scorer} indexer (its score has no "
@@ -485,7 +805,8 @@ class SparseEvaluationRunner:
                 memory_config or None,
             )
 
-        pipeline = SparseGenerationPipeline(model=model, tokenizer=tokenizer, device=model.device)
+        pipeline_cls = EvictGenerationPipeline if cfg.evict else SparseGenerationPipeline
+        pipeline = pipeline_cls(model=model, tokenizer=tokenizer, device=model.device)
         pipeline.configure_sparse(
             press,
             topk=cfg.topk,
@@ -494,7 +815,18 @@ class SparseEvaluationRunner:
             block_k=cfg.block_k,
             precision=cfg.precision,
             memory=bool(cfg.memory_ckpt),
+            cmp_slots=cfg.cmp_slots,
+            cmp_mass=cfg.cmp_mass,
+            cmp_delta=cfg.cmp_delta,
+            cmp_space=cfg.cmp_space,
+            cmp_mass_ckpt=cfg.cmp_mass_ckpt,
+            head_budget=cfg.head_budget,
+            head_budget_floor=cfg.head_budget_floor,
+            head_budget_table=cfg.head_budget_table,
+            topk_ratio=cfg.topk_ratio,
         )
+        if cfg.evict:
+            pipeline.configure_evict(decode_batch=cfg.decode_batch)
         self.pipeline = pipeline
 
     def _load_dataset(self):
@@ -548,27 +880,167 @@ class SparseEvaluationRunner:
     def _run_inference(self):
         cfg = self.config
         self.df["predicted_answer"] = None
+        # Sampling is configured on the pipeline, not passed per call: `generate_answer` is shared
+        # with the eviction eval and its signature is part of the base class's contract.
+        self.pipeline.sampling = (
+            {"temperature": cfg.temperature, "top_p": cfg.top_p, "top_k": cfg.top_k}
+            if cfg.do_sample
+            else None
+        )
+        if cfg.rollouts > 1:
+            # R independent traces per row, scored as a mean -- the pass@1 estimator. Replicating
+            # the FRAME (rather than looping inside the row loop) keeps every downstream step
+            # untouched: the scorers compute a mean over rows, `predictions.csv` keeps one line per
+            # trace, and the sharded driver's union stays a plain concatenation. `rollout` is
+            # carried as a column so a per-rollout breakdown is recoverable after the fact.
+            #
+            # The index must stay GLOBALLY UNIQUE, which is why the rollout is folded into it
+            # rather than reset. `ignore_index=True` renumbered each shard's rows 0..N-1, so shards
+            # 0 and 1 both produced indices 0..143 and the sharded driver's overlap guard correctly
+            # refused to score their union ("the same row appears in more than one shard"). The
+            # generated rows were fine -- 500 questions x 2 rollouts, verified -- but a union keyed
+            # on a colliding index would double-count, and that guard exists precisely because a
+            # double-counted union reads exactly like a correct metric.
+            #
+            # `index + r * ROLLOUT_STRIDE` keeps rollout r of row i distinct from every other row
+            # while preserving row identity as `index % ROLLOUT_STRIDE`. The stride is a CONSTANT,
+            # not derived from this frame: each shard holds a different row slice, so a
+            # frame-derived offset (`index.max() + 1`) differs per shard and the indices collide
+            # again -- verified, 997 unique out of 1000. A constant every shard agrees on is the
+            # only version that composes with sharding.
+            offset = ROLLOUT_STRIDE
+            if int(self.df.index.max()) >= offset:
+                raise ValueError(
+                    f"row index {int(self.df.index.max())} exceeds the rollout stride {offset}; "
+                    "raise ROLLOUT_STRIDE or rollout indices would collide with row indices."
+                )
+            self.df = pd.concat(
+                [
+                    self.df.assign(rollout=r).set_axis(self.df.index + r * offset)
+                    for r in range(cfg.rollouts)
+                ]
+            )
+            logger.info(
+                "rollouts=%d: %d rows to generate (%d problems x %d). The reported accuracy is the "
+                "mean over all of them, i.e. a pass@1 estimate, NOT pass@k.",
+                cfg.rollouts, len(self.df), len(self.df) // cfg.rollouts, cfg.rollouts,
+            )
         grouped = self.df.groupby("context")
         assert all(grouped["answer_prefix"].nunique() == 1), "answer_prefix varies within a context"
-        for context, group in tqdm(grouped, total=self.df["context"].nunique(), desc="Sparse eval"):
-            questions = group["question"].to_list()
-            max_new_tokens = cfg.max_new_tokens or group["max_new_tokens"].iloc[0]
-            answer_prefix = group["answer_prefix"].iloc[0]
-            output = self.pipeline(
-                context,
-                questions=questions,
-                answer_prefix=answer_prefix,
-                press=None,
-                max_new_tokens=max_new_tokens,
-                max_context_length=cfg.max_context_length,
-                enable_thinking=cfg.enable_thinking,
+
+        # Incremental progress log: one JSON line per completed trace, fsync'd per chunk.
+        #
+        # Without it a run is all-or-nothing. math500/aime25 put every row under ONE context, so
+        # the whole dataset was a single `self.pipeline(...)` call and nothing reached disk until
+        # it returned -- when the shared filesystem filled at 09:56 this cost 6h38m of generation
+        # with zero recoverable output. The log is append-only and keyed by the strided index, so
+        # a restart replays what is already there and generates only the remainder.
+        #
+        # JSONL rather than parquet: appending to parquet means rewriting the file, which is both
+        # slower and not crash-safe at the moment that matters. The parquet/CSV is still written
+        # at the end, unchanged, so nothing downstream has to know this file exists.
+        # `get_results_dir()` is STATEFUL -- it uniquifies against what exists on disk and creates
+        # the directory before returning, so a second call yields a DIFFERENT path (`.../` then
+        # `.../1`). Calling it here as well sent the progress log into `/1` while metrics.json
+        # went to the parent, orphaning the resume file from the run that wrote it. Resolved once
+        # in run(); None when _run_inference is driven directly (diagnostics), in which case the
+        # progress log is simply skipped.
+        progress_path = (
+            None
+            if self._results_dir is None
+            else self._results_dir / (
+                f"progress_shard{cfg.shard_index}.jsonl" if cfg.num_shards > 1 else "progress.jsonl"
             )
-            self.df.loc[group.index, "predicted_answer"] = output["answers"]
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        )
+        done: dict[int, str] = {}
+        if progress_path is not None and progress_path.exists():
+            with open(progress_path) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        # A torn final line is expected after a hard kill; ignore it and redo that
+                        # trace rather than refuse to resume.
+                        logger.warning("ignoring a truncated final line in %s", progress_path.name)
+                        continue
+                    done[int(rec["i"])] = rec["a"]
+            keep = [i for i in done if i in self.df.index]
+            self.df.loc[keep, "predicted_answer"] = pd.Series({i: done[i] for i in keep})
+            logger.info(
+                "resuming from %s: %d/%d traces already generated, %d to go",
+                progress_path.name, len(keep), len(self.df), len(self.df) - len(keep),
+            )
+            if keep:
+                # Stamped onto the saved config so a resumed number is never mistaken for a clean
+                # one: the per-(context, rollout) reseed cannot reproduce the RNG stream across an
+                # interruption, so the traces are valid samples but not bit-reproducible.
+                self._resumed_from = len(keep)
+
+        # Chunk size for flushing. Under --evict the pipeline groups questions into decode_batch
+        # batches internally, so matching it means a flush lands on a batch boundary and costs
+        # nothing; otherwise flush every question.
+        chunk = max(1, int(cfg.decode_batch)) if cfg.evict else 1
+
+        fh = open(progress_path, "a", buffering=1) if progress_path is not None else None
+        try:
+            for context, group in tqdm(
+                grouped, total=self.df["context"].nunique(), desc="Sparse eval"
+            ):
+                max_new_tokens = cfg.max_new_tokens or group["max_new_tokens"].iloc[0]
+                answer_prefix = group["answer_prefix"].iloc[0]
+                # Generate per rollout index, reseeding before each: the traces of rollout r are
+                # then a function of (seed, r) alone, so a rerun reproduces them and the dense arm
+                # draws the identical seed sequence -- making the two arms' difference paired.
+                #
+                # NOTE ON RESUME AND THE SEED: reseeding happens once per (context, rollout), so a
+                # resumed run that skips part of a rollout does NOT reproduce the skipped traces'
+                # RNG stream for the remaining ones. The completed traces are replayed from the
+                # log verbatim, so the result is still a valid set of samples at the right
+                # temperature -- but a resumed run is not bit-identical to an uninterrupted one.
+                # Recorded in the config as `resumed` so a number can never be silently attributed
+                # to a clean run.
+                for rollout, sub in (
+                    group.groupby("rollout") if "rollout" in group else [(0, group)]
+                ):
+                    todo = sub[sub["predicted_answer"].isna()]
+                    if todo.empty:
+                        continue
+                    if cfg.do_sample:
+                        torch.manual_seed(cfg.seed + 1000 * int(rollout))
+                        if torch.cuda.is_available():
+                            torch.cuda.manual_seed_all(cfg.seed + 1000 * int(rollout))
+                    for start in range(0, len(todo), chunk):
+                        part = todo.iloc[start : start + chunk]
+                        output = self.pipeline(
+                            context,
+                            questions=part["question"].to_list(),
+                            answer_prefix=answer_prefix,
+                            press=None,
+                            max_new_tokens=max_new_tokens,
+                            max_context_length=cfg.max_context_length,
+                            enable_thinking=cfg.enable_thinking,
+                        )
+                        answers = output["answers"]
+                        self.df.loc[part.index, "predicted_answer"] = answers
+                        if fh is not None:
+                            for idx, ans in zip(part.index, answers):
+                                fh.write(json.dumps({"i": int(idx), "a": ans}) + "\n")
+                            fh.flush()
+                            os.fsync(fh.fileno())
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        finally:
+            if fh is not None:
+                fh.close()
 
     def run(self):
-        results_dir = self.config.get_results_dir()
+        # Resolved exactly ONCE: get_results_dir uniquifies against the filesystem and creates the
+        # directory, so a second call returns a different path. `_run_inference` reads this for
+        # the progress log.
+        results_dir = self._results_dir = self.config.get_results_dir()
 
         self._setup_pipeline()
         self._load_dataset()
@@ -586,6 +1058,23 @@ class SparseEvaluationRunner:
             shard_file = results_dir / f"predictions_shard{self.config.shard_index}.parquet"
             self.df.to_parquet(str(shard_file), index=True)
             logger.info("Shard %d wrote %d rows to %s", self.config.shard_index, len(self.df), shard_file)
+            # Greedy decoding cannot detect a NaN (argmax has no NaN check), so a completed greedy
+            # run is NOT evidence of a clean run. Report the count explicitly: nonzero means some
+            # traces in this shard were generated from a corrupted distribution.
+            try:
+                from kvpress.presses.gqa_indexer.evict_runner import nonfinite_logit_count
+
+                nf = nonfinite_logit_count()
+                if nf:
+                    logger.warning(
+                        "NONFINITE_LOGIT_ROWS=%d in shard %d -- some traces are CORRUPT; do not "
+                        "report this shard's score without disclosing it",
+                        nf, self.config.shard_index,
+                    )
+                else:
+                    logger.info("NONFINITE_LOGIT_ROWS=0 in shard %d (clean)", self.config.shard_index)
+            except Exception:  # never let instrumentation break a finished shard
+                pass
             return
 
         predictions_file = results_dir / "predictions.csv"
@@ -597,7 +1086,15 @@ class SparseEvaluationRunner:
         with open(metrics_file, "w") as f:
             json.dump(metrics, f, indent=4)
         with open(config_file, "w") as f:
-            yaml.dump(asdict(self.config), f, default_flow_style=False, sort_keys=False)
+            saved = asdict(self.config)
+            resumed = getattr(self, "_resumed_from", 0)
+            if resumed:
+                # Provenance, not decoration. A resumed run replays completed traces from the
+                # progress log and reseeds only for the ones it still has to generate, so it is
+                # NOT bit-identical to an uninterrupted run at the same seed. Recording it here
+                # means the difference can never be discovered later as an unexplained mismatch.
+                saved["resumed_traces"] = int(resumed)
+            yaml.dump(saved, f, default_flow_style=False, sort_keys=False)
         logger.info("Metrics:\n%s", json.dumps(metrics, indent=2))
         logger.info("Saved to %s", results_dir)
 

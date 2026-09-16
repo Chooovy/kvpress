@@ -295,7 +295,7 @@ class ScalarIndexer(nn.Module):
         # See GQAIndexer.gate_scale: deliberately not zero, since dL/dscore is proportional to
         # it and a zero start gives the router no gradient to leave that point with.
         self.gate_scale = (
-            nn.Parameter(torch.tensor(self.GATE_SCALE_INIT())) if config.gate_scale else None
+            nn.Parameter(torch.tensor([self.GATE_SCALE_INIT()])) if config.gate_scale else None
         )
 
         # TrimKV's lifetime head. Emits log_beta <= 0 per (token, KV head) in nats per decay_ref
@@ -408,9 +408,7 @@ class ScalarIndexer(nn.Module):
         if hidden_states.dtype != self.weight_dtype:
             hidden_states = hidden_states.to(self.weight_dtype)
 
-        x = self.in_norm(hidden_states)
-        if self.w_in is not None:
-            x = nn.functional.gelu(self.mid_norm(self.w_in(x)))
+        x = self._trunk(hidden_states, key_offset=key_offset, mask=mask)
         scores = self.w_out(x).float()  # (B, Sk, n_heads)
         scores = scores.transpose(1, 2)  # (B, n_heads, Sk)
 
@@ -437,6 +435,34 @@ class ScalarIndexer(nn.Module):
                 # pinned at the bottom.
                 log_beta = log_beta.masked_fill(keep, 0.0)
         return scores, log_beta
+
+    def _trunk(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        key_offset: int = 0,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        The shared representation both heads read: ``(B, Sk, readout_width)``.
+
+        ``readout_width`` is ``mid_dim`` when the MLP is present and ``hidden_size`` otherwise --
+        whatever ``w_out`` (and ``w_decay``) consume.
+
+        **This is the single extension point for a subclass**, and the reason it exists as its own
+        method: ``score_keys``, :meth:`score_at`, ``gate_key`` and the CMP paths all reach the
+        score through :meth:`_score_and_decay`, so a subclass that overrode only ``score_keys``
+        would silently keep the *base* trunk everywhere else. :class:`~.prefix_indexer.PrefixIndexer`
+        overrides this to add its prefix-attention term, which is what lets the lifetime head work
+        there unchanged: ``w_decay`` consumes the trunk, not the score, so the same mechanism
+        applies to whatever representation the subclass builds.
+
+        ``key_offset`` and ``mask`` are accepted but unused here; the prefix subclass needs both.
+        """
+        x = self.in_norm(hidden_states)
+        if self.w_in is not None:
+            x = nn.functional.gelu(self.mid_norm(self.w_in(x)))
+        return x
 
     def score_at(
         self,

@@ -371,22 +371,8 @@ class PrefixIndexer(ScalarIndexer):
         if hidden_states.dtype != self.weight_dtype:
             hidden_states = hidden_states.to(self.weight_dtype)
 
-        keep = None
-        if mask is not None:
-            keep = (mask if mask.dtype == torch.bool else mask != 0).view(
-                hidden_states.shape[0], -1
-            )
-            if bool(keep.all()):
-                keep = None  # nothing masked: stay on the O(L) flash path
-
-        x = self.in_norm(hidden_states)
-        a = self.a_norm(self.prefix_readout(x, keep=keep))
-
-        if self.w_in is not None:
-            scores = self.w_out(nn.functional.gelu(self.mid_norm(self.w_in(x) + self.w_a(a))))
-        else:
-            scores = self.w_out(x + self.w_a(a))
-        scores = scores.float().transpose(1, 2)  # (B, n_heads, Sk)
+        x = self._trunk(hidden_states, key_offset=key_offset, mask=mask)
+        scores = self.w_out(x).float().transpose(1, 2)  # (B, n_heads, Sk)
 
         if self.pos_slope:
             pos = torch.arange(
@@ -404,10 +390,75 @@ class PrefixIndexer(ScalarIndexer):
             scores = scores.masked_fill(~real, MASK_NEG)
         return scores
 
-    def project_k(self, hidden_states: torch.Tensor, cos=None, sin=None) -> torch.Tensor:
+    def _trunk(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        key_offset: int = 0,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        The scalar trunk plus this arm's prefix-attention term, ``(B, Sk, readout_width)``.
+
+        Overriding here rather than in ``score_keys`` alone is what makes the whole indexer
+        consistent: :meth:`~.scalar_indexer.ScalarIndexer._score_and_decay` is the single path
+        behind ``score_keys``, ``score_at``, ``gate_key`` and the CMP/deadline readouts, so an
+        override placed only on ``score_keys`` would leave every other caller silently computing
+        the *scalar* score for a prefix checkpoint.
+
+        It is also what lets the lifetime head (``w_decay``) work for this arm with no new
+        machinery. ``w_decay`` consumes the trunk, not the score, and this trunk is the same width
+        and the same kind of object as the base class's -- ``gelu(mid_norm(...))`` into
+        ``mid_dim``, or the residual sum into ``hidden_size`` for the linear form. So
+        ``log_beta = -softplus(w_decay(trunk))`` is the *same mechanism* as in the scalar arm, a
+        per-(token, KV head) lifetime read off the indexer's own representation. The only
+        difference is that the representation now also sees the key's prefix, which is exactly
+        what this arm adds.
+        """
+        keep = None
+        if mask is not None:
+            keep = (mask if mask.dtype == torch.bool else mask != 0).view(
+                hidden_states.shape[0], -1
+            )
+            if bool(keep.all()):
+                keep = None  # nothing masked: stay on the O(L) flash path
+
+        x = self.in_norm(hidden_states)
+        a = self.a_norm(self.prefix_readout(x, keep=keep))
+        if self.w_in is not None:
+            return nn.functional.gelu(self.mid_norm(self.w_in(x) + self.w_a(a)))
+        return x + self.w_a(a)
+
+    def project_k(
+        self,
+        hidden_states: torch.Tensor,
+        cos=None,
+        sin=None,
+        *,
+        value_states: torch.Tensor | None = None,
+        key_offset: int | None = None,
+    ) -> torch.Tensor:
+        """Project keys, matching the base ``Indexer.project_k`` signature.
+
+        ``value_states`` is accepted for the scorer protocol and intentionally unused, exactly as
+        in ``Indexer`` and ``ScalarIndexer``. Prefix scoring reads the key's own hidden state plus
+        the cached prefix, never the values.
+
+        ``key_offset`` is the position of ``hidden_states[0]`` in the full key sequence, which the
+        decay fold needs to compute each key's age. It defaults to ``None`` -> ``self.cached_length``,
+        preserving the previous hardcoded behaviour for callers that do not pass it (training and
+        prefill, where the two agree). The decode path passes it explicitly.
+
+        This subclass previously NARROWED the base signature by omitting both keywords, so
+        ``e2e_trainer.indexer_qk`` (passes ``value_states=``) and the eval path (passes
+        ``key_offset=``) both raised ``TypeError`` -- the prefix arm could neither train nor be
+        evaluated on the e2e/sparse paths.
+        """
         self._reject_rope(cos, sin)
         return self.gate_key(
-            hidden_states, key_offset=self.cached_length, dtype=hidden_states.dtype
+            hidden_states,
+            key_offset=self.cached_length if key_offset is None else key_offset,
+            dtype=hidden_states.dtype,
         )
 
     def extra_repr(self) -> str:

@@ -312,7 +312,7 @@ class _HistoryLSE(torch.autograd.Function):
 
         d_q = torch.zeros_like(q_idx, dtype=acc)
         d_k = torch.zeros_like(k_idx, dtype=acc)
-        d_scale = torch.zeros((), device=q_idx.device, dtype=acc)
+        d_scale = torch.zeros(1, device=q_idx.device, dtype=acc)
 
         # An empty-history row returned a constant 0, so it has no gradient path; zeroing the
         # incoming cotangent there keeps its (all -inf) weights from producing NaN below.
@@ -334,7 +334,7 @@ class _HistoryLSE(torch.autograd.Function):
             weights = torch.nan_to_num(torch.exp(logits - lse.unsqueeze(-1)), 0.0) * grad
             d_q += torch.einsum("bhqk,bkd->bhqd", weights, k_tile) * scale
             d_k[:, start:stop] += torch.einsum("bhqk,bhqd->bkd", weights, q_idx.to(acc)) * scale
-            d_scale += (weights * raw).sum()
+            d_scale += (weights * raw).sum().reshape(1)
 
         return (
             d_q.to(q_idx.dtype),

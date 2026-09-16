@@ -260,11 +260,55 @@ class KVPressTextGenerationPipeline(Pipeline):
                     :, :, :sequence_length
                 ]
 
+    def _pick_token(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Next token: ``argmax`` by default, or a temperature/top-k/top-p sample.
+
+        Sampling is opt-in through :attr:`sampling` (set by the eval driver) so that every result
+        collected before it existed is reproduced bitwise -- with ``sampling`` unset this is
+        exactly the ``logits.argmax()`` it replaced.
+
+        It exists because the reasoning benchmarks cannot be run greedily and stay comparable to
+        the literature: Qwen3's own ``generation_config.json`` ships ``temperature 0.6 / top_p
+        0.95 / top_k 20``, thinking-mode traces degenerate into repetition under greedy decoding,
+        and a pass@1 estimate is defined as a mean over sampled rollouts. The order below --
+        temperature, then top-k, then top-p -- is the order HF's own logits processors apply, so a
+        given (temperature, top_k, top_p) triple means the same thing here as in ``model.generate``.
+        """
+        cfg = getattr(self, "sampling", None)
+        if not cfg:
+            return logits.argmax()
+
+        logits = logits.float()
+        temperature = float(cfg.get("temperature", 1.0) or 1.0)
+        if temperature != 1.0:
+            logits = logits / temperature
+
+        top_k = int(cfg.get("top_k", 0) or 0)
+        if top_k > 0:
+            top_k = min(top_k, logits.shape[-1])
+            kth = torch.topk(logits, top_k).values[-1]
+            logits = logits.masked_fill(logits < kth, float("-inf"))
+
+        top_p = float(cfg.get("top_p", 1.0) or 1.0)
+        if 0.0 < top_p < 1.0:
+            ordered, order = torch.sort(logits, descending=True)
+            cumulative = torch.softmax(ordered, dim=-1).cumsum(dim=-1)
+            # Keep the first token whose cumulative mass crosses top_p: shifting the mask right by
+            # one is what makes the highest-probability token always survive, even when it alone
+            # already exceeds top_p (otherwise the distribution can come back all -inf).
+            drop = cumulative - torch.softmax(ordered, dim=-1) >= top_p
+            ordered = ordered.masked_fill(drop, float("-inf"))
+            logits = torch.full_like(logits, float("-inf")).scatter(-1, order, ordered)
+
+        probs = torch.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1)[0]
+
     def generate_answer(
         self, question_ids: torch.Tensor, cache: Cache, context_length: int, max_new_tokens: int
     ) -> str:
         """
-        Generate an answer to a question using greedy decoding.
+        Generate an answer to a question, greedily or by sampling (see :meth:`_pick_token`).
 
         Parameters
         ----------
@@ -295,7 +339,7 @@ class KVPressTextGenerationPipeline(Pipeline):
         )
 
         position_ids = position_ids[:, -1:] + 1
-        generated_ids = [outputs.logits[0, -1].argmax()]
+        generated_ids = [self._pick_token(outputs.logits[0, -1])]
 
         should_stop_token_ids = self.model.generation_config.eos_token_id
         if not isinstance(should_stop_token_ids, list):
@@ -307,7 +351,7 @@ class KVPressTextGenerationPipeline(Pipeline):
                 past_key_values=cache,
                 position_ids=position_ids + i,
             )
-            new_id = outputs.logits[0, -1].argmax()
+            new_id = self._pick_token(outputs.logits[0, -1])
             generated_ids.append(new_id)
             if new_id.item() in should_stop_token_ids:
                 break

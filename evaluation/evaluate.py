@@ -3,6 +3,7 @@
 
 import json
 import logging
+import os
 import random
 import sys
 from dataclasses import asdict, dataclass
@@ -44,6 +45,12 @@ from kvpress import (  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+#: Index stride between rollouts when ``--rollouts > 1``; must match
+#: ``evaluate_sparse.ROLLOUT_STRIDE`` so a dense run and a sparse run key their rows identically.
+#: Defined here rather than imported because ``evaluate_sparse`` pulls in the whole gqa_indexer
+#: stack (triton kernels, flex_attention), which an eviction-only run has no reason to load.
+ROLLOUT_STRIDE = 1_000_000
+
 
 @dataclass
 class EvaluationConfig:
@@ -73,6 +80,20 @@ class EvaluationConfig:
     # are several times longer, so max_new_tokens has to be raised with it or the trace is truncated
     # before it ever reaches \boxed{}.
     enable_thinking: bool = False
+
+    # Sampled decoding and pass@1 rollouts, mirroring evaluate_sparse.py field for field.
+    #
+    # Defaults (`rollouts=1`, `do_sample=False`) are the greedy single-trace path every earlier
+    # result used, bitwise -- `KVPressTextGenerationPipeline._pick_token` falls back to `argmax`
+    # when `sampling` is unset. They exist so the Full-KV reference for the reasoning benchmarks
+    # can be measured under the SAME protocol as the sparse arm: comparing an R=2 sampled mean
+    # against one greedy trace would confound the compression effect with the decoding rule, and
+    # the difference is large (thinking-mode traces degenerate into repetition under argmax).
+    rollouts: int = 1
+    do_sample: bool = False
+    temperature: float = 0.6
+    top_p: float = 0.95
+    top_k: int = 20
 
     # Decoding parameters
     compression_interval: Optional[int] = None
@@ -207,6 +228,15 @@ class EvaluationConfig:
             # already holds predictions.csv + metrics.json, the second run would silently report the
             # first one's numbers.
             components.append("thinking")
+        if self.do_sample:
+            # Same collision hazard as `thinking`, and worse here: run_evaluation SKIPS a directory
+            # that already holds predictions.csv + metrics.json, so without this a sampled run
+            # would not merely overwrite the greedy one -- it would decline to run and report the
+            # greedy numbers as its own. R is in the name too, since an R=8 mean and an R=2 mean
+            # have different variance.
+            components.append(f"sample-t{self.temperature:g}-p{self.top_p:g}-k{self.top_k}")
+        if self.rollouts > 1:
+            components.append(f"r{self.rollouts}")
         if self.key_channel_compression_ratio is not None:
             components.append(f"key_channel_cr{self.key_channel_compression_ratio:.2f}")
         if self.needle_depth is not None and self.dataset == "needle_in_haystack":
@@ -226,11 +256,19 @@ class EvaluationConfig:
         config_dir.mkdir(parents=True, exist_ok=True)
         return config_dir
 
-    def save_config(self, config_filename: Path):
+    def save_config(self, config_filename: Path, resumed_traces: int = 0):
         """
         Saves the evaluation configuration to a YAML file.
+
+        ``resumed_traces`` records how many traces were replayed from a progress log rather than
+        generated in this process. It is provenance, not decoration: a resumed run reseeds only
+        for the traces it still has to generate, so it is NOT bit-identical to an uninterrupted
+        run at the same seed, and the paired dense/sparse seed argument holds only for clean runs.
+        Recording it means the difference can never surface later as an unexplained mismatch.
         """
         config_dict = asdict(self)
+        if resumed_traces:
+            config_dict["resumed_traces"] = int(resumed_traces)
         if self.threshold is not None or self.head_compression_ratio is not None:
             config_dict.pop("compression_ratio", None)
         if self.threshold is None:
@@ -474,14 +512,14 @@ class EvaluationRunner:
             model_kwargs["attn_implementation"] = self.config.attn_implementation
             logger.info("Using requested attn_implementation=%r.", self.config.attn_implementation)
         else:
-            try:
-                import flash_attn  # noqa: F401
-
-                model_kwargs["attn_implementation"] = "flash_attention_2"
-                logger.info("Flash Attention 2 detected, setting attn_implementation to 'flash_attention_2'.")
-            except ImportError:
-                logger.info("Flash Attention 2 not available, using default attn_implementation.")
-                pass
+            # DEFAULT TO SDPA, NOT AUTODETECTED FLASH-ATTN. A flash-attn build that imports but does
+            # not match the installed torch produces token garbage on long contexts and scores ~0
+            # WITHOUT raising -- measured on LongBench gov_report: 0.0 under flash_attention_2 vs
+            # 33.55 under sdpa, same checkpoint, same rows. Silently wrong beats loudly broken only
+            # for the machine, never for the paper, so the safe implementation is the default and
+            # flash-attn must be requested explicitly via --attn_implementation.
+            model_kwargs["attn_implementation"] = "sdpa"
+            logger.info("No attn_implementation requested; defaulting to 'sdpa' (flash-attn must be explicit).")
 
         logger.info(f"Loading model pipeline for: {model_name} on device: {device} with model_kwargs: {model_kwargs}")
         pipeline_kwargs = {
@@ -493,7 +531,39 @@ class EvaluationRunner:
             pipeline_kwargs["device_map"] = "auto"
         else:
             pipeline_kwargs["device"] = device
-        self.pipeline = pipeline("kv-press-text-generation", **pipeline_kwargs)
+        try:
+            self.pipeline = pipeline("kv-press-text-generation", **pipeline_kwargs)
+        except (TypeError, ValueError) as e:
+            # transformers >=4.56 dev injects `dtype=` into the model constructor when the caller
+            # supplies none, and Qwen3ForCausalLM.__init__ rejects it:
+            #   TypeError: Qwen3ForCausalLM.__init__() got an unexpected keyword argument 'dtype'
+            # Pinning the dtype explicitly avoids the injection. Same try/except shape as
+            # evaluate_sparse.py:619-621, which hit the mirror-image version of this.
+            #
+            # CATCHING ValueError TOO IS LOAD-BEARING. `pipeline()` does not propagate the
+            # TypeError: `infer_framework_load_model` catches every per-class failure and re-raises
+            # a ValueError ("Could not load model ... See the original errors:") with the original
+            # traceback embedded as TEXT. So `except TypeError` never fired and this whole retry was
+            # dead code -- evaluate.py simply could not load Qwen3 on this environment. The
+            # substring check below is what keeps the wider catch honest: anything not about dtype
+            # is re-raised untouched.
+            if "dtype" not in str(e):
+                raise
+            logger.info("pipeline() rejected an injected dtype (%s); retrying with explicit dtype.", str(e)[:200])
+            retry = dict(pipeline_kwargs)
+            retry_kwargs = dict(model_kwargs)
+            retry_kwargs.setdefault("dtype", torch.bfloat16)
+            retry["model_kwargs"] = retry_kwargs
+            try:
+                self.pipeline = pipeline("kv-press-text-generation", **retry)
+            except (TypeError, ValueError):
+                # Same wrapping as above: an older transformers wants `torch_dtype` and rejects
+                # `dtype`, and the rejection again arrives as a ValueError from
+                # infer_framework_load_model rather than the underlying TypeError.
+                retry_kwargs.pop("dtype", None)
+                retry_kwargs["torch_dtype"] = torch.bfloat16
+                retry["model_kwargs"] = retry_kwargs
+                self.pipeline = pipeline("kv-press-text-generation", **retry)
 
         self.pipeline.model.eval()
         logger.info("Model pipeline loaded.")
@@ -505,6 +575,44 @@ class EvaluationRunner:
         """
 
         self.df["predicted_answer"] = None  # type: ignore[index]
+        # Sampling rule and rollouts, matching evaluate_sparse.py exactly so the dense reference
+        # and the sparse arm are the same measurement apart from compression.
+        self.pipeline.sampling = (  # type: ignore[union-attr]
+            {
+                "temperature": self.config.temperature,
+                "top_p": self.config.top_p,
+                "top_k": self.config.top_k,
+            }
+            if self.config.do_sample
+            else None
+        )
+        if self.config.rollouts > 1:
+            # Replicate the FRAME, one row per trace: the scorers already average over rows, so
+            # the reported accuracy becomes a pass@1 estimate with no scorer change.
+            #
+            # `index + r * ROLLOUT_STRIDE`, NOT `ignore_index=True` and NOT a frame-derived offset.
+            # The sharded driver unions shards on their index and refuses to score when two shards
+            # carry the same index value. Resetting the index made every shard start at 0; a
+            # per-shard `max()+1` offset also collides, because each shard holds a different slice
+            # (verified: 997 unique out of 1000). Only a constant every shard agrees on composes
+            # with sharding. Row identity stays recoverable as `index % ROLLOUT_STRIDE`.
+            offset = ROLLOUT_STRIDE
+            if int(self.df.index.max()) >= offset:  # type: ignore[union-attr]
+                raise ValueError(
+                    f"row index {int(self.df.index.max())} exceeds the rollout stride {offset}"  # type: ignore[union-attr]
+                )
+            self.df = pd.concat(  # type: ignore[assignment]
+                [
+                    self.df.assign(rollout=r).set_axis(self.df.index + r * offset)  # type: ignore[union-attr]
+                    for r in range(self.config.rollouts)
+                ]
+            )
+            logger.info(
+                "rollouts=%d: %d rows (%d problems x %d); accuracy is the mean over them, "
+                "i.e. pass@1, NOT pass@k",
+                self.config.rollouts, len(self.df), len(self.df) // self.config.rollouts,
+                self.config.rollouts,
+            )
 
         if isinstance(self.press, DecodingPress):
             logger.info("DecodingPress detected, running inference for each context-question pair.")
@@ -532,29 +640,103 @@ class EvaluationRunner:
             ), "Inconsistent 'answer_prefix' within the same context group detected."
 
             logger.info("Starting inference...")
-            for context, df_group in tqdm(
-                df_context_grouped, total=self.df["context"].nunique(), desc="Running Inference"
-            ):  # type: ignore[union-attr]
-                questions = df_group["question"].to_list()
-                # Use max_new_tokens from config, or fallback to dataset's default for the task
-                max_new_tokens = self.config.max_new_tokens or df_group["max_new_tokens"].iloc[0]
-                answer_prefix = df_group["answer_prefix"].iloc[0]
-
-                output = self.pipeline(  # type: ignore[misc]
-                    context,
-                    questions=questions,
-                    answer_prefix=answer_prefix,
-                    press=self.press,
-                    max_new_tokens=max_new_tokens,
-                    max_context_length=self.config.max_context_length,
-                    enable_thinking=self.config.enable_thinking,
+            # Incremental progress log, mirroring evaluate_sparse.py. One JSON line per completed
+            # trace, fsync'd per chunk, replayed on restart so only the missing traces are
+            # generated. Without it a run is all-or-nothing: math500/aime25 put every row under
+            # ONE context, so a whole shard is a single pipeline() call and a kill at 99% leaves
+            # nothing. That cost 6h38m when the filesystem filled mid-run.
+            #
+            # `_results_dir` is set by run(); when it is None (this method driven directly, as the
+            # diagnostics do) the log is simply skipped.
+            progress_path = (
+                None
+                if getattr(self, "_results_dir", None) is None
+                else self._results_dir / (
+                    f"progress_shard{self.config.shard_index}.jsonl"
+                    if self.config.num_shards > 1
+                    else "progress.jsonl"
                 )
-                self.df.loc[df_group.index, "predicted_answer"] = output["answers"]  # type: ignore[union-attr]
-                # Store the actual compression ratio used (if the press has one)
-                self.df.loc[df_group.index, "compression_ratio"] = (
-                    self.press.compression_ratio if self.press is not None else 0.0  # type: ignore[attr-defined]
-                )  # type: ignore[union-attr, attr-defined]
-                torch.cuda.empty_cache()  # Clear CUDA cache to free up memory
+            )
+            done: dict[int, str] = {}
+            if progress_path is not None and progress_path.exists():
+                with open(progress_path) as pfh:
+                    for line in pfh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError:
+                            # A torn final line is the expected result of a hard kill: redo that
+                            # one trace rather than refuse to resume.
+                            logger.warning("ignoring a truncated final line in %s", progress_path.name)
+                            continue
+                        done[int(rec["i"])] = rec["a"]
+                keep = [i for i in done if i in self.df.index]  # type: ignore[union-attr]
+                self.df.loc[keep, "predicted_answer"] = pd.Series({i: done[i] for i in keep})  # type: ignore[union-attr]
+                logger.info(
+                    "resuming from %s: %d/%d traces already generated, %d to go",
+                    progress_path.name, len(keep), len(self.df), len(self.df) - len(keep),
+                )
+                if keep:
+                    self._resumed_from = len(keep)
+
+            pfh = open(progress_path, "a", buffering=1) if progress_path is not None else None
+            try:
+                for context, df_group in tqdm(
+                    df_context_grouped, total=self.df["context"].nunique(), desc="Running Inference"
+                ):  # type: ignore[union-attr]
+                    # Use max_new_tokens from config, or fallback to dataset's default for the task
+                    max_new_tokens = self.config.max_new_tokens or df_group["max_new_tokens"].iloc[0]
+                    answer_prefix = df_group["answer_prefix"].iloc[0]
+
+                    # One generate call per rollout index, reseeded from (seed, r) so the traces
+                    # are reproducible AND the sparse arm draws the identical seed sequence --
+                    # which is what makes the dense-vs-sparse difference paired rather than two
+                    # independent samples. With rollouts=1 this is the original single call.
+                    #
+                    # NOTE: a RESUMED run cannot reproduce the skipped traces' RNG stream, so it is
+                    # not bit-identical to an uninterrupted one. Recorded as `resumed_traces` in
+                    # the saved config so the difference is never discovered as a mystery later.
+                    for rollout, sub in (
+                        df_group.groupby("rollout") if "rollout" in df_group else [(0, df_group)]
+                    ):
+                        todo = sub[sub["predicted_answer"].isna()]
+                        if todo.empty:
+                            continue
+                        if self.config.do_sample:
+                            torch.manual_seed(self.config.seed + 1000 * int(rollout))
+                            if torch.cuda.is_available():
+                                torch.cuda.manual_seed_all(self.config.seed + 1000 * int(rollout))
+                        # Chunked so a kill loses at most one chunk. 8 is a compromise: small
+                        # enough to bound the loss, large enough that the per-call overhead and
+                        # the shared context prefill still amortize.
+                        for start in range(0, len(todo), 8):
+                            part = todo.iloc[start : start + 8]
+                            output = self.pipeline(  # type: ignore[misc]
+                                context,
+                                questions=part["question"].to_list(),
+                                answer_prefix=answer_prefix,
+                                press=self.press,
+                                max_new_tokens=max_new_tokens,
+                                max_context_length=self.config.max_context_length,
+                                enable_thinking=self.config.enable_thinking,
+                            )
+                            answers = output["answers"]
+                            self.df.loc[part.index, "predicted_answer"] = answers  # type: ignore[union-attr]
+                            # Store the actual compression ratio used (if the press has one)
+                            self.df.loc[part.index, "compression_ratio"] = (
+                                self.press.compression_ratio if self.press is not None else 0.0  # type: ignore[attr-defined]
+                            )  # type: ignore[union-attr, attr-defined]
+                            if pfh is not None:
+                                for idx, ans in zip(part.index, answers):
+                                    pfh.write(json.dumps({"i": int(idx), "a": ans}) + "\n")
+                                pfh.flush()
+                                os.fsync(pfh.fileno())
+                    torch.cuda.empty_cache()  # Clear CUDA cache to free up memory
+            finally:
+                if pfh is not None:
+                    pfh.close()
 
         logger.info("Inference completed.")
 
@@ -603,7 +785,11 @@ class EvaluationRunner:
         logger.info("Starting evaluation run...")
         output_dir = self._setup_directories()
 
-        results_dir = self.config.get_results_dir(output_dir)
+        # Resolved once and stashed: _run_inference writes its progress log here. Must not
+        # call get_results_dir twice -- it uniquifies against the filesystem and creates the
+        # directory, so a second call returns a DIFFERENT path and the log would be orphaned
+        # from the run that wrote it (the exact bug hit in evaluate_sparse.py).
+        results_dir = self._results_dir = self.config.get_results_dir(output_dir)
         predictions_filename = results_dir / "predictions.csv"
         metrics_filename = results_dir / "metrics.json"
         config_filename = results_dir / "config.yaml"
@@ -638,7 +824,7 @@ class EvaluationRunner:
 
         self._save_results(predictions_filename)
         self._calculate_and_save_metrics(metrics_filename)
-        self.config.save_config(config_filename)
+        self.config.save_config(config_filename, getattr(self, "_resumed_from", 0))
         logger.info("Evaluation run completed successfully.")
 
 

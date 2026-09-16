@@ -142,7 +142,11 @@ def _block_mask():
 
 
 def deadlines(
-    scores: torch.Tensor, topk: int, *, force_sink: int = 0, force_local: int = 0
+    scores: torch.Tensor,
+    topk: int | torch.Tensor,
+    *,
+    force_sink: int = 0,
+    force_local: int = 0,
 ) -> torch.Tensor:
     """
     Per-key eviction deadline for a query-independent score, ``(n_heads, Sk)`` int32.
@@ -164,6 +168,14 @@ def deadlines(
         The support budget, matching the gather path's arguments. ``take = topk - force_sink -
         force_local`` is what the deadline actually governs.
 
+        ``topk`` may also be a **``(n_heads,)`` integer tensor**, giving each KV head its own
+        budget. The per-key ordering is already per head (``argsort`` along the key axis), so a
+        per-head ``take`` changes only where each head's ranking is cut -- no other part of the
+        derivation assumes the budgets are equal. Conservation of the total is the caller's
+        responsibility: nothing here checks that ``sum(topk) == n_heads * uniform_topk``, and a
+        vector that quietly sums higher would buy its win with extra cache rather than with
+        allocation.
+
     Notes
     -----
     Let ``ord`` be the pool sorted by score descending (ties by ascending key index -- a *stable*
@@ -183,14 +195,31 @@ and 10.2x at ``L=16384``, both bit-identical to the naive form.
         raise ValueError(f"scores must be (n_heads, Sk), got {tuple(scores.shape)}")
     n_heads, k_len = scores.shape
     device = scores.device
-    take = int(topk) - int(force_sink) - int(force_local)
-    if take <= 0 or k_len == 0:
-        # No top-k budget at all: the support is exactly the forced slots. The sentinel must
+    # `take` is per head from here on: a (n_heads, 1) tensor broadcasts against the (n_heads, Sk)
+    # and (n_heads, Sk, n_blocks) intermediates exactly where a scalar did, so the derivation is
+    # unchanged -- only the cut point moves per head.
+    if isinstance(topk, torch.Tensor):
+        if topk.numel() != n_heads:
+            raise ValueError(
+                f"per-head topk has {topk.numel()} entries but scores has {n_heads} heads"
+            )
+        take_h = topk.to(device=device, dtype=torch.int64).reshape(n_heads) - int(force_sink) - int(force_local)
+    else:
+        take_h = torch.full(
+            (n_heads,), int(topk) - int(force_sink) - int(force_local),
+            dtype=torch.int64, device=device,
+        )
+    if k_len == 0 or int(take_h.max()) <= 0:
+        # No head has any top-k budget: the support is exactly the forced slots. The sentinel must
         # therefore select NOTHING, not "never evicted" -- returning k_len-1 here would make
         # `horizon <= deadline` true for every key and the mask would keep the whole pool. (Caught
         # by test_deadline_mask_matches_streaming_topk at topk == force_sink + force_local, where it
         # kept 528 entries instead of 275.)
         return torch.full((n_heads, k_len), -1, dtype=torch.int32, device=device)
+    # A head with take <= 0 must still select nothing while its siblings select normally; clamped
+    # to 1 to keep the tensor ops well-formed, then forced back to the -1 sentinel at the end.
+    empty_head = take_h <= 0
+    take_h = take_h.clamp(min=1)
 
     key_idx = torch.arange(k_len, device=device)
     in_pool = key_idx >= force_sink
@@ -215,7 +244,7 @@ and 10.2x at ``L=16384``, both bit-identical to the naive form.
     prefix_blk = cum_rank.cumsum(2)
     del hist, cum_rank
 
-    reached = prefix_blk >= take
+    reached = prefix_blk >= take_h.view(n_heads, 1, 1)
     block = reached.to(torch.uint8).argmax(2)  # first block whose running total hits `take`
     unreached = ~reached.any(2)  # fewer than `take` keys beat this rank => never evicted
     before = torch.where(
@@ -223,7 +252,7 @@ and 10.2x at ``L=16384``, both bit-identical to the naive form.
         prefix_blk.gather(2, (block - 1).clamp(min=0).unsqueeze(-1)).squeeze(-1),
         torch.zeros_like(block),
     )
-    need = take - before  # how many more are needed from within `block`
+    need = take_h.view(n_heads, 1) - before  # how many more are needed from within `block`
     del prefix_blk, reached
 
     arrival = torch.empty_like(order)
@@ -251,6 +280,8 @@ and 10.2x at ``L=16384``, both bit-identical to the naive form.
     )
     out = torch.empty((n_heads, k_len), dtype=torch.int64, device=device)
     out.scatter_(-1, order, per_rank)
+    # A head whose budget the pins already consumed selects nothing from the pool.
+    out = torch.where(empty_head.view(n_heads, 1), torch.full_like(out, -1), out)
     # Keys outside the pool (the sink) are unconditional; give them the "never" value so a caller
     # that forgets the sink rule still cannot evict them.
     return torch.where(in_pool.view(1, -1), out, torch.full_like(out, k_len - 1)).to(torch.int32)

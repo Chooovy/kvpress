@@ -63,6 +63,7 @@ from kvpress.presses.gqa_indexer.e2e_trainer import (
     E2EIndexerTrainer,
     e2e_indexer_training_step,
     e2e_indexer_delta_weighted_step,
+    e2e_indexer_fwkl_step,
     e2e_indexer_longce_step,
 )
 from kvpress.presses.gqa_indexer.fused_loss import (
@@ -147,6 +148,25 @@ from kvpress.presses.gqa_indexer.prefix_indexer import (
     PrefixIndexerConfig,
     score_variance_profile,
 )
+from kvpress.presses.gqa_indexer.conv_indexer import (
+    DEFAULT_CONV_DIM,
+    DEFAULT_CONV_KERNEL,
+    ConvIndexer,
+    ConvIndexerConfig,
+)
+from kvpress.presses.gqa_indexer.rnn_indexer import (
+    DEFAULT_GATE_BIAS,
+    DEFAULT_STATE_DIM,
+    RNNIndexer,
+    RNNIndexerConfig,
+    gated_scan,
+)
+from kvpress.presses.gqa_indexer.kvzip_indexer import (
+    DEFAULT_KVZIP_BASE,
+    DEFAULT_KVZIP_DIM,
+    KVzipIndexer,
+    KVzipIndexerConfig,
+)
 from kvpress.presses.gqa_indexer.loss import (
     build_dense_indexer_target,
     build_sparse_indexer_target,
@@ -187,6 +207,16 @@ from kvpress.presses.gqa_indexer.press import GQAIndexerPress
 from kvpress.presses.gqa_indexer.sparse_inference import (
     IMPL_NAME as SPARSE_ATTENTION_IMPL_NAME,
     SparseAttentionContext,
+)
+from kvpress.presses.gqa_indexer.evict_cache import (
+    PAGE_BLOCK,
+    EvictCache,
+    EvictPagedPool,
+    rank_key,
+)
+from kvpress.presses.gqa_indexer.evict_runner import (
+    IMPL_NAME as EVICT_IMPL_NAME,
+    EvictInferenceContext,
 )
 from kvpress.presses.gqa_indexer.sparse_attention import (
     check_sparse_shapes,
@@ -283,6 +313,19 @@ __all__ = [
     "PrefixIndexer",
     "PrefixIndexerConfig",
     "score_variance_profile",
+    "ConvIndexer",
+    "ConvIndexerConfig",
+    "RNNIndexer",
+    "RNNIndexerConfig",
+    "gated_scan",
+    "KVzipIndexer",
+    "KVzipIndexerConfig",
+    "DEFAULT_CONV_DIM",
+    "DEFAULT_CONV_KERNEL",
+    "DEFAULT_GATE_BIAS",
+    "DEFAULT_STATE_DIM",
+    "DEFAULT_KVZIP_BASE",
+    "DEFAULT_KVZIP_DIM",
     "DEFAULT_DECAY_INIT",
     "DEFAULT_DECAY_REF",
     "DEFAULT_POS_SLOPE",
@@ -318,6 +361,12 @@ __all__ = [
     "ingestion_horizon",
     "SparseAttentionContext",
     "SPARSE_ATTENTION_IMPL_NAME",
+    "EvictInferenceContext",
+    "EvictPagedPool",
+    "EvictCache",
+    "EVICT_IMPL_NAME",
+    "PAGE_BLOCK",
+    "rank_key",
     "build_indexer_mask",
     "slice_rope_tables",
     "aggregate_chunk_scores",
@@ -356,6 +405,7 @@ __all__ = [
     "E2EIndexerTrainer",
     "e2e_indexer_training_step",
     "e2e_indexer_delta_weighted_step",
+    "e2e_indexer_fwkl_step",
     "e2e_indexer_longce_step",
     "DEFAULT_LOGIT_CHUNK",
     "delta_weights",

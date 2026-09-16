@@ -103,6 +103,7 @@ from kvpress.presses.gqa_indexer import (  # noqa: E402
     E2EIndexerTrainer,
     e2e_indexer_training_step,
     e2e_indexer_delta_weighted_step,
+    e2e_indexer_fwkl_step,
     e2e_indexer_longce_step,
     e2e_indexer_split_step,
     resolve_split,
@@ -162,7 +163,15 @@ def save(
         "indexer": indexer_state_dict(model, args.scorer_attr),
         "step": step,
         "config": {
-            "objective": "ruler_sft_answer_only" if args.sft_ruler else (
+            # FWKL first: it REPLACES the cross-entropy, so a checkpoint trained with it is not
+            # an "e2e_lm_loss" one and recording it as such makes the two arms indistinguishable
+            # after the fact (the weights alone do not say which objective produced them).
+            "objective": (
+                (("rvkl" if args.fwkl_reverse else "fwkl")
+                 + ("_ce%g" % args.fwkl_ce_weight if args.fwkl_ce_weight else ""))
+                if args.fwkl
+                else "ruler_sft_answer_only"
+            ) if (args.fwkl or args.sft_ruler) else (
                 "e2e_split_c1c2" if args.split_frac is not None else "e2e_lm_loss"
             ),
             "model": args.model,
@@ -176,7 +185,9 @@ def save(
             # names differ, so load_indexer_state_dict (strict=False) would drop everything and
             # silently start from init.
             "scorer": args.scorer,
-            "scalar_mid_dim": args.scalar_mid_dim if args.scorer in ("scalar", "prefix") else None,
+            "scalar_mid_dim": (
+            args.scalar_mid_dim if args.scorer in ("scalar", "prefix", "conv", "rnn") else None
+        ),
             "scalar_pos_slope": (
                 args.scalar_pos_slope if args.scorer in ("scalar", "prefix") else None
             ),
@@ -185,8 +196,21 @@ def save(
             # NOT parameters -- ref only ever divides a position and init only seeds a bias -- so a
             # mismatch loads every tensor cleanly and silently rescales every age. Recording them
             # is the only thing that makes an eval reproduce the geometry it was trained at.
-            "scalar_decay": args.scalar_decay if args.scorer in ("scalar", "kvzip") else None,
-            "kvzip_dim": args.kvzip_dim if args.scorer == "kvzip" else None,
+            "scalar_decay": (
+            args.scalar_decay
+            if args.scorer in ("scalar", "kvzip", "prefix", "conv", "rnn")
+            else None
+        ),
+            # conv/rnn geometry. conv_dim/conv_kernel/state_dim ARE parameter shapes and would fail
+        # loudly on load, but conv_exclude_self and rnn_gate_bias are NOT -- a run resumed with
+        # either flipped would load every tensor cleanly and train a different experiment.
+        "conv_kernel": args.conv_kernel if args.scorer == "conv" else None,
+        "conv_dim": args.conv_dim if args.scorer == "conv" else None,
+        "conv_exclude_self": args.conv_exclude_self if args.scorer == "conv" else None,
+        "state_dim": args.state_dim if args.scorer == "rnn" else None,
+        "rnn_gate_mode": args.rnn_gate_mode if args.scorer == "rnn" else None,
+        "rnn_gate_bias": args.rnn_gate_bias if args.scorer == "rnn" else None,
+        "kvzip_dim": args.kvzip_dim if args.scorer == "kvzip" else None,
             "kvzip_base": args.kvzip_base if args.scorer == "kvzip" else None,
             "kvzip_ngroup": args.kvzip_ngroup if args.scorer == "kvzip" else None,
             "scalar_decay_ref": args.scalar_decay_ref if args.scalar_decay else None,
@@ -215,6 +239,12 @@ def save(
             "sft_tasks": list(resolve_tasks(args.sft_tasks)) if args.sft_ruler else None,
             "sft_max_len": args.sft_max_len if args.sft_ruler else None,
             "sft_append_eos": args.sft_append_eos if args.sft_ruler else None,
+            # The FWKL geometry. Not recoverable from the weights, and `fwkl` in particular is
+            # what distinguishes this arm from the CE baseline at identical gate settings.
+            "fwkl": args.fwkl,
+            "fwkl_ce_weight": args.fwkl_ce_weight if args.fwkl else None,
+            "fwkl_reverse": args.fwkl_reverse if args.fwkl else None,
+            "kl_chunk": args.kl_chunk if args.fwkl else None,
             "topk": args.topk,
             "peak_lr": args.peak_lr,
             "final_lr": args.final_lr,
@@ -470,7 +500,7 @@ def main() -> int:
     model_group.add_argument("--n-heads", type=int, default=None)
     model_group.add_argument(
         "--scorer",
-        choices=("pairwise", "scalar", "prefix", "dma", "kvzip"),
+        choices=("pairwise", "scalar", "prefix", "dma", "kvzip", "conv", "rnn"),
         default="pairwise",
         help="which router to train. 'pairwise' scores every (query, key) pair -- query-aware, "
         "and O(t) per decode step, which at 128K makes the router 32x the cost of the sparse "
@@ -492,7 +522,7 @@ def main() -> int:
         "--scalar-mid-dim",
         type=int,
         default=256,
-        help="MLP width for --scorer scalar and --scorer prefix; 0 is SparseK's plain linear "
+        help="MLP width for --scorer scalar, prefix, conv and rnn; 0 is SparseK's plain linear "
         "score. This is the arm's "
         "capacity knob, not just a parameter-matching one: in the probe study a nonlinear readout "
         "of the hidden state beat a linear one by +0.12 held-out Spearman on total attention mass, "
@@ -504,7 +534,7 @@ def main() -> int:
         "--scalar-pos-slope",
         type=float,
         default=DEFAULT_POS_SLOPE,
-        help="recency tilt (t * eps) for --scorer scalar and --scorer prefix. Keeps top-k "
+        help="recency tilt (t * eps) for --scorer scalar, prefix, conv and rnn. Keeps top-k "
         "irreversible, which is what "
         "makes a dropped key safe to free: verified 0 re-entries over 1500 steps with an absolute "
         "tilt against 27 when normalised by sequence length. Also carries the recency duty so the "
@@ -513,7 +543,8 @@ def main() -> int:
     model_group.add_argument(
         "--scalar-decay",
         action="store_true",
-        help="--scorer scalar only: give each key a learned LIFETIME as well as a magnitude, "
+        help="--scorer scalar, prefix, conv and rnn: give each key a learned LIFETIME as well as "
+        "a magnitude, "
         "which is TrimKV's core mechanism. The gate becomes s_j + log_beta_j * (i - j) / "
         "decay_ref with log_beta <= 0, so a key's weight decays geometrically in its age and "
         "its RANK can change over the sequence -- a frozen score fixes the ranking forever. "
@@ -620,6 +651,42 @@ def main() -> int:
     )
     model_group.set_defaults(prefix_zero_init=True)
     model_group.add_argument(
+        "--conv-kernel", type=int, default=8,
+        help="--scorer conv only: receptive field in tokens of the causal depthwise conv over "
+        "past hidden states. Also the size of the decode ring buffer, so this is the arm's whole "
+        "decode state.",
+    )
+    model_group.add_argument(
+        "--conv-dim", type=int, default=256,
+        help="--scorer conv only: channel width of the conv branch. The conv is depthwise, so "
+        "capacity comes from this width and the pointwise maps around it.",
+    )
+    model_group.add_argument(
+        "--conv-include-self", dest="conv_exclude_self", action="store_false",
+        help="--scorer conv only: let the conv read the CURRENT token (tap 0) as well as the "
+        "past. Off by default: h_j already reaches the score through W_in, so excluding tap 0 is "
+        "what makes ||w_a|| a readout on whether PAST information earned its place. NOT a shape, "
+        "so a checkpoint trained with it flipped loads cleanly and scores differently.",
+    )
+    model_group.set_defaults(conv_exclude_self=True)
+    model_group.add_argument(
+        "--state-dim", type=int, default=256,
+        help="--scorer rnn only: width of the gated recurrent state, and of the O(1) decode carry.",
+    )
+    model_group.add_argument(
+        "--rnn-gate-mode", choices=("learned", "fixed"), default="learned",
+        help="--scorer rnn only: 'learned' gives a per-channel input-dependent forget gate "
+        "(the arm's actual hypothesis); 'fixed' is one learnable scalar retention shared by every "
+        "channel and token, which is the ablation matched to the already-probed EMA form. Keeping "
+        "both lets 'learned gating matters' be separated from 'recurrence does not help'.",
+    )
+    model_group.add_argument(
+        "--rnn-gate-bias", type=float, default=2.0,
+        help="--scorer rnn only: initial logit of the forget gate. 2.0 -> g=0.88, a ~5-token "
+        "half-life, so the state starts LOCAL and must learn to hold. A large value would start "
+        "saturated at g=1 where the gate's own gradient nearly vanishes.",
+    )
+    model_group.add_argument(
         "--press-n-sink", type=int, default=4,
         help="keys the press protects from eviction. Also the default for --n-sink, so the keys "
         "exempted from the gate during training are the keys kept at inference.",
@@ -698,7 +765,7 @@ def main() -> int:
         "at gate 0 AND held out of the gate's normalizer, so the router never spends budget on "
         "a neighbour and ranks only what lies beyond the window -- the division of labour the "
         "eviction path already assumes at inference via --force-local. SP-KV sweeps this at "
-        "{1, 8, 32, 128, 512} and reads gate densities 60.7/47.8/33.4/25.4/27.5%, i.e. a WIDER "
+        "{1, 8, 32, 128, 512} and reads gate densities 60.7/47.8/33.4/25.4/27.5%%, i.e. a WIDER "
         "window makes the router MORE willing to drop distant keys. Ignored by every other "
         "pin mode; `self` is fixed at width 1.",
     )
@@ -782,6 +849,50 @@ def main() -> int:
         "for it. Off by default so a partial cache (--max-docs-per-shard) still trains, with the "
         "uncached fraction reported as longce_cache_miss_frac in the metrics; on for a run that "
         "must be exactly the cached objective.",
+    )
+    optim.add_argument(
+        "--fwkl",
+        default=None,
+        help="train on FORWARD KL against the frozen backbone's own dense output distribution, "
+        "`mean_t KL(p_dense_t || p_gated_t)`, instead of the LM cross-entropy. Takes the root of "
+        "an h_dense cache from scripts/precompute_hdense.py -- the teacher is cached as final "
+        "HIDDEN states, 37x smaller than logits, because lm_head is frozen. Why not CE: CE anchors "
+        "on the gold token, so it is nearly blind to the case eviction turns on -- a key whose "
+        "removal changes the prediction entirely at a position where the gold token was never "
+        "top-1. Needle tokens are exactly that (measured key_L - all_L = -1.7, i.e. EASIER than "
+        "average under long context, which is also why LongCE's weight misses them). Requires a "
+        "pin; incompatible with --delta-weight / --longce-weights / --sft-ruler.",
+    )
+    optim.add_argument(
+        "--kl-chunk", type=int, default=2048,
+        help="rows per lm_head call when forming the two distributions. Pure memory/speed knob -- "
+        "KL is a per-position sum so the result is chunk-invariant (verified spread 0.0). Measured "
+        "fwd+bwd at L=8192: 447 ms/14.7 GiB at chunk 1024, 360 ms/17.6 GiB at 2048, 348 ms/35.0 "
+        "GiB at 8192, against 240 ms for plain CE -- i.e. +0.2%% of a 59 s step.",
+    )
+    optim.add_argument(
+        "--fwkl-require-all", action="store_true",
+        help="fail if a drawn document has no cached h_dense instead of computing that teacher "
+        "inline. Off by default so a partial cache still trains, with the rate reported as "
+        "fwkl_cache_miss_frac.",
+    )
+    optim.add_argument(
+        "--fwkl-ce-weight", type=float, default=0.0,
+        help="mix the LM cross-entropy into --fwkl: loss = (1-w)*KL + w*CE. 0 (default) is pure "
+        "forward KL. **0.5 reproduces TrimKV**, whose compute_base_loss accumulates each enabled "
+        "term and divides by how many there are, so base_loss='ntp+fwkl' is exactly an equal "
+        "average. Equal WEIGHTS are not equal influence, though: CE starts near 2.4 while this KL "
+        "starts near 0.14, so at w=0.5 the CE term dominates the gradient by ~17x. Sweep it if the "
+        "pure-KL arm needs an 'answer correctly' pressure it does not have.",
+    )
+    optim.add_argument(
+        "--fwkl-reverse", action="store_true",
+        help="use REVERSE KL, KL(p_gated || p_dense), i.e. TrimKV's rvkl, instead of the forward "
+        "direction. The two punish different things: forward is mass-covering (large wherever the "
+        "teacher has mass and the student does not, so losing the needle is expensive), reverse is "
+        "mode-seeking (punishes mass the teacher lacks, and is BLIND to a mode the student misses "
+        "entirely). Forward is the default because it matches 'do not lose an irreplaceable key'; "
+        "this flag is the ablation that tests whether that reasoning holds.",
     )
     optim.add_argument("--schedule", default="8192:300,16384:300,32768:300", help="SEQ_LEN:STEPS,...")
     optim.add_argument(
@@ -935,6 +1046,35 @@ def main() -> int:
             )
         if args.split_gap < 0:
             raise SystemExit(f"--split-gap must be non-negative, got {args.split_gap}")
+    if args.fwkl:
+        for flag, value in (
+            ("--delta-weight", args.delta_weight),
+            ("--longce-weights", args.longce_weights),
+            ("--sft-ruler", args.sft_ruler),
+        ):
+            if value:
+                parser.error(
+                    f"--fwkl and {flag} are different objectives over the same forward; running "
+                    "both would give a third that neither was validated as. --fwkl REPLACES the "
+                    "cross-entropy rather than reweighting it."
+                )
+        if args.pin_mode == "none":
+            parser.error(
+                "--fwkl needs a pin. A gate that is flat along the key axis leaves the output "
+                "distribution bit-identical, so KL is exactly 0 -- a global optimum with no "
+                "ranking learned (verified numerically). Use --pin-mode local+sink."
+            )
+        if not args.tokenized:
+            parser.error(
+                "--fwkl needs --tokenized: the h_dense cache is keyed by the pretokenized "
+                "corpus's doc_ids, which the on-the-fly text loader does not produce."
+            )
+        if args.take_from != "head":
+            parser.error(
+                f"--fwkl requires --take-from head (got {args.take_from!r}). The cache stores a "
+                "per-document PREFIX of hidden states; a random window would pair position i's "
+                "teacher with a different token entirely."
+            )
     if args.longce_weights:
         # All four are configuration contradictions, so they surface before any device is touched.
         if args.delta_weight:
@@ -1153,22 +1293,28 @@ def main() -> int:
         press_kwargs["kvzip_dim"] = args.kvzip_dim
         press_kwargs["kvzip_base"] = args.kvzip_base
         press_kwargs["kvzip_ngroup"] = args.kvzip_ngroup
-    if args.scorer in ("scalar", "prefix"):
+    if args.scorer in ("scalar", "prefix", "conv", "rnn"):
         press_kwargs["scalar_mid_dim"] = args.scalar_mid_dim
         press_kwargs["scalar_pos_slope"] = args.scalar_pos_slope
-        if args.scorer == "scalar":
-            press_kwargs["scalar_decay"] = args.scalar_decay
-            press_kwargs["scalar_decay_ref"] = args.scalar_decay_ref
-            press_kwargs["scalar_decay_init"] = args.scalar_decay_init
-        elif args.scalar_decay:
-            raise SystemExit(
-                f"--scalar-decay is only implemented for --scorer scalar/kvzip, got "
-                f"{args.scorer!r}."
-            )
+        # Every arm here supports the lifetime head: `w_decay` consumes the TRUNK, and each of
+        # PrefixIndexer / ConvIndexer / RNNIndexer overrides `_trunk` (not `score_keys`), so
+        # `log_beta = -softplus(w_decay(trunk))` is the same per-(token, KV head) mechanism --
+        # only the representation differs, which is what the history arms exist to add.
+        press_kwargs["scalar_decay"] = args.scalar_decay
+        press_kwargs["scalar_decay_ref"] = args.scalar_decay_ref
+        press_kwargs["scalar_decay_init"] = args.scalar_decay_init
     if args.scorer == "prefix":
         press_kwargs["prefix_head_dim"] = args.prefix_head_dim
         press_kwargs["prefix_value_dim"] = args.prefix_value_dim
         press_kwargs["prefix_zero_init"] = args.prefix_zero_init
+    if args.scorer == "conv":
+        press_kwargs["conv_kernel"] = args.conv_kernel
+        press_kwargs["conv_dim"] = args.conv_dim
+        press_kwargs["conv_exclude_self"] = args.conv_exclude_self
+    if args.scorer == "rnn":
+        press_kwargs["state_dim"] = args.state_dim
+        press_kwargs["rnn_gate_mode"] = args.rnn_gate_mode
+        press_kwargs["rnn_gate_bias"] = args.rnn_gate_bias
     for name in ("rope_dim", "head_dim", "n_heads"):
         value = getattr(args, name)
         if value is not None:
@@ -1254,6 +1400,8 @@ def main() -> int:
     # at the stage's own seq_len, so it has to know which width the loader is drawing.
     longce_cache = None
     longce_missing, longce_seen = 0, 0
+    hdense_cache = None
+    fwkl_missing, fwkl_seen = 0, 0
     window: list[float] = []
     started = time.time()
     step = 0
@@ -1307,6 +1455,17 @@ def main() -> int:
                         batch_size=args.batch_size,
                     )
                     iterator = iter(loader)
+                    if args.fwkl:
+                        # Reopened per stage: the cache is a prefix store and the digest it
+                        # verifies against was taken at THIS seq_len. Constructing it here also
+                        # makes an unusable cache fail at the stage boundary with a message
+                        # naming the fix, rather than at the first lookup 200 steps in.
+                        from kvpress.presses.gqa_indexer.hdense_cache import HDenseCache
+
+                        hdense_cache = HDenseCache(args.fwkl, seq_len=seq_len)
+                        fwkl_missing, fwkl_seen = 0, 0
+                        if rank == 0:
+                            logger.info("h_dense teacher cache: %s", hdense_cache.summary())
                     if args.longce_weights:
                         # Reopened per stage because the digest to verify against is the one taken at
                         # THIS seq_len. Constructing it here also means an unusable cache (missing,
@@ -1413,7 +1572,41 @@ def main() -> int:
                     # runs at the shape and dtype the run actually uses.
                     check_liger_loss_unchanged(model, trainer, input_ids, labels=labels)
                     liger_check_pending = False
-                if args.delta_weight:
+                if args.fwkl:
+                    # Teacher from the cache when present. A miss computes it inline under
+                    # no_grad for that row -- correct but ~+27% step time, so the rate is
+                    # reported rather than silently absorbed.
+                    rows = []
+                    for row, doc_id in enumerate(batch["doc_ids"]):
+                        fwkl_seen += 1
+                        if doc_id in hdense_cache:
+                            rows.append(
+                                torch.from_numpy(
+                                    hdense_cache.lookup(doc_id, input_ids[row]).copy()
+                                )
+                            )
+                        elif args.fwkl_require_all:
+                            raise RuntimeError(
+                                f"no cached h_dense for doc {doc_id}, and --fwkl-require-all was "
+                                "passed. Extend the cache with scripts/precompute_hdense.py, or "
+                                "drop the flag to compute that teacher inline."
+                            )
+                        else:
+                            fwkl_missing += 1
+                            rows.append(None)
+                    teacher = None
+                    if all(r is not None for r in rows):
+                        teacher = torch.stack(rows).to(device, non_blocking=True)
+                    loss, delta_stats = e2e_indexer_fwkl_step(
+                        model, trainer, input_ids=input_ids,
+                        hidden_dense=teacher, kl_chunk=args.kl_chunk,
+                        ce_weight=args.fwkl_ce_weight, labels=labels,
+                        reverse=args.fwkl_reverse,
+                    )
+                    delta_stats["fwkl_cache_miss_frac"] = (
+                        fwkl_missing / fwkl_seen if fwkl_seen else 0.0
+                    )
+                elif args.delta_weight:
                     # Delta-weighted objective: put the router's gradient where routing can
                     # actually change the loss. Liger is not consulted -- this path calls the base
                     # model and applies lm_head in chunks itself, so the fused-CE kernel is not on

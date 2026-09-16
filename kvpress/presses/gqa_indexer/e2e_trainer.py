@@ -84,6 +84,7 @@ from kvpress.presses.gqa_indexer.gate_pin import (
 )
 from kvpress.presses.gqa_indexer.triton_fused_loss import HAS_TRITON
 from kvpress.presses.gqa_indexer.delta_loss import DEFAULT_LOGIT_CHUNK
+from kvpress.presses.gqa_indexer.fwkl import DEFAULT_KL_CHUNK
 from kvpress.presses.gqa_indexer.gated_attention import gated_attention
 from kvpress.presses.gqa_indexer.press import GQAIndexerPress, get_language_model
 from kvpress.presses.gqa_indexer.sparse_support import resolve_topk, streaming_topk_support
@@ -292,6 +293,19 @@ class E2EIndexerTrainer:
     #: division of labour ``force_local`` already assumes at inference. Ignored by every other
     #: mode; ``self`` is fixed at width 1.
     n_local: int = DEFAULT_N_LOCAL
+
+    #: Train on HARD eviction instead of the soft gate: keys outside each row's top-k are removed
+    #: with -inf rather than down-weighted, which is the geometry inference actually runs. ``None``
+    #: keeps the soft gate.
+    #:
+    #: Requires a FROZEN, query-independent router. Both are checked (hard_evict.py), because the
+    #: threshold is only equivalent to a per-row top-k when a key's score is fixed for the step.
+    #: This exists because the soft/hard gap is not academic: with the router training, the
+    #: backbone lowered the LM loss by re-spreading attention until the gate stopped binding
+    #: (gate_sparsity 0.282 -> 0.359, loss 1.75 -> 1.53) and RULER 8K fell 77.62 -> 69.17 while
+    #: topk=8192 still matched dense (93.71 vs 93.69) -- it routed AROUND the constraint rather
+    #: than adapting to it. Under a hard gate that option does not exist.
+    hard_topk: int | None = None
     gate_budget: float = 1.0
     gate_budget_ratio: float | None = None
     key_tile: int = 1024
@@ -640,6 +654,23 @@ class E2EIndexerTrainer:
         measure_history_mass = (
             self.measure_sparsity and self.scope == "full" and pins_sink(self.gate_pin_mode) and self.split is None
         )
+        # The hard-evict boundary, recomputed per layer per step: it depends on the hidden states,
+        # which the backbone is changing. Under no_grad and O(Sq) per (batch, KV head) -- the same
+        # shape as `lse` -- so it does not touch the memory argument for the fused path.
+        thresh = None
+        if self.hard_topk is not None and self.scope == "full":
+            from kvpress.presses.gqa_indexer.hard_evict import hard_threshold_for_layer
+
+            thresh = hard_threshold_for_layer(
+                self.press.get_indexer(module),
+                hidden_states,
+                self.hard_topk,
+                n_sink=self.sink_count if pins_sink(self.gate_pin_mode) else 0,
+                n_local=local_width(self.gate_pin_mode, self.n_local),
+                query_offset=key.shape[2] - query.shape[2],
+                q_len=query.shape[2],
+            ).to(q_idx.dtype if q_idx.dtype == torch.float32 else torch.float32)
+
         attention = gated_attention(
             query,
             key,
@@ -660,6 +691,7 @@ class E2EIndexerTrainer:
             n_sink=self.sink_count,
             n_local=self.n_local,
             pin_from=None if self.scope == "sparse" else self.split,
+            thresh=thresh,
             key_tile=self.key_tile,
             return_row_lse=measure_history_mass,
         )
@@ -1035,6 +1067,94 @@ def e2e_indexer_delta_weighted_step(
         n_valid = int(mask.sum())
         stats["dense_loss"] = float(dense_loss[mask].mean()) if n_valid else 0.0
         stats["sparse_loss"] = float(sparse_loss.detach()[mask].mean()) if n_valid else 0.0
+    return loss, stats
+
+
+def e2e_indexer_fwkl_step(
+    model: nn.Module,
+    trainer: E2EIndexerTrainer,
+    *,
+    input_ids: torch.Tensor,
+    hidden_dense: torch.Tensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    kl_chunk: int = DEFAULT_KL_CHUNK,
+    ce_weight: float = 0.0,
+    labels: torch.Tensor | None = None,
+    reverse: bool = False,
+) -> tuple[torch.Tensor, dict]:
+    """
+    One step of **forward KL against the model's own dense output distribution**.
+
+        L = mean_t KL(p_dense_t || p_gated_t)
+
+    Self-distillation: the teacher is this same frozen backbone run *without* the gate. Replaces
+    the LM cross-entropy rather than reweighting it -- see :mod:`~.fwkl` for why CE is nearly blind
+    to the case eviction turns on (a key whose removal changes the prediction entirely, at a
+    position where the gold token was never top-1).
+
+    ``hidden_dense`` is the teacher's final hidden state, ``(B, L, H)``. Passing it from
+    :class:`~.hdense_cache.HDenseCache` avoids the extra forward; ``None`` computes it inline under
+    ``no_grad``, which is the fallback for a cache miss.
+
+    **The pin is mandatory here, not merely advisable.** A gate that is constant along the key axis
+    leaves ``softmax(a + g) == softmax(a)``, so every layer's output is bit-identical, the logits
+    are identical, and the KL is *exactly* 0 -- verified. That is a global optimum reached with no
+    ranking learned, the same hole ``gate_pin`` closes for the LM loss. ``pin_mode="none"`` is
+    therefore rejected rather than warned about.
+    """
+    from kvpress.presses.gqa_indexer.fwkl import fwkl_chunked
+
+    if trainer.gate_pin_mode == "none":
+        raise ValueError(
+            "forward KL with pin_mode='none' has an exact no-op optimum: a gate that is flat "
+            "along the key axis leaves the output distribution unchanged, so KL = 0 with nothing "
+            "learned (verified numerically). Use pin_mode='local+sink' (or 'sink')."
+        )
+
+    lm_head = model.get_output_embeddings()
+    if lm_head is None:
+        raise RuntimeError("model has no output embeddings; cannot form a distribution")
+
+    if hidden_dense is None:
+        # Inline teacher: the SAME model with the gate hooks absent. `trainer.hooks()` is a context
+        # manager, so simply calling the base model outside it is the ungated forward.
+        with torch.no_grad():
+            hidden_dense = _final_hidden_states(
+                model, input_ids=input_ids, attention_mask=attention_mask
+            )
+
+    with trainer.hooks(model):
+        hidden_gated = _final_hidden_states(
+            model, input_ids=input_ids, attention_mask=attention_mask
+        )
+
+    kl, stats = fwkl_chunked(
+        hidden_gated,
+        hidden_dense.to(hidden_gated.device, hidden_gated.dtype),
+        lm_head,
+        chunk=kl_chunk,
+        reverse=reverse,
+    )
+    if ce_weight <= 0.0:
+        return kl, stats
+
+    # TrimKV's form: it accumulates each enabled term and divides by how many there are, so
+    # `base_loss='ntp+fwkl'` is exactly 0.5*CE + 0.5*KL. ce_weight=0.5 reproduces that; the
+    # parameter exists because equal weighting is a choice, not a derivation -- the two terms
+    # have different scales (CE starts near 2.4, this KL near 0.14), so equal WEIGHTS do not
+    # mean equal influence on the gradient.
+    from kvpress.presses.gqa_indexer.delta_loss import per_token_ce, valid_mask
+
+    targets = input_ids if labels is None else labels
+    # (lm_head, hidden, labels) -- that argument order, and the returned vector is
+    # (B*(L-1),) with IGNORED positions holding 0.0. Masking rather than .mean() matters:
+    # a real CE can be ~0 too, so averaging over the zeros would silently dilute the term.
+    ce_tokens = per_token_ce(lm_head, hidden_gated, targets, chunk_size=kl_chunk)
+    keep = valid_mask(targets)
+    ce = ce_tokens[keep].mean() if bool(keep.any()) else ce_tokens.sum() * 0.0
+    loss = (1.0 - ce_weight) * kl + ce_weight * ce
+    stats["ce"] = float(ce.detach())
+    stats["ce_weight"] = ce_weight
     return loss, stats
 
 

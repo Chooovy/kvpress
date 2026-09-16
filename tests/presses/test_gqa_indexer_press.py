@@ -745,6 +745,33 @@ def test_detect_scorer_from_keys_separates_the_scorers():
     assert detect_scorer_from_keys({"m.0.self_attn.indexer.gate_scale": None}) is None
     assert detect_scorer_from_keys({**scalar, **pairwise}) is None
 
+    # The three history arms all subclass the scalar one, so each carries the scalar
+    # discriminators too and must be tested before the bare-scalar fall-through. Note none of
+    # them may key on `w_a`: all three project their branch into the trunk through a module of
+    # that name, so keying on it made every conv/rnn checkpoint ambiguous with prefix.
+    prefix = {**scalar, "m.0.self_attn.indexer.w_pq.weight": None,
+              "m.0.self_attn.indexer.w_a.weight": None}
+    conv = {**scalar, "m.0.self_attn.indexer.w_cin.weight": None,
+            "m.0.self_attn.indexer.conv.weight": None,
+            "m.0.self_attn.indexer.w_a.weight": None}
+    rnn = {**scalar, "m.0.self_attn.indexer.w_u.weight": None,
+           "m.0.self_attn.indexer.w_g.weight": None,
+           "m.0.self_attn.indexer.w_a.weight": None}
+    rnn_fixed = {**scalar, "m.0.self_attn.indexer.w_u.weight": None,
+                 "m.0.self_attn.indexer.logit_retain": None,
+                 "m.0.self_attn.indexer.w_a.weight": None}
+    kvzip = {**pairwise, "m.0.self_attn.indexer.k_base": None}
+    assert detect_scorer_from_keys(prefix) == "prefix"
+    assert detect_scorer_from_keys(conv) == "conv"
+    assert detect_scorer_from_keys(rnn) == "rnn"
+    assert detect_scorer_from_keys(rnn_fixed) == "rnn"
+    assert detect_scorer_from_keys(kvzip) == "kvzip"
+    # Two history fingerprints at once is contradictory: refuse rather than half-load.
+    assert detect_scorer_from_keys({**conv, **rnn}) is None
+    assert detect_scorer_from_keys({**prefix, **conv}) is None
+    # A history arm without the scalar parameters it inherits is also contradictory.
+    assert detect_scorer_from_keys({"m.0.self_attn.indexer.w_cin.weight": None}) is None
+
 
 def test_detect_scorer_prefers_the_recorded_config():
     """

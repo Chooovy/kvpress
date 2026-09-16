@@ -30,6 +30,18 @@ from kvpress.presses.gqa_indexer.scalar_indexer import (
     ScalarIndexer,
     ScalarIndexerConfig,
 )
+from kvpress.presses.gqa_indexer.conv_indexer import (
+    DEFAULT_CONV_DIM,
+    DEFAULT_CONV_KERNEL,
+    ConvIndexer,
+    ConvIndexerConfig,
+)
+from kvpress.presses.gqa_indexer.rnn_indexer import (
+    DEFAULT_GATE_BIAS,
+    DEFAULT_STATE_DIM,
+    RNNIndexer,
+    RNNIndexerConfig,
+)
 from kvpress.presses.gqa_indexer.kvzip_indexer import (
     DEFAULT_KVZIP_BASE,
     DEFAULT_KVZIP_DIM,
@@ -51,6 +63,8 @@ _SCORER_CLASSES = {
     "prefix": PrefixIndexer,
     "dma": DMAIndexer,
     "kvzip": KVzipIndexer,
+    "conv": ConvIndexer,
+    "rnn": RNNIndexer,
 }
 
 
@@ -181,6 +195,19 @@ class GQAIndexerPress(ScorerPress):
     prefix_value_dim: int = 128
     prefix_zero_init: bool = True
 
+    # scorer="conv" only: the causal depthwise-conv branch's geometry
+    conv_kernel: int = DEFAULT_CONV_KERNEL
+    conv_dim: int = DEFAULT_CONV_DIM
+    conv_exclude_self: bool = True
+    conv_zero_init: bool = True
+
+    # scorer="rnn" only: the gated recurrent branch's geometry. gate_mode="fixed" is the
+    # ablation matched to the probed (fixed-decay EMA) form -- see rnn_indexer's docstring.
+    state_dim: int = DEFAULT_STATE_DIM
+    rnn_gate_mode: str = "learned"
+    rnn_gate_bias: float = DEFAULT_GATE_BIAS
+    rnn_zero_init: bool = True
+
     # scorer="kvzip" only: Fast-KVzip's gate geometry. kvzip_ngroup=0 means "derive it
     # from the model", i.e. n_q_heads / n_kv_heads, which is what upstream uses.
     kvzip_dim: int = DEFAULT_KVZIP_DIM
@@ -218,10 +245,9 @@ class GQAIndexerPress(ScorerPress):
             raise ValueError("n_sink and n_local must be non-negative")
         if self.chunk_size < 0:
             raise ValueError("chunk_size must be non-negative")
-        if self.scorer not in ("pairwise", "scalar", "prefix", "dma", "kvzip"):
+        if self.scorer not in _SCORER_CLASSES:
             raise ValueError(
-                "scorer must be 'pairwise', 'scalar', 'prefix', 'dma' or 'kvzip', "
-                f"got {self.scorer!r}"
+                f"scorer must be one of {sorted(_SCORER_CLASSES)}, got {self.scorer!r}"
             )
         if self.memory and self.scorer != "scalar":
             # Structural, not a missing feature. The memory holds one state per KV head standing
@@ -267,18 +293,22 @@ class GQAIndexerPress(ScorerPress):
                 raise ValueError("scorer='dma' scores values directly and does not use RoPE")
             return DMAIndexerConfig(n_heads=model_n_heads, head_dim=model_head_dim)
 
-        if self.scorer in ("scalar", "prefix", "kvzip"):
+        if self.scorer in ("scalar", "prefix", "kvzip", "conv", "rnn"):
             # No head_dim and no rope_dim: the score is one number per (key, head), derived from
-            # that key (or its prefix) alone, so there is nothing to rotate. The prefix arm's own
-            # attention is deliberately NoPE -- h_j already carries the backbone's rotary signal
-            # and pos_slope carries recency -- and its q/k width is prefix_head_dim, not this
-            # head_dim. Overrides here would silently do nothing, so reject them.
+            # that key (or its own causal history) alone, so there is nothing to rotate. The
+            # history arms are deliberately NoPE -- h_j already carries the backbone's rotary
+            # signal and pos_slope carries recency -- and each arm's own width is its own
+            # parameter, not this head_dim. Overrides here would silently do nothing, so reject
+            # them.
+            _WIDTH_HINT = {
+                "prefix": " Use prefix_head_dim for the prefix attention's q/k width.",
+                "conv": " Use conv_dim for the conv branch's channel width.",
+                "rnn": " Use state_dim for the recurrent state's width.",
+            }
             for name in ("head_dim", "rope_dim"):
                 if getattr(self, name) is not None:
                     hint = (
-                        " Use prefix_head_dim for the prefix attention's q/k width."
-                        if name == "head_dim" and self.scorer == "prefix"
-                        else ""
+                        _WIDTH_HINT.get(self.scorer, "") if name == "head_dim" else ""
                     )
                     raise ValueError(
                         f"{name} was set but scorer={self.scorer!r} has no q/k geometry to apply "
@@ -292,26 +322,45 @@ class GQAIndexerPress(ScorerPress):
                 pos_slope=self.scalar_pos_slope,
                 gate_scale=self.gate_scale,
             )
-            if self.scorer == "prefix":
-                if self.scalar_decay:
-                    # PrefixIndexer overrides score_keys with its own prefix-attention readout and
-                    # has no lifetime head; silently dropping the flag would train the wrong arm.
-                    raise ValueError(
-                        "scalar_decay is only implemented for scorer='scalar'. The prefix arm "
-                        "computes its score through prefix attention, which the decay fold does "
-                        "not cover."
-                    )
-                return PrefixIndexerConfig(
-                    **common,
-                    head_dim=self.prefix_head_dim,
-                    value_dim=self.prefix_value_dim,
-                    zero_init_prefix=self.prefix_zero_init,
-                )
             decay_kwargs = dict(
                 decay=self.scalar_decay,
                 decay_ref=self.scalar_decay_ref,
                 decay_init=self.scalar_decay_init,
             )
+            if self.scorer == "prefix":
+                # Decay works here for the same reason it works for the scalar arm: `w_decay`
+                # consumes the TRUNK, not the score, and PrefixIndexer overrides `_trunk` rather
+                # than `score_keys`. So `log_beta = -softplus(w_decay(trunk))` is the same
+                # per-(token, KV head) lifetime mechanism, read off a representation that also
+                # sees the key's prefix. With decay off, `w_decay` is not built and the arm stays
+                # bit-comparable to existing prefix checkpoints.
+                return PrefixIndexerConfig(
+                    **common,
+                    **decay_kwargs,
+                    head_dim=self.prefix_head_dim,
+                    value_dim=self.prefix_value_dim,
+                    zero_init_prefix=self.prefix_zero_init,
+                )
+            if self.scorer == "conv":
+                # Decay works here for the same reason as in the scalar and prefix arms:
+                # `w_decay` consumes the TRUNK, and ConvIndexer overrides `_trunk`.
+                return ConvIndexerConfig(
+                    **common,
+                    **decay_kwargs,
+                    conv_kernel=self.conv_kernel,
+                    conv_dim=self.conv_dim,
+                    exclude_self=self.conv_exclude_self,
+                    zero_init_conv=self.conv_zero_init,
+                )
+            if self.scorer == "rnn":
+                return RNNIndexerConfig(
+                    **common,
+                    **decay_kwargs,
+                    state_dim=self.state_dim,
+                    gate_mode=self.rnn_gate_mode,
+                    gate_bias=self.rnn_gate_bias,
+                    zero_init_state=self.rnn_zero_init,
+                )
             if self.scorer == "kvzip":
                 # No MLP in this head, so mid_dim is dropped rather than passed -- the config
                 # rejects a nonzero one, which is what keeps a swept --scalar-mid-dim from

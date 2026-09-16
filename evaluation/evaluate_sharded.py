@@ -185,11 +185,36 @@ def main(
     df = pd.concat(frames).sort_index()
     total = sum(len(f) for f in frames)
     assert len(df) == total, f"concat lost rows: {len(df)} != {total}"
+    # Overlap is checked on the index, the only row identity available here -- but a rollout run
+    # legitimately repeats a source row R times. With the ROLLOUT_STRIDE scheme rollout r of row i
+    # is `i + r*STRIDE`, so a correct union still has NO duplicate index. Shards written before
+    # that fix renumbered each shard from 0, making the index meaningless across shards; those
+    # cannot be told apart from a real overlap locally, so they are refused with an explanation.
+    # See the longer note in evaluate_sparse_sharded.py -- keying on `(index, rollout)` or on
+    # `question` both look right and are both wrong (RULER has 4959 distinct questions in 6500
+    # rows, so content is not an identity either).
     if df.index.has_duplicates:
+        rollouts = int(df["rollout"].nunique()) if "rollout" in df.columns else 1
+        if rollouts > 1:
+            raise SystemExit(
+                f"the union has duplicate index values with rollouts={rollouts}. If these shards "
+                "predate the ROLLOUT_STRIDE fix, each renumbered its rows from 0 and the index is "
+                "not a row identity -- the DATA may be fine but cannot be verified here. Re-run, "
+                "or score offline after re-keying on the source row."
+            )
         raise SystemExit(
             "shards overlap: the same row appears in more than one shard, so the union would "
             "double-count it. This means the shards did not derive from the identical frame."
         )
+    if "rollout" in df.columns:
+        from evaluate_sparse import ROLLOUT_STRIDE
+
+        counts = (df.index % ROLLOUT_STRIDE).value_counts().unique()
+        if len(counts) > 1:
+            raise SystemExit(
+                f"source rows carry differing rollout counts {sorted(counts)}; an accuracy mean "
+                "over them would weight some problems more than others."
+            )
     if df["predicted_answer"].isna().any():
         n = int(df["predicted_answer"].isna().sum())
         raise SystemExit(f"{n} row(s) have no prediction; refusing to score an incomplete union")
@@ -208,6 +233,25 @@ def main(
     with open(results_dir / "config.yaml", "w") as f:
         saved = asdict(config)
         saved.update({"num_shards": num_shards, "shard_index": None, "sharded_devices": gpu_ids})
+        # Resume provenance, recovered from the shard logs -- see the fuller note in
+        # evaluate_sparse_sharded.py. In a sharded run this driver writes config.yaml and never
+        # learns what the shards replayed, so a resumed run would record `resumed_traces: 0` and
+        # read as clean. A resumed run reseeds only for the traces it still generates, so it is not
+        # bit-identical to a clean one and must not be compared as though the seeds were paired.
+        resumed = 0
+        for log in sorted(results_dir.glob("shard*.log")):
+            try:
+                text = log.read_text(errors="replace")
+            except OSError:
+                continue
+            for line in text.splitlines():
+                if "resuming from" in line and "traces already generated" in line:
+                    head = line.split("traces already generated")[0].rsplit(":", 1)[-1]
+                    got = head.strip().split("/")[0]
+                    if got.isdigit():
+                        resumed += int(got)
+        if resumed:
+            saved["resumed_traces"] = resumed
         yaml.dump(saved, f, default_flow_style=False, sort_keys=False)
 
     if not keep_shards:

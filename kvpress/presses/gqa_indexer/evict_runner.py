@@ -512,7 +512,26 @@ class EvictInferenceContext:
             setter = getattr(ctx, "set_context_length", None)
             if setter is not None:
                 setter(int(input_ids.shape[1]))
-            self.model.model(input_ids=input_ids, past_key_values=cache)
+            # Capture hooks otherwise retain every layer's inputs until prefill ends.
+            # On attention return, both contexts have consumed these captures; pool
+            # commit and CMP seeding below read ctx._k_idx and the dense cache instead.
+            # Release the references before the MLP to reduce peak memory without
+            # changing tensor operations (36 historical 256-step traces matched).
+            def release_prefill_inputs(module, _args, _output):
+                layer_idx = int(module.layer_idx)
+                for captures in (self._hidden, self._kwargs, ctx._hidden_states, ctx._kwargs):
+                    captures.pop(layer_idx, None)
+
+            release_handles = [
+                layer.self_attn.register_forward_hook(release_prefill_inputs)
+                for layer in layers
+            ]
+            try:
+                self.model.model(input_ids=input_ids, past_key_values=cache)
+            finally:
+                for handle in release_handles:
+                    handle.remove()
+
             k_len = input_ids.shape[1]
             # Allocate the pool from the budgets THIS prefill actually resolved. Deferred to here
             # rather than done in __enter__ because two features settle the budget only during the

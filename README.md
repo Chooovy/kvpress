@@ -4,6 +4,10 @@ Learned KV routing for Qwen3-8B: a small per-layer *indexer* scores KV entries s
 either attend sparsely (keep the whole cache, pick top-k per query) or **evict** (free the KV
 outright). Built on [kvpress](https://github.com/NVIDIA/kvpress).
 
+The [H20 FA2 decode benchmark](scripts/decode_benchmark/README.md) provides the measured
+Full-KV / IndexMem++ timing path, portable multi-GPU launcher, protocol and links to
+the previously published memory fixes and results.
+
 Everything below is measured on RULER at `topk=2048`, `fraction=0.100`, Qwen3-8B
 (`evaluation/results_*`). Dense baseline: **94.66** @4K, **93.69** @8K, **93.22** @16K.
 

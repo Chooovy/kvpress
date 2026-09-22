@@ -1,0 +1,125 @@
+{
+  "source_sha": "03b5caf05eefd27f57c2c87a71798c43d4720a09",
+  "cases": [
+    {
+      "kind": "mlp",
+      "dtype": "torch.float32",
+      "layers": 2,
+      "state_tensors": 18,
+      "weights_exact": true,
+      "outputs_exact": true,
+      "input_gradients_exact": true,
+      "parameter_gradients_exact": true
+    },
+    {
+      "kind": "mlp",
+      "dtype": "torch.bfloat16",
+      "layers": 2,
+      "state_tensors": 18,
+      "weights_exact": true,
+      "outputs_exact": true,
+      "input_gradients_exact": true,
+      "parameter_gradients_exact": true
+    },
+    {
+      "kind": "linear",
+      "dtype": "torch.float32",
+      "layers": 2,
+      "state_tensors": 12,
+      "weights_exact": true,
+      "outputs_exact": true,
+      "input_gradients_exact": true,
+      "parameter_gradients_exact": true
+    },
+    {
+      "kind": "linear",
+      "dtype": "torch.bfloat16",
+      "layers": 2,
+      "state_tensors": 12,
+      "weights_exact": true,
+      "outputs_exact": true,
+      "input_gradients_exact": true,
+      "parameter_gradients_exact": true
+    },
+    {
+      "kind": "conv",
+      "dtype": "torch.float32",
+      "layers": 2,
+      "state_tensors": 28,
+      "weights_exact": true,
+      "outputs_exact": true,
+      "input_gradients_exact": true,
+      "parameter_gradients_exact": true
+    },
+    {
+      "kind": "conv",
+      "dtype": "torch.bfloat16",
+      "layers": 2,
+      "state_tensors": 28,
+      "weights_exact": true,
+      "outputs_exact": true,
+      "input_gradients_exact": true,
+      "parameter_gradients_exact": true
+    },
+    {
+      "kind": "rnn",
+      "dtype": "torch.float32",
+      "layers": 2,
+      "state_tensors": 30,
+      "weights_exact": true,
+      "outputs_exact": true,
+      "input_gradients_exact": true,
+      "parameter_gradients_exact": true
+    },
+    {
+      "kind": "rnn",
+      "dtype": "torch.bfloat16",
+      "layers": 2,
+      "state_tensors": 30,
+      "weights_exact": true,
+      "outputs_exact": true,
+      "input_gradients_exact": true,
+      "parameter_gradients_exact": true
+    },
+    {
+      "kind": "prefix",
+      "dtype": "torch.float32",
+      "layers": 2,
+      "state_tensors": 30,
+      "weights_exact": true,
+      "outputs_exact": true,
+      "input_gradients_exact": true,
+      "parameter_gradients_exact": true
+    },
+    {
+      "kind": "prefix",
+      "dtype": "torch.bfloat16",
+      "layers": 2,
+      "state_tensors": 30,
+      "weights_exact": true,
+      "outputs_exact": true,
+      "input_gradients_exact": true,
+      "parameter_gradients_exact": true
+    },
+    {
+      "kind": "kvzip",
+      "dtype": "torch.float32",
+      "layers": 2,
+      "state_tensors": 24,
+      "weights_exact": true,
+      "outputs_exact": true,
+      "input_gradients_exact": true,
+      "parameter_gradients_exact": true
+    },
+    {
+      "kind": "kvzip",
+      "dtype": "torch.bfloat16",
+      "layers": 2,
+      "state_tensors": 24,
+      "weights_exact": true,
+      "outputs_exact": true,
+      "input_gradients_exact": true,
+      "parameter_gradients_exact": true
+    }
+  ]
+}

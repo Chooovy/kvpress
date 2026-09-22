@@ -1,0 +1,29 @@
+{
+  "cpu": {
+    "tests": 184,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 24,
+    "passed": 160,
+    "seconds": 7.366,
+    "command": "python -m pytest tests/indexmem tests/evaluation -q"
+  },
+  "cuda": {
+    "tests": 184,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 184,
+    "seconds": 33.221,
+    "command": "python -m pytest tests/indexmem tests/evaluation -q"
+  },
+  "reference_cuda": {
+    "tests": 77,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 77,
+    "seconds": 16.271,
+    "command": "python -m pytest tests/presses/test_gqa_indexer_scalar_decay.py tests/presses/test_gqa_indexer_streaming_cmp.py tests/presses/test_gqa_indexer_evict_cache.py -q"
+  }
+}

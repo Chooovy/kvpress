@@ -1,0 +1,46 @@
+{
+  "scripts/train.py --help": {
+    "exit_code": 0,
+    "help_rendered": true
+  },
+  "scripts/train_joint.py --help": {
+    "exit_code": 0,
+    "help_rendered": true
+  },
+  "scripts/convert_checkpoint.py --help": {
+    "exit_code": 0,
+    "help_rendered": true
+  },
+  "scripts/fit_head_budgets.py --help": {
+    "exit_code": 0,
+    "help_rendered": true
+  },
+  "scripts/benchmark_decode.py --help": {
+    "exit_code": 0,
+    "help_rendered": true
+  },
+  "scripts/pretokenize_longmino.py --help": {
+    "exit_code": 0,
+    "help_rendered": true
+  },
+  "scripts/precompute_hdense.py --help": {
+    "exit_code": 0,
+    "help_rendered": true
+  },
+  "scripts/precompute_longce_weights.py --help": {
+    "exit_code": 0,
+    "help_rendered": true
+  },
+  "evaluation/evaluate_indexmem.py -- --help": {
+    "exit_code": 0,
+    "help_rendered": true
+  },
+  "evaluation/evaluate_indexmem_sharded.py -- --help": {
+    "exit_code": 0,
+    "help_rendered": true
+  },
+  "-m kvpress.indexmem.ablations.compensation --help": {
+    "exit_code": 0,
+    "help_rendered": true
+  }
+}

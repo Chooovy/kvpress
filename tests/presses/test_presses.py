@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Modified for the IndexMem++ public implementation.
 from dataclasses import dataclass
-import inspect
 
 import pytest
 import torch
@@ -33,20 +33,7 @@ from tests.fixtures import unit_test_model, unit_test_model_output_attention  # 
 
 
 def init_press_from_model(press, model):
-    """
-    Call ``post_init_from_model`` for presses that need it, on a model shared across kwargs.
-
-    ``GQAIndexerPress`` attaches an indexer module to each attention layer and refuses to
-    reuse one whose geometry differs from what it was configured for. Since this loop drives
-    many kwargs sets through a single session-scoped model, later variants (e.g. ``rope_dim=0,
-    head_dim=32``) would otherwise inherit the first variant's indexer and never exercise the
-    geometry they name, so ask for a fresh one.
-    """
-    if not hasattr(press, "post_init_from_model"):
-        return
-    if "force_reinit" in inspect.signature(press.post_init_from_model).parameters:
-        press.post_init_from_model(model, force_reinit=True)
-    else:
+    if hasattr(press, "post_init_from_model"):
         press.post_init_from_model(model)
 
 

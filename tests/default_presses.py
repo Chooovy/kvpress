@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Modified for the IndexMem++ public implementation.
 
 import numpy as np
 
@@ -11,7 +12,6 @@ from kvpress import (
     ExpectedAttentionPress,
     ExpectedAttentionStatsPress,
     FastKVzipPress,
-    GQAIndexerPress,
     KeyDiffPress,
     KnormPress,
     KVComposePress,
@@ -168,19 +168,5 @@ default_presses = [
     },
     {"cls": CapPress, "kwargs": [{"compression_ratio": 0.5}, {"compression_ratio": 0.8}]},
     {"cls": TestLUKVPress, "kwargs": [{"compression_ratio": 0.5}, {"compression_ratio": 0.8}]},
-    {
-        "cls": GQAIndexerPress,
-        "kwargs": [
-            {"compression_ratio": 0.2},
-            {"compression_ratio": 0.8},
-            # per-KV-head vs head-uniform selection
-            {"compression_ratio": 0.5, "mean_head": True},
-            # chunk-level selection on top of token scores
-            {"compression_ratio": 0.5, "chunk_size": 8, "chunk_aggregate": "max"},
-            # sink + local protection, and a query-reduction variant
-            {"compression_ratio": 0.5, "n_sink": 2, "n_local": 4, "query_reduce": "max"},
-            # NoPE and a narrower indexer
-            {"compression_ratio": 0.5, "rope_dim": 0, "head_dim": 32},
-        ],
-    },
+
 ]

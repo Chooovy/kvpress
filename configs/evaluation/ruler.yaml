@@ -1,0 +1,17 @@
+dataset: ruler
+data_dir: '8192'
+model: Qwen/Qwen3-8B
+inference_mode: mask
+cache_budget: 2048
+sink_size: 4
+window_size: 128
+cmp_slots: 64
+head_budget: mass
+min_head_budget: 512
+decode_batch: 1
+fraction: 1.0
+enable_thinking: false
+do_sample: false
+rollouts: 1
+shard_by: context
+seed: 42

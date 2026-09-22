@@ -1,0 +1,20 @@
+{
+  "mask": {
+    "prefill_logits_equal": true,
+    "prefill_logits_max_abs_diff": 0.0,
+    "logits_equal": true,
+    "logits_max_abs_diff": 0.0,
+    "tokens_equal": true,
+    "positions_equal": true,
+    "populations_equal": true
+  },
+  "evict": {
+    "prefill_logits_equal": true,
+    "prefill_logits_max_abs_diff": 0.0,
+    "logits_equal": true,
+    "logits_max_abs_diff": 0.0,
+    "tokens_equal": true,
+    "positions_equal": true,
+    "populations_equal": true
+  }
+}

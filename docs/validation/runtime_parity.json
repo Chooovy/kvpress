@@ -1,0 +1,9 @@
+{
+  "exact_comparisons": 426,
+  "all_equal": true,
+  "removed_unused_bookkeeping": [
+    "_committed"
+  ],
+  "torch": "2.8.0+cu128",
+  "device": "NVIDIA H20"
+}

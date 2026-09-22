@@ -1,58 +1,18 @@
-SHELL := /bin/bash -o pipefail
-UV ?= $(shell which uv)
-BUILD_VERSION:=$(APP_VERSION)
-TESTS_FILTER:=
-FLASH_ATTN_PACKAGE ?= flash-attn
-FLASH_ATTN_INSTALL_ARGS ?= --no-build-isolation
+PYTHON ?= python
+INDEXMEM_PATHS = kvpress/indexmem tests/indexmem scripts evaluation/evaluate_indexmem.py evaluation/evaluate_indexmem_sharded.py
 
-PYTEST_LOG=--log-cli-level=debug --log-format="%(asctime)s %(levelname)s [%(name)s:%(filename)s:%(lineno)d] %(message)s" --log-date-format="%Y-%m-%d %H:%M:%S"
+.PHONY: test test-kvpress style format
 
-.PHONY: isort
-isort:
-	$(UV) run isort .
+test:
+	$(PYTHON) -m pytest tests/indexmem tests/evaluation
 
-.PHONY: black
-black:
-	$(UV) run black .
+test-kvpress:
+	$(PYTHON) -m pytest tests/presses
 
-PHONY: format
-format: isort black
+style:
+	$(PYTHON) -m black --check $(INDEXMEM_PATHS)
+	$(PYTHON) -m isort --check-only $(INDEXMEM_PATHS)
 
-.PHONY: style
-style: reports
-	@echo -n > reports/flake8_errors.log
-	@echo -n > reports/mypy_errors.log
-	@echo -n > reports/mypy.log
-	@echo -n > reports/copyright_errors.log
-	@echo
-
-	-$(UV) run flake8 | tee -a reports/flake8_errors.log
-	@if [ -s reports/flake8_errors.log ]; then exit 1; fi
-
-	-$(UV) run mypy . --check-untyped-defs | tee -a reports/mypy.log
-	@if ! grep -Eq "Success: no issues found in [0-9]+ source files" reports/mypy.log ; then exit 1; fi
-
-	@echo "Checking for SPDX-FileCopyrightText headers in Python files..."
-	@find . -name "*.py" -not -path "*/\.*" | xargs grep -L "SPDX-FileCopyrightText:" | tee reports/copyright_errors.log || true
-	@if [ -s reports/copyright_errors.log ]; then echo "Error: Missing SPDX-FileCopyrightText headers in files listed above"; exit 1; fi
-	@echo "Success: All Python files have SPDX-FileCopyrightText headers."
-
-
-reports:
-	mkdir -p reports
-
-.PHONY: test
-test: reports
-	$(UV) pip install $(FLASH_ATTN_INSTALL_ARGS) $(FLASH_ATTN_PACKAGE) --find-links https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/expanded_assets/v0.9.4
-	PYTHONPATH=. \
-	$(UV) run --no-sync pytest \
-		--cov-report xml:reports/coverage.xml \
-		--cov=kvpress/ \
-		--junitxml=./reports/junit.xml \
-		-v \
-		tests/ | tee reports/pytest_output.log
-	@if grep -q "FAILED" reports/pytest_output.log; then \
-		echo "Error: Some tests failed."; \
-		grep "FAILED" reports/pytest_output.log; \
-		exit 1; \
-	fi
+format:
+	$(PYTHON) -m isort $(INDEXMEM_PATHS)
+	$(PYTHON) -m black $(INDEXMEM_PATHS)

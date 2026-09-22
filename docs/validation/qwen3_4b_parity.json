@@ -1,0 +1,28 @@
+{
+  "mask": {
+    "tokens_equal": true,
+    "input_length": 1024,
+    "decode_steps": 16,
+    "logits_equal": true,
+    "logits_max_abs": 0.0,
+    "prefill_logits_equal": true,
+    "prefill_logits_max_abs": 0.0,
+    "positions_equal": true,
+    "positions_steps": 0,
+    "populations_equal": true,
+    "populations_steps": 0
+  },
+  "evict": {
+    "tokens_equal": true,
+    "input_length": 1024,
+    "decode_steps": 16,
+    "logits_equal": true,
+    "logits_max_abs": 0.0,
+    "prefill_logits_equal": true,
+    "prefill_logits_max_abs": 0.0,
+    "positions_equal": true,
+    "positions_steps": 16,
+    "populations_equal": true,
+    "populations_steps": 16
+  }
+}

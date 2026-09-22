@@ -63,16 +63,16 @@ DATASET_REGISTRY = {
 }
 
 SCORER_REGISTRY = {
-    "loogle": _lazy_scorer("benchmarks.loogle.calculate_metrics"),
-    "ruler": _lazy_scorer("benchmarks.ruler.calculate_metrics"),
-    "zero_scrolls": _lazy_scorer("benchmarks.zero_scrolls.calculate_metrics"),
-    "infinitebench": _lazy_scorer("benchmarks.infinite_bench.calculate_metrics"),
-    "longbench": _lazy_scorer("benchmarks.longbench.calculate_metrics"),
-    "longbench-e": _lazy_scorer("benchmarks.longbench.calculate_metrics", "calculate_metrics_e"),
-    "longbench-v2": _lazy_scorer("benchmarks.longbenchv2.calculate_metrics"),
-    "needle_in_haystack": _lazy_scorer("benchmarks.needle_in_haystack.calculate_metrics"),
-    "aime25": _lazy_scorer("benchmarks.aime25.calculate_metrics"),
-    "math500": _lazy_scorer("benchmarks.math500.calculate_metrics"),
+    "loogle": _lazy_scorer("evaluation.benchmarks.loogle.calculate_metrics"),
+    "ruler": _lazy_scorer("evaluation.benchmarks.ruler.calculate_metrics"),
+    "zero_scrolls": _lazy_scorer("evaluation.benchmarks.zero_scrolls.calculate_metrics"),
+    "infinitebench": _lazy_scorer("evaluation.benchmarks.infinite_bench.calculate_metrics"),
+    "longbench": _lazy_scorer("evaluation.benchmarks.longbench.calculate_metrics"),
+    "longbench-e": _lazy_scorer("evaluation.benchmarks.longbench.calculate_metrics", "calculate_metrics_e"),
+    "longbench-v2": _lazy_scorer("evaluation.benchmarks.longbenchv2.calculate_metrics"),
+    "needle_in_haystack": _lazy_scorer("evaluation.benchmarks.needle_in_haystack.calculate_metrics"),
+    "aime25": _lazy_scorer("evaluation.benchmarks.aime25.calculate_metrics"),
+    "math500": _lazy_scorer("evaluation.benchmarks.math500.calculate_metrics"),
 }
 
 

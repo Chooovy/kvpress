@@ -1,0 +1,17 @@
+dataset: longbench
+model: Qwen/Qwen3-8B
+inference_mode: mask
+cache_budget_ratio: 0.25
+sink_size: 4
+window_size: 128
+cmp_slots: 64
+head_budget: mass
+min_head_budget: 512
+decode_batch: 1
+max_context_length: 32768
+fraction: 1.0
+enable_thinking: false
+do_sample: false
+rollouts: 1
+shard_by: context
+seed: 42

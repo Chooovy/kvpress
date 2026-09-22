@@ -1,0 +1,94 @@
+{
+  "date": "2026-09-22",
+  "scope": "Training refactor verification; no paper benchmark reproduction or long training run",
+  "reference_commit": "03b5caf",
+  "local_environment": {
+    "python": "3.12",
+    "torch": "2.8.0",
+    "transformers": "4.57.3"
+  },
+  "gpu_environment": {
+    "gpu": "NVIDIA H20",
+    "torch": "2.8.0",
+    "transformers": "4.57.3",
+    "triton": "3.4.0",
+    "liger_kernel": "0.6.2"
+  },
+  "direct_reference_comparisons": {
+    "history_normalizer": {
+      "geometries": ["sink", "window", "sink_and_window"],
+      "query_length": 9,
+      "key_length": 13,
+      "query_offset": 4,
+      "dtypes": ["float32", "float64"],
+      "forward_max_absolute_difference": 0.0,
+      "query_key_and_scale_gradient_max_absolute_difference": 0.0
+    },
+    "distribution_kl": {
+      "directions": ["forward", "reverse"],
+      "dtypes": ["float32", "bfloat16"],
+      "chunk_size": 5,
+      "loss_max_absolute_difference": 0.0,
+      "student_hidden_gradient_max_absolute_difference": 0.0
+    },
+    "document_loader": {
+      "take_from": ["head", "random"],
+      "workers": [0, 2],
+      "data_parallel_world_sizes": [1, 2],
+      "rank_streams_compared": 12,
+      "document_ids_and_token_ids": "exact match"
+    }
+  },
+  "automated_tests": {
+    "command": "python -m pytest tests/indexmem/test_training.py tests/indexmem/test_training_data.py tests/indexmem/test_training_cli.py -q",
+    "gpu_passed": 36,
+    "coverage": [
+      "history normalizer values and gradients, including empty history",
+      "five paper objective configurations against full logits",
+      "full CUDA trainer forward/backward for five objectives and CE without protected regions",
+      "all six scorer structures with CUDA RKL forward and backward",
+      "four protected-region configurations with fused attention value and gradient comparisons",
+      "two-rank sequence-parallel full-gradient equivalence",
+      "joint parameter partition",
+      "teacher and LongCE cache schemas",
+      "LongCE target and window alignment",
+      "CLI checkpoint and random-document-window resume equivalence"
+    ]
+  },
+  "end_to_end_checks": {
+    "frozen_training": "Tiny Qwen3, two CUDA reverse-KL optimizer steps",
+    "native_resume": {
+      "from_step": 1,
+      "to_step": 2,
+      "scorer_max_absolute_difference_from_uninterrupted_run": 0.0
+    },
+    "joint_training": {
+      "ranks": 2,
+      "ffn_sequence_parallel_size": 2,
+      "optimizer_steps": 1,
+      "full_checkpoint_keys": 43,
+      "scorer_checkpoint_keys": 18,
+      "changed_backbone_tensors": 8,
+      "frozen_ffn_embedding_and_lm_head": "unchanged",
+      "restore": "strict load passed; no training FFN-wrapper keys",
+      "entrypoint": "scripts.train_joint imports ablations.joint"
+    },
+    "tokenization": "CLI output verified: three documents with exact first 24 token IDs, uint32",
+    "teacher_precompute": "CLI generated and reader loaded two documents of shape 24 by 64",
+    "longce_precompute": "CLI generated and reader loaded two 23-position weight vectors",
+    "liger_longce_training": "One CUDA optimizer step with Liger enabled"
+  },
+  "import_boundary": "Importing the default training entrypoint loads no ablations modules",
+  "joint_recipe": {
+    "model": "Qwen/Qwen3-8B",
+    "subsets": ["2e16", "2e17"],
+    "schedule": "8192:300",
+    "data_seed": 1000,
+    "take_from": "head",
+    "backbone_learning_rate": 0.00002,
+    "scorer_learning_rate_multiplier": 5.0,
+    "final_learning_rate_fraction": 0.01,
+    "source": "Reference joint Python entrypoint and shell recipe; this does not establish the manuscript joint table provenance"
+  },
+  "initialization": "model_seed is separate from the document seed and shared across data replicas; the reference initialized scorer weights with data seed plus data rank. Document stream comparisons retain the original seed and show exact parity."
+}

@@ -1,0 +1,36 @@
+{
+  "full": {
+    "model": "Qwen3-4B",
+    "input_length": 8192,
+    "batch": 1,
+    "documents": 1,
+    "steps": 4,
+    "warmups": 1,
+    "repeats": 2,
+    "completed": true,
+    "repeat_token_hashes_equal": true,
+    "nonfinite_rows": 0,
+    "cmp_population_deltas": [
+      null,
+      null,
+      null
+    ]
+  },
+  "indexmem": {
+    "model": "Qwen3-4B",
+    "input_length": 8192,
+    "batch": 1,
+    "documents": 1,
+    "steps": 4,
+    "warmups": 1,
+    "repeats": 2,
+    "completed": true,
+    "repeat_token_hashes_equal": true,
+    "nonfinite_rows": 0,
+    "cmp_population_deltas": [
+      1152.0,
+      1152.0,
+      1152.0
+    ]
+  }
+}

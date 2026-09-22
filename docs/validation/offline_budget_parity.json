@@ -1,0 +1,99 @@
+{
+  "0": {
+    "old": [
+      [
+        5,
+        7
+      ],
+      [
+        6,
+        6
+      ]
+    ],
+    "new": [
+      [
+        5,
+        7
+      ],
+      [
+        6,
+        6
+      ]
+    ],
+    "equal": true
+  },
+  "1": {
+    "old": [
+      [
+        5,
+        7
+      ],
+      [
+        6,
+        6
+      ]
+    ],
+    "new": [
+      [
+        5,
+        7
+      ],
+      [
+        6,
+        6
+      ]
+    ],
+    "equal": true
+  },
+  "3": {
+    "old": [
+      [
+        6,
+        6
+      ],
+      [
+        6,
+        6
+      ]
+    ],
+    "new": [
+      [
+        6,
+        6
+      ],
+      [
+        6,
+        6
+      ]
+    ],
+    "equal": true
+  },
+  "8": {
+    "old": [
+      [
+        10,
+        10
+      ],
+      [
+        10,
+        10
+      ]
+    ],
+    "new": [
+      [
+        6,
+        6
+      ],
+      [
+        6,
+        6
+      ]
+    ],
+    "equal": false
+  },
+  "historical_table_runtime": {
+    "includes_sink_window_cmp": true,
+    "mask_consumed_unchanged": true,
+    "evict_exact_kv_subtracts_cmp": true
+  }
+}

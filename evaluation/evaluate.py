@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Modified for the IndexMem++ public implementation.
 
 import json
 import logging
@@ -45,10 +46,6 @@ from kvpress import (  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-#: Index stride between rollouts when ``--rollouts > 1``; must match
-#: ``evaluate_sparse.ROLLOUT_STRIDE`` so a dense run and a sparse run key their rows identically.
-#: Defined here rather than imported because ``evaluate_sparse`` pulls in the whole gqa_indexer
-#: stack (triton kernels, flex_attention), which an eviction-only run has no reason to load.
 ROLLOUT_STRIDE = 1_000_000
 
 

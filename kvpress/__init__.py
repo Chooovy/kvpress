@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Modified for the IndexMem++ public implementation.
 
 
 from kvpress.attention_patch import patch_attention_functions
@@ -24,15 +25,6 @@ from kvpress.presses.expected_attention_with_stats import ExpectedAttentionStats
 from kvpress.presses.fastkvzip_press import FastKVzipPress
 from kvpress.presses.facility_location_press import FacilityLocationPress
 from kvpress.presses.finch_press import FinchPress
-from kvpress.presses.gqa_indexer import (
-    EvictInferenceContext,
-    EvictPagedPool,
-    GQAIndexer,
-    GQAIndexerConfig,
-    GQAIndexerPress,
-    SparseAttentionContext,
-)
-from kvpress.presses.gqa_indexer.train import load_indexer_state_dict
 from kvpress.presses.key_rerotation_press import KeyRerotationPress
 from kvpress.presses.keydiff_press import KeyDiffPress
 from kvpress.presses.knorm_press import KnormPress
@@ -106,11 +98,4 @@ __all__ = [
     "MergingPress",
     "CapPress",
     "LUKVPress",
-    "GQAIndexerPress",
-    "SparseAttentionContext",
-    "EvictInferenceContext",
-    "EvictPagedPool",
-    "load_indexer_state_dict",
-    "GQAIndexer",
-    "GQAIndexerConfig",
 ]

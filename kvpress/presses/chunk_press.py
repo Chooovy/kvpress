@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Modified for the IndexMem++ public implementation.
 
 from dataclasses import dataclass
 
@@ -55,7 +56,7 @@ class ChunkPress(BasePress):
         to follow or they describe positions the chunk does not contain. Presses that rotate
         queries themselves (SnapKV, TOVA, ThinK, Finch) would otherwise read the wrong
         positions silently -- ``cos[:, -window_size:]`` means the end of the *sequence*, not
-        the end of the chunk -- while a press that rotates the whole chunk (GQAIndexerPress)
+        the end of the chunk -- while a press that rotates the whole chunk
         fails outright on the length mismatch.
         """
         position_embeddings = kwargs.get("position_embeddings")

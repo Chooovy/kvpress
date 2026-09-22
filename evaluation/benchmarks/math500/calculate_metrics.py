@@ -3,7 +3,7 @@
 
 import pandas as pd
 
-from benchmarks.boxed_answer import extract_boxed, is_answered, score_boxed
+from ..boxed_answer import extract_boxed, is_answered, score_boxed
 
 
 def score_math500(pred_answer, true_answer) -> bool:

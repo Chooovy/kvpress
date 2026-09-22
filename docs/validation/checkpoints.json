@@ -1,0 +1,8 @@
+{
+  "Qwen3-4B": {
+    "source_checkpoint_sha256": "e2772c938b8ff6598fdd6195df3818bb562ac67416a3b3cb3b6602ef60710175"
+  },
+  "Qwen3-8B": {
+    "source_checkpoint_sha256": "4b03096c8592492f4493fcb21ffbeef5035fb91afecfbe4ae5119c69d85d5edc"
+  }
+}
